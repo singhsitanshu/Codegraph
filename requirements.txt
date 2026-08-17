@@ -1,0 +1,13 @@
+fastapi==0.116.1
+httpx==0.28.1
+langchain-anthropic>=1.0,<2.0
+langgraph>=1.0,<2.0
+pydantic-settings==2.10.1
+python-dotenv==1.1.1
+neo4j==5.28.2
+tree-sitter==0.25.1
+tree-sitter-python==0.23.6
+uvicorn[standard]==0.35.0
+
+# Tests
+pytest==8.4.1

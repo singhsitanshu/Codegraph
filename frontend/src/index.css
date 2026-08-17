@@ -1,0 +1,78 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap");
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+:root {
+  font-family: "Manrope", ui-sans-serif, system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  color: #20332d;
+  background: #f5f6f1;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.typing-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: #698078;
+  animation: typing 900ms ease-in-out infinite alternate;
+}
+
+@keyframes typing {
+  from {
+    opacity: 0.25;
+    transform: translateY(1px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+.react-flow__controls {
+  overflow: hidden;
+  border: 1px solid #d2dbd4;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(32, 51, 45, 0.1);
+}
+
+.react-flow__controls-button {
+  width: 30px;
+  height: 30px;
+  border-bottom-color: #e5eae6;
+  background: rgba(255, 255, 255, 0.94);
+  fill: #42574f;
+}
+
+.react-flow__minimap {
+  overflow: hidden;
+  border: 1px solid #d2dbd4;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 8px 24px rgba(32, 51, 45, 0.08);
+}
+
+@media (max-width: 1023px) {
+  main {
+    min-height: 100dvh;
+  }
+}
