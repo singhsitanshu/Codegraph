@@ -1,0 +1,270 @@
+import asyncio
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+
+import tree_sitter_python
+import tree_sitter_typescript
+from tree_sitter import Language, Node, Parser, Query, QueryCursor
+
+
+logger = logging.getLogger(__name__)
+
+
+PYTHON_FUNCTION_DEFINITIONS_QUERY = """
+(function_definition
+  name: (identifier) @name)
+"""
+
+PYTHON_FUNCTION_CALLS_QUERY = """
+(call
+  function: (identifier) @call)
+
+(call
+  function: (attribute
+    attribute: (identifier) @call))
+"""
+
+PYTHON_CLASS_DEFINITIONS_QUERY = """
+(class_definition
+  name: (identifier) @name)
+"""
+
+TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY = """
+(function_declaration
+  name: (identifier) @name)
+
+(generator_function_declaration
+  name: (identifier) @name)
+
+(method_definition
+  name: (property_identifier) @name)
+
+(variable_declarator
+  name: (identifier) @name
+  value: [(arrow_function) (function_expression)])
+"""
+
+TYPESCRIPT_FUNCTION_CALLS_QUERY = """
+(call_expression
+  function: (identifier) @call)
+
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @call))
+"""
+
+TYPESCRIPT_CLASS_DEFINITIONS_QUERY = """
+(class_declaration
+  name: (type_identifier) @name)
+
+(abstract_class_declaration
+  name: (type_identifier) @name)
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _LanguageQueries:
+    """Compiled queries needed to extract one language's code relationships."""
+
+    function_definitions: Query
+    function_calls: Query
+    class_definitions: Query
+
+
+class CodeParser:
+    """Parse Python, TypeScript, and TSX source into graph-ready relationships.
+
+    Grammar packages are loaded from their precompiled Python wheels. No grammar
+    compilation, C toolchain, or legacy ``Language.build_library`` call is used.
+    Parser instances are retained for reuse, while per-language locks prevent a
+    single parser from being used concurrently by multiple background threads.
+    """
+
+    _SUPPORTED_EXTENSIONS = frozenset({".py", ".ts", ".tsx"})
+    PYTHON_FUNCTION_DEFINITIONS_QUERY = PYTHON_FUNCTION_DEFINITIONS_QUERY
+    PYTHON_FUNCTION_CALLS_QUERY = PYTHON_FUNCTION_CALLS_QUERY
+    PYTHON_CLASS_DEFINITIONS_QUERY = PYTHON_CLASS_DEFINITIONS_QUERY
+    TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY = TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY
+    TYPESCRIPT_FUNCTION_CALLS_QUERY = TYPESCRIPT_FUNCTION_CALLS_QUERY
+    TYPESCRIPT_CLASS_DEFINITIONS_QUERY = TYPESCRIPT_CLASS_DEFINITIONS_QUERY
+
+    def __init__(self) -> None:
+        """Initialize parsers and compile extraction queries for all grammars."""
+
+        python_language = Language(tree_sitter_python.language())
+        typescript_language = Language(
+            tree_sitter_typescript.language_typescript()
+        )
+        tsx_language = Language(tree_sitter_typescript.language_tsx())
+
+        self._languages: dict[str, Language] = {
+            ".py": python_language,
+            ".ts": typescript_language,
+            ".tsx": tsx_language,
+        }
+        self.python_parser = Parser(python_language)
+        self.typescript_parser = Parser(typescript_language)
+        self.tsx_parser = Parser(tsx_language)
+        self._parsers: dict[str, Parser] = {
+            ".py": self.python_parser,
+            ".ts": self.typescript_parser,
+            ".tsx": self.tsx_parser,
+        }
+        self._parse_locks: dict[str, asyncio.Lock] = {
+            extension: asyncio.Lock() for extension in self._SUPPORTED_EXTENSIONS
+        }
+        self._queries: dict[str, _LanguageQueries] = {
+            ".py": self._compile_python_queries(python_language),
+            ".ts": self._compile_typescript_queries(typescript_language),
+            ".tsx": self._compile_typescript_queries(tsx_language),
+        }
+
+    @staticmethod
+    def _compile_python_queries(language: Language) -> _LanguageQueries:
+        """Compile Python definition, class, and call queries once."""
+
+        return _LanguageQueries(
+            function_definitions=Query(
+                language, PYTHON_FUNCTION_DEFINITIONS_QUERY
+            ),
+            function_calls=Query(language, PYTHON_FUNCTION_CALLS_QUERY),
+            class_definitions=Query(language, PYTHON_CLASS_DEFINITIONS_QUERY),
+        )
+
+    @staticmethod
+    def _compile_typescript_queries(language: Language) -> _LanguageQueries:
+        """Compile TypeScript queries for either the TypeScript or TSX grammar."""
+
+        return _LanguageQueries(
+            function_definitions=Query(
+                language, TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY
+            ),
+            function_calls=Query(language, TYPESCRIPT_FUNCTION_CALLS_QUERY),
+            class_definitions=Query(
+                language, TYPESCRIPT_CLASS_DEFINITIONS_QUERY
+            ),
+        )
+
+    @classmethod
+    def _normalize_extension(cls, file_extension: str) -> str:
+        """Normalize and validate a source file extension."""
+
+        normalized = file_extension.strip().lower()
+        if normalized and not normalized.startswith("."):
+            normalized = f".{normalized}"
+        if normalized not in cls._SUPPORTED_EXTENSIONS:
+            supported = ", ".join(sorted(cls._SUPPORTED_EXTENSIONS))
+            raise ValueError(
+                f"Unsupported file extension '{file_extension}'. "
+                f"Supported extensions: {supported}"
+            )
+        return normalized
+
+    def get_parser(self, file_extension: str) -> Parser:
+        """Return the initialized parser for ``.py``, ``.ts``, or ``.tsx``.
+
+        Args:
+            file_extension: File suffix, with or without a leading period.
+
+        Raises:
+            ValueError: If the extension is not supported.
+        """
+
+        return self._parsers[self._normalize_extension(file_extension)]
+
+    @staticmethod
+    def _capture_text(
+        query: Query,
+        capture_name: str,
+        root_node: Node,
+        source_code: bytes,
+    ) -> list[str]:
+        """Run a query and decode one capture in deterministic source order."""
+
+        captures = QueryCursor(query).captures(root_node)
+        nodes = sorted(
+            captures.get(capture_name, []),
+            key=lambda node: (node.start_byte, node.end_byte),
+        )
+        return [
+            source_code[node.start_byte : node.end_byte].decode(
+                "utf-8", errors="replace"
+            )
+            for node in nodes
+        ]
+
+    def _parse_source(
+        self,
+        file_path: str,
+        extension: str,
+        source_code: bytes,
+    ) -> dict[str, str | list[str]]:
+        """Synchronously parse and query source code in a worker thread."""
+
+        parser = self.get_parser(extension)
+        tree = parser.parse(source_code)
+        root_node = tree.root_node
+        queries = self._queries[extension]
+
+        if root_node.has_error:
+            logger.warning("Tree-sitter found syntax errors while parsing %s", file_path)
+
+        return {
+            "file_path": file_path,
+            "defined_classes": self._capture_text(
+                queries.class_definitions,
+                "name",
+                root_node,
+                source_code,
+            ),
+            "defined_functions": self._capture_text(
+                queries.function_definitions,
+                "name",
+                root_node,
+                source_code,
+            ),
+            "outgoing_calls": self._capture_text(
+                queries.function_calls,
+                "call",
+                root_node,
+                source_code,
+            ),
+        }
+
+    async def parse_file(
+        self,
+        file_path: str,
+        source_code: bytes,
+    ) -> dict[str, str | list[str]]:
+        """Extract classes, functions, and outgoing calls from one source file.
+
+        Parsing is CPU-bound and therefore runs in a worker thread so callers do
+        not block FastAPI's event loop. Results preserve source order and are
+        shaped for direct transformation into Neo4j nodes and relationships.
+
+        Args:
+            file_path: Logical or filesystem path used to select the grammar and
+                identify the resulting file record.
+            source_code: UTF-8 encoded Python, TypeScript, or TSX source bytes.
+
+        Returns:
+            A dictionary containing ``file_path``, ``defined_classes``,
+            ``defined_functions``, and ``outgoing_calls``.
+
+        Raises:
+            TypeError: If ``source_code`` is not bytes.
+            ValueError: If ``file_path`` has an unsupported extension.
+        """
+
+        if not isinstance(source_code, bytes):
+            raise TypeError("source_code must be bytes")
+
+        extension = self._normalize_extension(Path(file_path).suffix)
+        async with self._parse_locks[extension]:
+            return await asyncio.to_thread(
+                self._parse_source,
+                file_path,
+                extension,
+                source_code,
+            )

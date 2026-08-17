@@ -1,10 +1,14 @@
 import hashlib
 import hmac
+import json
 import logging
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,11 +20,36 @@ class Settings(BaseSettings):
     github_webhook_secret: str
     github_token: str | None = None
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    neo4j_uri: str
+    neo4j_user: str
+    neo4j_password: str
+    neo4j_database: str = "neo4j"
+
+    anthropic_api_key: str
+    anthropic_model: str = "claude-sonnet-5"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 
 settings = Settings()
 app = FastAPI(title="GitHub Webhook Listener")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=10_000)
 
 
 def verify_signature(body: bytes, signature: str | None) -> None:
@@ -47,6 +76,80 @@ def push_files(payload: dict[str, Any]) -> list[str]:
         for key in ("added", "modified", "removed"):
             files.update(commit.get(key, []))
     return sorted(files)
+
+
+@app.get("/api/graph")
+def get_graph() -> dict[str, list[dict[str, Any]]]:
+    from database import Neo4jDatabase
+    from neo4j.exceptions import AuthError, ServiceUnavailable
+
+    try:
+        with Neo4jDatabase() as database:
+            return database.get_call_graph()
+    except AuthError as exc:
+        logger.warning("Neo4j rejected the configured credentials")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Neo4j authentication failed. Update NEO4J_USER and "
+                "NEO4J_PASSWORD in .env, then restart FastAPI."
+            ),
+        ) from exc
+    except ServiceUnavailable as exc:
+        logger.warning("Neo4j is unavailable at %s", settings.neo4j_uri)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Neo4j is unavailable at {settings.neo4j_uri}.",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Unable to retrieve the Neo4j call graph")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve graph data from Neo4j",
+        ) from exc
+
+
+@app.post("/api/chat")
+def chat(request: ChatRequest) -> StreamingResponse:
+    from agent import stream_agent
+    from anthropic import AuthenticationError, NotFoundError
+
+    def event_stream():
+        try:
+            for token in stream_agent(request.message.strip()):
+                yield f"data: {json.dumps({'token': token})}\n\n"
+            yield "event: done\ndata: [DONE]\n\n"
+        except NotFoundError as exc:
+            logger.warning("Anthropic model is unavailable: %s", exc)
+            payload = json.dumps(
+                {
+                    "error": (
+                        f"Anthropic model '{settings.anthropic_model}' is unavailable. "
+                        "Set ANTHROPIC_MODEL to an active Claude API model."
+                    )
+                }
+            )
+            yield f"event: error\ndata: {payload}\n\n"
+        except AuthenticationError:
+            logger.warning("Anthropic rejected the configured API key")
+            payload = json.dumps(
+                {"error": "Anthropic authentication failed. Check ANTHROPIC_API_KEY."}
+            )
+            yield f"event: error\ndata: {payload}\n\n"
+        except Exception as exc:
+            logger.exception("Unable to stream the agent response")
+            payload = json.dumps({"error": str(exc)})
+            yield f"event: error\ndata: {payload}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 async def pull_request_files(payload: dict[str, Any]) -> list[str]:

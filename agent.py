@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from typing import Annotated
 
 from langchain_anthropic import ChatAnthropic
@@ -42,7 +43,7 @@ were found in the indexed graph; do not invent relationships.
 
 def build_agent():
     model = ChatAnthropic(
-        model="claude-3-5-sonnet-latest",
+        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
         temperature=0,
     )
     tools = [get_function_callers]
@@ -71,6 +72,32 @@ def run_agent(user_query: str) -> str:
     graph = build_agent()
     result = graph.invoke({"messages": [HumanMessage(content=user_query)]})
     return str(result["messages"][-1].content)
+
+
+def _content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def stream_agent(user_query: str):
+    """Yield only user-visible text chunks from the LangGraph execution."""
+    graph = build_agent()
+    for message, metadata in graph.stream(
+        {"messages": [HumanMessage(content=user_query)]},
+        stream_mode="messages",
+    ):
+        if metadata.get("langgraph_node") != "agent":
+            continue
+        text = _content_text(message.content)
+        if text:
+            yield text
 
 
 def main() -> None:

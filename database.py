@@ -38,6 +38,26 @@ RETURN DISTINCT caller.id AS id,
 ORDER BY caller.file, caller.line, caller.qualified_name
 """
 
+GET_GRAPH_NODES = """
+MATCH (function:Function)
+RETURN function.id AS id,
+       function.name AS name,
+       function.qualified_name AS qualified_name,
+       function.file AS file,
+       function.line AS line,
+       coalesce(function.external, false) AS external
+ORDER BY function.file, function.line, function.qualified_name
+"""
+
+GET_GRAPH_EDGES = """
+MATCH (caller:Function)-[call:CALLS]->(callee:Function)
+RETURN caller.id AS source,
+       callee.id AS target,
+       coalesce(call.count, 1) AS count,
+       coalesce(call.locations, []) AS locations
+ORDER BY source, target
+"""
+
 
 class Neo4jDatabase:
     def __init__(
@@ -85,6 +105,12 @@ class Neo4jDatabase:
                 function_name=function_name,
             )
             return [record.data() for record in result]
+
+    def get_call_graph(self) -> dict[str, list[dict[str, Any]]]:
+        with self._driver.session(database=self.database) as session:
+            nodes = [record.data() for record in session.run(GET_GRAPH_NODES)]
+            edges = [record.data() for record in session.run(GET_GRAPH_EDGES)]
+        return {"nodes": nodes, "edges": edges}
 
     def close(self) -> None:
         self._driver.close()

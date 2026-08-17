@@ -132,6 +132,24 @@ function extractSseText(data) {
   }
 }
 
+async function responseError(response, fallback) {
+  try {
+    const payload = await response.json();
+    return payload.detail ?? payload.error ?? `${fallback} (${response.status})`;
+  } catch {
+    return `${fallback} (${response.status})`;
+  }
+}
+
+function extractSseError(data) {
+  try {
+    const payload = JSON.parse(data);
+    return payload.error ?? data;
+  } catch {
+    return data;
+  }
+}
+
 function ChatMessage({ message }) {
   const isUser = message.role === "user";
   return (
@@ -177,7 +195,9 @@ function App() {
     setGraphError("");
     try {
       const response = await fetch(`${API_BASE}/api/graph`);
-      if (!response.ok) throw new Error(`Graph request failed (${response.status})`);
+      if (!response.ok) {
+        throw new Error(await responseError(response, "Graph request failed"));
+      }
       const graph = normalizeGraph(await response.json());
       setNodes(graph.nodes);
       setEdges(graph.edges);
@@ -230,7 +250,9 @@ function App() {
         body: JSON.stringify({ message: prompt }),
         signal: controller.signal,
       });
-      if (!response.ok) throw new Error(`Chat request failed (${response.status})`);
+      if (!response.ok) {
+        throw new Error(await responseError(response, "Chat request failed"));
+      }
       if (!response.body) throw new Error("This browser cannot stream the response");
 
       const reader = response.body.getReader();
@@ -250,7 +272,9 @@ function App() {
             .filter((line) => line.startsWith("data:"))
             .map((line) => line.slice(5).trimStart())
             .join("\n");
-          if (eventType === "error") throw new Error(data || "Streaming failed");
+          if (eventType === "error") {
+            throw new Error(extractSseError(data) || "Streaming failed");
+          }
           accumulated += extractSseText(data);
           setMessages((current) =>
             current.map((message) =>
