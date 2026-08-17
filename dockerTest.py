@@ -11,7 +11,7 @@ try:
     with GraphDatabase.driver(URI, auth=AUTH) as driver:
         # Test connection
         driver.verify_connectivity()
-        print("✅ SUCCESS: Connected to Neo4j successfully!")
+        print("Connected to Neo4j successfully!")
 
         # Run a test query
         result = driver.execute_query("RETURN 'Neo4j is working!' AS message")

@@ -244,7 +244,7 @@ function App() {
       const response = await fetch(`${API_BASE}/api/chat`, {
         method: "POST",
         headers: {
-          Accept: "text/event-stream",
+          Accept: "application/json, text/event-stream",
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ message: prompt }),
@@ -253,38 +253,51 @@ function App() {
       if (!response.ok) {
         throw new Error(await responseError(response, "Chat request failed"));
       }
-      if (!response.body) throw new Error("This browser cannot stream the response");
+      const contentType = response.headers.get("content-type") ?? "";
+      if (contentType.includes("application/json")) {
+        const payload = await response.json();
+        accumulated = payload.response ?? "";
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === assistantId
+              ? { ...message, content: accumulated }
+              : message,
+          ),
+        );
+      } else {
+        if (!response.body) throw new Error("This browser cannot stream the response");
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
 
-      while (true) {
-        const { value, done } = await reader.read();
-        buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-        const events = buffer.split(/\r?\n\r?\n/);
-        buffer = events.pop() ?? "";
+        while (true) {
+          const { value, done } = await reader.read();
+          buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+          const events = buffer.split(/\r?\n\r?\n/);
+          buffer = events.pop() ?? "";
 
-        for (const block of events) {
-          const lines = block.split(/\r?\n/);
-          const eventType = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
-          const data = lines
-            .filter((line) => line.startsWith("data:"))
-            .map((line) => line.slice(5).trimStart())
-            .join("\n");
-          if (eventType === "error") {
-            throw new Error(extractSseError(data) || "Streaming failed");
+          for (const block of events) {
+            const lines = block.split(/\r?\n/);
+            const eventType = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+            const data = lines
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice(5).trimStart())
+              .join("\n");
+            if (eventType === "error") {
+              throw new Error(extractSseError(data) || "Streaming failed");
+            }
+            accumulated += extractSseText(data);
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === assistantId
+                  ? { ...message, content: accumulated }
+                  : message,
+              ),
+            );
           }
-          accumulated += extractSseText(data);
-          setMessages((current) =>
-            current.map((message) =>
-              message.id === assistantId
-                ? { ...message, content: accumulated }
-                : message,
-            ),
-          );
+          if (done) break;
         }
-        if (done) break;
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {

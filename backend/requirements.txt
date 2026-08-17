@@ -4,6 +4,10 @@ pydantic
 pydantic-settings
 python-dotenv
 httpx
+langchain-anthropic
+langgraph
+neo4j
+pytest
 tree-sitter
 tree-sitter-python
 tree-sitter-typescript
