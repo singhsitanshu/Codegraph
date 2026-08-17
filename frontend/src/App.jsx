@@ -1,16 +1,33 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   BackgroundVariant,
   Controls,
+  Handle,
   MarkerType,
   MiniMap,
+  Position,
   ReactFlow,
   useEdgesState,
   useNodesState,
 } from "@xyflow/react";
 
 const API_BASE = "http://localhost:8000";
+const NODE_WIDTH = 210;
+const NODE_HEIGHT = 64;
+const FILE_HEADER_HEIGHT = 72;
+const FILE_PADDING = 18;
+const CHILD_COLUMN_GAP = 18;
+const CHILD_ROW_GAP = 16;
+const COLLAPSED_FILE_WIDTH = 300;
+const COLLAPSED_FILE_HEIGHT = 72;
+const MODULE_COLUMN_GAP = 80;
+const MODULE_ROW_GAP = 120;
+const LAYOUT_MARGIN = 50;
+const INITIAL_ZOOM = 0.85;
+const DEFAULT_EDGE_COLOR = "#789084";
+const FOCUSED_EDGE_COLOR = "#178b6b";
+const PRIMARY_FILES = new Set(["api.py", "sessions.py", "models.py", "adapters.py"]);
 
 const starterMessages = [
   {
@@ -51,63 +68,360 @@ function Icon({ name, className = "size-4" }) {
   );
 }
 
-function layoutNodes(rawNodes) {
-  const columns = Math.max(1, Math.ceil(Math.sqrt(rawNodes.length)));
+function getNodeKind(raw, data) {
+  const labels = raw.labels ?? data.labels ?? [];
+  if (labels.includes("File")) return "File";
+  if (labels.includes("Function")) return "Function";
+  return data.nodeType ?? raw.nodeType ?? "Function";
+}
+
+const GraphNode = memo(function GraphNode({ data }) {
+  const isExternal = Boolean(data.external);
+  const isFocused = data.focusState === "focused";
+  const isNeighbor = data.focusState === "neighbor";
+  const borderClass = isFocused
+    ? "border-[#23a47d] ring-4 ring-[#23a47d]/20"
+    : isNeighbor
+      ? "border-[#74b9a1] ring-2 ring-[#74b9a1]/15"
+      : isExternal
+        ? "border-[#d5a24e]"
+        : "border-[#8ab7a8]";
+  const surfaceClass = isExternal
+      ? "bg-[#fffaf0] text-[#423629] shadow-[0_8px_22px_rgba(91,67,28,0.09)]"
+      : "bg-white text-[#20332d] shadow-[0_8px_22px_rgba(32,51,45,0.09)]";
+
+  return (
+    <div
+      className={`relative flex h-16 w-[210px] items-center gap-3 rounded-2xl border px-4 py-3 transition-[border-color,box-shadow] duration-150 ${borderClass} ${surfaceClass}`}
+      title={data.fullLabel}
+      aria-label={`${data.nodeType}: ${data.fullLabel}`}
+    >
+      <Handle
+        type="target"
+        position={Position.Top}
+        className="!size-2 !border-2 !border-white !bg-[#789084]"
+      />
+      <span
+        className={`grid size-8 shrink-0 place-items-center rounded-lg text-[10px] font-extrabold uppercase ${
+          isExternal
+            ? "bg-[#f4dfb9] text-[#855f23]"
+            : "bg-[#e3f3ed] text-[#276d54]"
+        }`}
+      >
+        ƒ
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-xs font-extrabold leading-5">{data.fullLabel}</p>
+        <p
+          className={`mt-0.5 truncate text-[9px] font-bold uppercase tracking-[0.13em] ${
+            "text-[#809088]"
+          }`}
+        >
+          {isExternal ? "External function" : data.nodeType}
+        </p>
+      </div>
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        className="!size-2 !border-2 !border-white !bg-[#789084]"
+      />
+    </div>
+  );
+});
+
+const FileGroupNode = memo(function FileGroupNode({ data }) {
+  const isFocused = data.focusState === "focused";
+  const isNeighbor = data.focusState === "neighbor";
+  return (
+    <div
+      className={`h-full w-full overflow-hidden rounded-[22px] border bg-[#1e293b] text-white shadow-[0_16px_42px_rgba(15,23,42,0.2)] transition-[border-color,box-shadow] duration-150 ${
+        isFocused
+          ? "border-[#3dd6a4] ring-4 ring-[#23a47d]/20"
+          : isNeighbor
+            ? "border-[#74b9a1]"
+            : "border-[#334155]"
+      }`}
+      title={data.fullLabel}
+      aria-label={`File: ${data.fullLabel}. Click to ${data.collapsed ? "expand" : "collapse"}.`}
+    >
+      <Handle
+        type="target"
+        position={Position.Top}
+        className="!size-2.5 !border-2 !border-[#1e293b] !bg-[#8ba39a]"
+      />
+      <div className="flex h-[72px] items-center gap-3 border-b border-white/10 px-5">
+        <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/10 text-xs font-extrabold text-[#b9f2da]">
+          F
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-[13px] font-extrabold">{data.displayName}</p>
+          <p className="mt-1 text-[9px] font-bold uppercase tracking-[0.14em] text-slate-400">
+            {data.childCount} {data.childCount === 1 ? "function" : "functions"}
+          </p>
+        </div>
+        <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-white/8 text-base text-slate-300">
+          {data.collapsed ? "+" : "−"}
+        </span>
+      </div>
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        className="!size-2.5 !border-2 !border-[#1e293b] !bg-[#8ba39a]"
+      />
+    </div>
+  );
+});
+
+const nodeTypes = { fileGroup: FileGroupNode, graphNode: GraphNode };
+
+function basename(path) {
+  return String(path).split(/[\\/]/).pop() || String(path);
+}
+
+function normalizeNodes(rawNodes) {
   return rawNodes.map((raw, index) => {
     const data = raw.data ?? {};
     const external = raw.external ?? data.external ?? false;
+    const fullLabel = String(
+      data.label ??
+        raw.label ??
+        raw.qualified_name ??
+        raw.name ??
+        `Function ${index + 1}`,
+    );
     return {
       ...raw,
       id: String(raw.id ?? raw.elementId ?? index),
-      position: raw.position ?? {
-        x: (index % columns) * 230,
-        y: Math.floor(index / columns) * 130,
-      },
+      type: getNodeKind(raw, data) === "File" ? "fileGroup" : "graphNode",
+      position: { x: 0, y: 0 },
+      sourcePosition: Position.Bottom,
+      targetPosition: Position.Top,
       data: {
         ...data,
-        label:
-          data.label ??
-          raw.label ??
-          raw.qualified_name ??
-          raw.name ??
-          `Function ${index + 1}`,
+        external,
+        fullLabel,
+        displayName: basename(fullLabel),
+        label: fullLabel,
+        nodeType: getNodeKind(raw, data),
       },
       style: {
-        background: external ? "#fffaf0" : "#ffffff",
-        border: `1px solid ${external ? "#e7b56d" : "#cbd8d1"}`,
-        borderRadius: 14,
-        boxShadow: "0 8px 24px rgba(34, 55, 48, 0.08)",
-        color: "#20332d",
-        fontFamily: "Manrope, sans-serif",
-        fontSize: 12,
-        fontWeight: 700,
-        padding: "10px 14px",
-        width: 180,
+        width: NODE_WIDTH,
+        height: NODE_HEIGHT,
         ...raw.style,
       },
     };
   });
 }
 
-function normalizeGraph(payload) {
-  const rawNodes = payload.nodes ?? payload.functions ?? [];
-  const rawEdges = payload.edges ?? payload.calls ?? [];
-  return {
-    nodes: layoutNodes(rawNodes),
-    edges: rawEdges.map((edge, index) => ({
-      ...edge,
-      id: String(edge.id ?? `edge-${index}`),
-      source: String(edge.source ?? edge.caller_id),
-      target: String(edge.target ?? edge.callee_id),
-      type: edge.type ?? "smoothstep",
-      markerEnd: edge.markerEnd ?? {
-        type: MarkerType.ArrowClosed,
-        color: "#7d958a",
-        width: 16,
-        height: 16,
+function normalizeEdges(rawEdges) {
+  return rawEdges.map((edge, index) => ({
+    ...edge,
+    id: String(edge.id ?? `edge-${index}`),
+    source: String(edge.source ?? edge.caller_id),
+    target: String(edge.target ?? edge.callee_id),
+    type: "smoothstep",
+    markerEnd: {
+      type: MarkerType.ArrowClosed,
+      color: DEFAULT_EDGE_COLOR,
+      width: 18,
+      height: 18,
+    },
+    style: {
+      ...edge.style,
+      stroke: DEFAULT_EDGE_COLOR,
+      strokeWidth: 1.35,
+      opacity: 0.35,
+    },
+  }));
+}
+
+function buildCompoundNodes(nodes, edges) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const fileNodes = nodes.filter((node) => node.data.nodeType === "File");
+  const functionNodes = nodes.filter((node) => node.data.nodeType === "Function");
+  const fileByPath = new Map();
+  fileNodes.forEach((file) => {
+    const path = file.data.path ?? file.data.fullLabel;
+    fileByPath.set(String(path), file.id);
+  });
+
+  const parentFromDefines = new Map();
+  edges.forEach((edge) => {
+    const source = nodeById.get(edge.source);
+    const target = nodeById.get(edge.target);
+    if (source?.data.nodeType === "File" && target?.data.nodeType === "Function") {
+      parentFromDefines.set(target.id, source.id);
+    }
+  });
+
+  const orphanFunctions = functionNodes.filter((node) => {
+    const filePath = node.data.file;
+    return !parentFromDefines.has(node.id) && !fileByPath.has(String(filePath ?? ""));
+  });
+  let externalGroup = null;
+  if (orphanFunctions.length > 0) {
+    let externalId = "module:external-dependencies";
+    while (nodeById.has(externalId)) externalId = `${externalId}:fallback`;
+    externalGroup = {
+      id: externalId,
+      type: "fileGroup",
+      position: { x: 0, y: 0 },
+      data: {
+        nodeType: "File",
+        synthetic: true,
+        fullLabel: "External dependencies",
+        displayName: "External dependencies",
+        label: "External dependencies",
+        collapsed: true,
       },
-      style: { stroke: "#7d958a", strokeWidth: 1.4, ...edge.style },
-    })),
+      style: {},
+    };
+    fileNodes.push(externalGroup);
+  }
+
+  const parents = fileNodes.map((file) => {
+    const primary = PRIMARY_FILES.has(basename(file.data.path ?? file.data.fullLabel));
+    return {
+      ...file,
+      type: "fileGroup",
+      data: {
+        ...file.data,
+        collapsed: file.data.synthetic ? true : !primary,
+      },
+    };
+  });
+  const children = functionNodes.map((node) => {
+    const parentId =
+      parentFromDefines.get(node.id) ??
+      fileByPath.get(String(node.data.file ?? "")) ??
+      externalGroup?.id;
+    return {
+      ...node,
+      parentId,
+      extent: "parent",
+      expandParent: false,
+      draggable: false,
+    };
+  });
+  return [...parents, ...children];
+}
+
+function layoutFileModules(nodes) {
+  const parents = nodes.filter((node) => node.data.nodeType === "File");
+  const childrenByParent = new Map(parents.map((node) => [node.id, []]));
+  nodes.forEach((node) => {
+    if (node.parentId && childrenByParent.has(node.parentId)) {
+      childrenByParent.get(node.parentId).push(node);
+    }
+  });
+  childrenByParent.forEach((children) => {
+    children.sort((left, right) =>
+      left.data.fullLabel.localeCompare(right.data.fullLabel),
+    );
+  });
+
+  const parentLayouts = parents
+    .map((parent) => {
+      const children = childrenByParent.get(parent.id) ?? [];
+      const collapsed = Boolean(parent.data.collapsed);
+      const columns = collapsed
+        ? 1
+        : Math.min(3, Math.max(1, Math.ceil(Math.sqrt(children.length))));
+      const rows = Math.max(1, Math.ceil(children.length / columns));
+      const width = collapsed
+        ? COLLAPSED_FILE_WIDTH
+        : FILE_PADDING * 2 + columns * NODE_WIDTH + (columns - 1) * CHILD_COLUMN_GAP;
+      const height = collapsed
+        ? COLLAPSED_FILE_HEIGHT
+        : FILE_HEADER_HEIGHT + FILE_PADDING * 2 + rows * NODE_HEIGHT + (rows - 1) * CHILD_ROW_GAP;
+      return { parent, children, collapsed, columns, width, height };
+    })
+    .sort((left, right) => {
+      const leftPrimary = PRIMARY_FILES.has(left.parent.data.displayName);
+      const rightPrimary = PRIMARY_FILES.has(right.parent.data.displayName);
+      if (leftPrimary !== rightPrimary) return leftPrimary ? -1 : 1;
+      return left.parent.data.fullLabel.localeCompare(right.parent.data.fullLabel);
+    });
+
+  const moduleColumns = Math.max(1, Math.ceil(Math.sqrt(parentLayouts.length)));
+  const positioned = new Map();
+  let y = LAYOUT_MARGIN;
+  for (let rowStart = 0; rowStart < parentLayouts.length; rowStart += moduleColumns) {
+    const row = parentLayouts.slice(rowStart, rowStart + moduleColumns);
+    let x = LAYOUT_MARGIN;
+    let rowHeight = 0;
+    row.forEach(({ parent, children, collapsed, columns, width, height }) => {
+      positioned.set(parent.id, {
+        ...parent,
+        position: { x, y },
+        data: { ...parent.data, childCount: children.length },
+        style: { width, height },
+      });
+      children.forEach((child, index) => {
+        positioned.set(child.id, {
+          ...child,
+          hidden: collapsed,
+          position: {
+            x: FILE_PADDING + (index % columns) * (NODE_WIDTH + CHILD_COLUMN_GAP),
+            y:
+              FILE_HEADER_HEIGHT +
+              FILE_PADDING +
+              Math.floor(index / columns) * (NODE_HEIGHT + CHILD_ROW_GAP),
+          },
+          style: { ...child.style, width: NODE_WIDTH, height: NODE_HEIGHT },
+        });
+      });
+      x += width + MODULE_COLUMN_GAP;
+      rowHeight = Math.max(rowHeight, height);
+    });
+    y += rowHeight + MODULE_ROW_GAP;
+  }
+  return [
+    ...parentLayouts.map(({ parent }) => positioned.get(parent.id)),
+    ...nodes
+      .filter((node) => node.parentId)
+      .map((node) => positioned.get(node.id))
+      .filter(Boolean),
+  ];
+}
+
+function getInitialCenter(nodes, edges) {
+  const parentByNode = new Map(
+    nodes.map((node) => [node.id, node.parentId ?? node.id]),
+  );
+  const degree = new Map();
+  edges.forEach((edge) => {
+    const sourceParent = parentByNode.get(edge.source);
+    const targetParent = parentByNode.get(edge.target);
+    if (!sourceParent || !targetParent || sourceParent === targetParent) return;
+    degree.set(sourceParent, (degree.get(sourceParent) ?? 0) + 1);
+    degree.set(targetParent, (degree.get(targetParent) ?? 0) + 1);
+  });
+  const files = nodes.filter(
+    (node) => node.data.nodeType === "File" && !node.data.synthetic,
+  );
+  const entryPoints = files.filter((node) =>
+    new Set(["api.py", "sessions.py"]).has(node.data.displayName),
+  );
+  const candidates = entryPoints.length > 0 ? entryPoints : files;
+  const target = candidates.sort(
+    (left, right) => (degree.get(right.id) ?? 0) - (degree.get(left.id) ?? 0),
+  )[0];
+  if (!target) return { x: 0, y: 0 };
+  return {
+    x: target.position.x + Number(target.style.width) / 2,
+    y: target.position.y + Number(target.style.height) / 2,
+  };
+}
+
+function normalizeGraph(payload) {
+  const normalizedNodes = normalizeNodes(payload.nodes ?? payload.functions ?? []);
+  const edges = normalizeEdges(payload.edges ?? payload.calls ?? []);
+  const nodes = layoutFileModules(buildCompoundNodes(normalizedNodes, edges));
+  return {
+    nodes,
+    edges,
+    initialCenter: getInitialCenter(nodes, edges),
   };
 }
 
@@ -181,6 +495,9 @@ function ChatMessage({ message }) {
 function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [focusedNodeId, setFocusedNodeId] = useState(null);
+  const [initialCenter, setInitialCenter] = useState(null);
+  const [flowReady, setFlowReady] = useState(false);
   const [graphStatus, setGraphStatus] = useState("loading");
   const [graphError, setGraphError] = useState("");
   const [messages, setMessages] = useState(starterMessages);
@@ -189,6 +506,113 @@ function App() {
   const [chatError, setChatError] = useState("");
   const abortRef = useRef(null);
   const messagesEndRef = useRef(null);
+  const flowInstanceRef = useRef(null);
+
+  const adjacencyIndex = useMemo(() => {
+    const index = new Map();
+    edges.forEach((edge) => {
+      if (!index.has(edge.source)) {
+        index.set(edge.source, { nodeIds: new Set(), edgeIds: new Set() });
+      }
+      if (!index.has(edge.target)) {
+        index.set(edge.target, { nodeIds: new Set(), edgeIds: new Set() });
+      }
+      index.get(edge.source).nodeIds.add(edge.target);
+      index.get(edge.source).edgeIds.add(edge.id);
+      index.get(edge.target).nodeIds.add(edge.source);
+      index.get(edge.target).edgeIds.add(edge.id);
+    });
+    return index;
+  }, [edges]);
+
+  const focusedConnections = focusedNodeId
+    ? adjacencyIndex.get(focusedNodeId)
+    : null;
+
+  const hiddenNodeIds = useMemo(
+    () => new Set(nodes.filter((node) => node.hidden).map((node) => node.id)),
+    [nodes],
+  );
+  const graphCounts = useMemo(
+    () => ({
+      files: nodes.filter((node) => node.data.nodeType === "File").length,
+      functions: nodes.filter((node) => node.data.nodeType === "Function").length,
+    }),
+    [nodes],
+  );
+
+  const visibleNodes = useMemo(() => {
+    if (!focusedNodeId) return nodes;
+    const neighborIds = focusedConnections?.nodeIds ?? new Set();
+
+    return nodes.map((node) => {
+      const isFocused = node.id === focusedNodeId;
+      const isNeighbor = neighborIds.has(node.id);
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          focusState: isFocused
+            ? "focused"
+            : isNeighbor
+              ? "neighbor"
+              : "dimmed",
+        },
+        style: {
+          ...node.style,
+          opacity: isFocused || isNeighbor ? 1 : 0.1,
+          transition: "opacity 150ms ease",
+          zIndex: isFocused ? 20 : isNeighbor ? 10 : 0,
+        },
+      };
+    });
+  }, [focusedConnections, focusedNodeId, nodes]);
+
+  const visibleEdges = useMemo(() => {
+    const connectedEdgeIds = focusedConnections?.edgeIds ?? new Set();
+
+    return edges.map((edge) => {
+      const hidden = hiddenNodeIds.has(edge.source) || hiddenNodeIds.has(edge.target);
+      const isConnected = Boolean(focusedNodeId) && connectedEdgeIds.has(edge.id);
+      return {
+        ...edge,
+        hidden,
+        animated: isConnected && !hidden,
+        markerEnd: {
+          ...edge.markerEnd,
+          color: isConnected ? FOCUSED_EDGE_COLOR : DEFAULT_EDGE_COLOR,
+        },
+        style: {
+          ...edge.style,
+          stroke: isConnected ? FOCUSED_EDGE_COLOR : DEFAULT_EDGE_COLOR,
+          strokeWidth: isConnected ? 2.8 : 1,
+          opacity: focusedNodeId ? (isConnected ? 1 : 0.08) : 0.35,
+          transition: "opacity 150ms ease, stroke 150ms ease",
+        },
+        zIndex: isConnected ? 15 : 0,
+      };
+    });
+  }, [edges, focusedConnections, focusedNodeId, hiddenNodeIds]);
+
+  const toggleFileNode = useCallback(
+    (_, selectedNode) => {
+      if (selectedNode.data.nodeType !== "File") return;
+      setFocusedNodeId(null);
+      setNodes((currentNodes) =>
+        layoutFileModules(
+          currentNodes.map((node) =>
+            node.id === selectedNode.id
+              ? {
+                  ...node,
+                  data: { ...node.data, collapsed: !node.data.collapsed },
+                }
+              : node,
+          ),
+        ),
+      );
+    },
+    [setNodes],
+  );
 
   const loadGraph = useCallback(async () => {
     setGraphStatus("loading");
@@ -201,6 +625,8 @@ function App() {
       const graph = normalizeGraph(await response.json());
       setNodes(graph.nodes);
       setEdges(graph.edges);
+      setInitialCenter(graph.initialCenter);
+      setFocusedNodeId(null);
       setGraphStatus("ready");
     } catch (error) {
       setGraphError(error instanceof Error ? error.message : "Could not load graph");
@@ -211,6 +637,24 @@ function App() {
   useEffect(() => {
     loadGraph();
   }, [loadGraph]);
+
+  useEffect(() => {
+    if (
+      graphStatus !== "ready" ||
+      !flowReady ||
+      !initialCenter ||
+      !flowInstanceRef.current
+    ) {
+      return undefined;
+    }
+    const frame = requestAnimationFrame(() => {
+      flowInstanceRef.current?.setCenter(initialCenter.x, initialCenter.y, {
+        zoom: INITIAL_ZOOM,
+        duration: 350,
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [flowReady, graphStatus, initialCenter]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -414,7 +858,7 @@ function App() {
                 </span>
               </div>
               <p className="mt-1 text-[10px] font-medium text-[#83918b]">
-                {nodes.length} functions · {edges.length} call relationships
+                {graphCounts.files} files · {graphCounts.functions} functions · {edges.length} relationships
               </p>
             </div>
             <button
@@ -444,14 +888,24 @@ function App() {
               </div>
             ) : (
               <ReactFlow
-                nodes={nodes}
-                edges={edges}
+                nodes={visibleNodes}
+                edges={visibleEdges}
+                nodeTypes={nodeTypes}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
-                fitView
-                fitViewOptions={{ padding: 0.25 }}
-                minZoom={0.25}
+                onInit={(instance) => {
+                  flowInstanceRef.current = instance;
+                  setFlowReady(true);
+                }}
+                onNodeClick={toggleFileNode}
+                onNodeMouseEnter={(_, node) => {
+                  if (node.data.nodeType === "Function") setFocusedNodeId(node.id);
+                }}
+                onNodeMouseLeave={() => setFocusedNodeId(null)}
+                defaultViewport={{ x: 0, y: 0, zoom: INITIAL_ZOOM }}
+                minZoom={0.15}
                 maxZoom={1.8}
+                onlyRenderVisibleElements
                 proOptions={{ hideAttribution: true }}
               >
                 <Background color="#cbd4cd" gap={24} size={1} variant={BackgroundVariant.Dots} />
@@ -460,7 +914,11 @@ function App() {
                   pannable
                   zoomable
                   position="bottom-left"
-                  nodeColor={(node) => node.data?.external ? "#e7b56d" : "#3b765f"}
+                  nodeColor={(node) => {
+                    if (node.data?.nodeType === "File") return "#1e293b";
+                    if (node.data?.external) return "#d5a24e";
+                    return "#4f9c82";
+                  }}
                   maskColor="rgba(238, 241, 235, 0.75)"
                 />
               </ReactFlow>
