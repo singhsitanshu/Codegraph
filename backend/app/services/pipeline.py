@@ -3,6 +3,8 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
+from app.services.parser_service import parse_changed_files
+
 
 logger = logging.getLogger(__name__)
 
@@ -79,18 +81,17 @@ async def process_github_event(payload: dict[str, Any], event_type: str) -> None
             changed_files,
         )
 
-        # Yield control between stages. The real implementations should use
-        # native async clients or explicitly offload blocking work to a thread.
-        await asyncio.sleep(0)
+        parsed_relationships = await parse_changed_files(changed_files)
         logger.info(
-            "Tree-sitter stage placeholder: re-parse modified files=%s",
-            changed_files,
+            "Tree-sitter stage complete: parsed %d of %d changed file(s)",
+            len(parsed_relationships),
+            len(changed_files),
         )
 
         await asyncio.sleep(0)
         logger.info(
-            "Neo4j stage placeholder: update graph nodes and edges for files=%s",
-            changed_files,
+            "Neo4j stage placeholder: ingest parsed relationships=%s",
+            parsed_relationships,
         )
 
         await asyncio.sleep(0)

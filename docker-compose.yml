@@ -3,12 +3,12 @@ services:
     image: neo4j:latest
     container_name: codebase_graph_db
     ports:
-      - "7474:7474" # HTTP port for the Neo4j Browser UI
-      - "7687:7687" # Bolt port for Python/FastAPI connection
+      - "7474:7474"  # Web UI
+      - "7687:7687"  # Bolt Protocol (Python connection)
     environment:
-      - NEO4J_AUTH=aansh/gladline # Set your username and password here
+      - NEO4J_AUTH=neo4j/gladline
     volumes:
-      - neo4j_data:/data # Ensures your graph data persists if the container restarts
+      - neo4j_data:/data
 
 volumes:
   neo4j_data:

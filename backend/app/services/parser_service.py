@@ -268,3 +268,55 @@ class CodeParser:
                 extension,
                 source_code,
             )
+
+
+async def parse_changed_files(
+    file_paths: list[str],
+) -> list[dict[str, str | list[str]]]:
+    """Parse a collection of changed source files from disk.
+
+    Files are read concurrently without blocking the FastAPI event loop. A
+    single :class:`CodeParser` instance is reused for the batch so languages and
+    queries are initialized only once. Results retain the order of ``file_paths``
+    after deleted, unsupported, or failed files are omitted.
+
+    Args:
+        file_paths: Python, TypeScript, or TSX paths available on local disk.
+
+    Returns:
+        Graph-ready relationship dictionaries for successfully parsed files.
+    """
+
+    if not file_paths:
+        return []
+
+    code_parser = CodeParser()
+
+    async def parse_path(file_path: str) -> dict[str, str | list[str]] | None:
+        path = Path(file_path)
+        try:
+            source_code = await asyncio.to_thread(path.read_bytes)
+        except FileNotFoundError:
+            logger.info("Skipping missing or deleted source file: %s", file_path)
+            return None
+        except OSError as exc:
+            logger.warning("Unable to read source file %s: %s", file_path, exc)
+            return None
+
+        try:
+            return await code_parser.parse_file(file_path, source_code)
+        except ValueError as exc:
+            logger.warning("Skipping unsupported source file %s: %s", file_path, exc)
+        except Exception as exc:
+            logger.warning(
+                "Tree-sitter failed to parse source file %s: %s",
+                file_path,
+                exc,
+                exc_info=True,
+            )
+        return None
+
+    parsed_files = await asyncio.gather(
+        *(parse_path(file_path) for file_path in file_paths)
+    )
+    return [result for result in parsed_files if result is not None]
