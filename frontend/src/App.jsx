@@ -1,5 +1,12 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  forceCenter,
+  forceCollide,
+  forceLink,
+  forceManyBody,
+  forceSimulation,
+} from "d3-force";
+import {
   Background,
   BackgroundVariant,
   Controls,
@@ -13,21 +20,15 @@ import {
 } from "@xyflow/react";
 
 const API_BASE = "http://localhost:8000";
-const NODE_WIDTH = 210;
-const NODE_HEIGHT = 64;
-const FILE_HEADER_HEIGHT = 72;
-const FILE_PADDING = 18;
-const CHILD_COLUMN_GAP = 18;
-const CHILD_ROW_GAP = 16;
-const COLLAPSED_FILE_WIDTH = 300;
-const COLLAPSED_FILE_HEIGHT = 72;
-const MODULE_COLUMN_GAP = 80;
-const MODULE_ROW_GAP = 120;
-const LAYOUT_MARGIN = 50;
-const INITIAL_ZOOM = 0.85;
+const FUNCTION_NODE_WIDTH = 150;
+const FUNCTION_NODE_HEIGHT = 52;
+const FILE_NODE_MIN_WIDTH = 190;
+const FILE_NODE_MIN_HEIGHT = 72;
+const INITIAL_ZOOM = 1;
+const MANY_BODY_STRENGTH = -45;
+const LINK_DISTANCE = 100;
 const DEFAULT_EDGE_COLOR = "#789084";
 const FOCUSED_EDGE_COLOR = "#178b6b";
-const PRIMARY_FILES = new Set(["api.py", "sessions.py", "models.py", "adapters.py"]);
 
 const starterMessages = [
   {
@@ -75,6 +76,32 @@ function getNodeKind(raw, data) {
   return data.nodeType ?? raw.nodeType ?? "Function";
 }
 
+const HANDLE_SIDES = [
+  ["top", Position.Top],
+  ["right", Position.Right],
+  ["bottom", Position.Bottom],
+  ["left", Position.Left],
+];
+
+function DirectionalHandles({ className }) {
+  return HANDLE_SIDES.flatMap(([side, position]) => [
+    <Handle
+      key={`target-${side}`}
+      id={`target-${side}`}
+      type="target"
+      position={position}
+      className={className}
+    />,
+    <Handle
+      key={`source-${side}`}
+      id={`source-${side}`}
+      type="source"
+      position={position}
+      className={className}
+    />,
+  ]);
+}
+
 const GraphNode = memo(function GraphNode({ data }) {
   const isExternal = Boolean(data.external);
   const isFocused = data.focusState === "focused";
@@ -92,17 +119,13 @@ const GraphNode = memo(function GraphNode({ data }) {
 
   return (
     <div
-      className={`relative flex h-16 w-[210px] items-center gap-3 rounded-2xl border px-4 py-3 transition-[border-color,box-shadow] duration-150 ${borderClass} ${surfaceClass}`}
+      className={`relative flex h-full w-full items-center gap-2.5 rounded-xl border px-3 py-2 transition-[border-color,box-shadow] duration-150 ${borderClass} ${surfaceClass}`}
       title={data.fullLabel}
       aria-label={`${data.nodeType}: ${data.fullLabel}`}
     >
-      <Handle
-        type="target"
-        position={Position.Top}
-        className="!size-2 !border-2 !border-white !bg-[#789084]"
-      />
+      <DirectionalHandles className="!size-2 !border-2 !border-white !bg-[#789084]" />
       <span
-        className={`grid size-8 shrink-0 place-items-center rounded-lg text-[10px] font-extrabold uppercase ${
+        className={`grid size-7 shrink-0 place-items-center rounded-lg text-[10px] font-extrabold uppercase ${
           isExternal
             ? "bg-[#f4dfb9] text-[#855f23]"
             : "bg-[#e3f3ed] text-[#276d54]"
@@ -111,7 +134,7 @@ const GraphNode = memo(function GraphNode({ data }) {
         ƒ
       </span>
       <div className="min-w-0 flex-1">
-        <p className="truncate text-xs font-extrabold leading-5">{data.fullLabel}</p>
+        <p className="truncate text-[11px] font-extrabold leading-4">{data.fullLabel}</p>
         <p
           className={`mt-0.5 truncate text-[9px] font-bold uppercase tracking-[0.13em] ${
             "text-[#809088]"
@@ -120,21 +143,16 @@ const GraphNode = memo(function GraphNode({ data }) {
           {isExternal ? "External function" : data.nodeType}
         </p>
       </div>
-      <Handle
-        type="source"
-        position={Position.Bottom}
-        className="!size-2 !border-2 !border-white !bg-[#789084]"
-      />
     </div>
   );
 });
 
-const FileGroupNode = memo(function FileGroupNode({ data }) {
+const FileHubNode = memo(function FileHubNode({ data }) {
   const isFocused = data.focusState === "focused";
   const isNeighbor = data.focusState === "neighbor";
   return (
     <div
-      className={`h-full w-full overflow-hidden rounded-[22px] border bg-[#1e293b] text-white shadow-[0_16px_42px_rgba(15,23,42,0.2)] transition-[border-color,box-shadow] duration-150 ${
+      className={`flex h-full w-full items-center gap-3 overflow-hidden rounded-[20px] border bg-[#1e293b] px-4 text-white shadow-[0_16px_42px_rgba(15,23,42,0.22)] transition-[border-color,box-shadow] duration-150 ${
         isFocused
           ? "border-[#3dd6a4] ring-4 ring-[#23a47d]/20"
           : isNeighbor
@@ -142,37 +160,23 @@ const FileGroupNode = memo(function FileGroupNode({ data }) {
             : "border-[#334155]"
       }`}
       title={data.fullLabel}
-      aria-label={`File: ${data.fullLabel}. Click to ${data.collapsed ? "expand" : "collapse"}.`}
+      aria-label={`File hub: ${data.fullLabel}, ${data.degree} connections`}
     >
-      <Handle
-        type="target"
-        position={Position.Top}
-        className="!size-2.5 !border-2 !border-[#1e293b] !bg-[#8ba39a]"
-      />
-      <div className="flex h-[72px] items-center gap-3 border-b border-white/10 px-5">
-        <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/10 text-xs font-extrabold text-[#b9f2da]">
-          F
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-[13px] font-extrabold">{data.displayName}</p>
-          <p className="mt-1 text-[9px] font-bold uppercase tracking-[0.14em] text-slate-400">
-            {data.childCount} {data.childCount === 1 ? "function" : "functions"}
-          </p>
-        </div>
-        <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-white/8 text-base text-slate-300">
-          {data.collapsed ? "+" : "−"}
-        </span>
+      <DirectionalHandles className="!size-2.5 !border-2 !border-[#1e293b] !bg-[#8ba39a]" />
+      <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-white/10 text-xs font-extrabold text-[#b9f2da]">
+        F
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[13px] font-extrabold">{data.displayName}</p>
+        <p className="mt-1 truncate text-[9px] font-bold uppercase tracking-[0.14em] text-slate-400">
+          Module hub · {data.degree} links
+        </p>
       </div>
-      <Handle
-        type="source"
-        position={Position.Bottom}
-        className="!size-2.5 !border-2 !border-[#1e293b] !bg-[#8ba39a]"
-      />
     </div>
   );
 });
 
-const nodeTypes = { fileGroup: FileGroupNode, graphNode: GraphNode };
+const nodeTypes = { fileHub: FileHubNode, graphNode: GraphNode };
 
 function basename(path) {
   return String(path).split(/[\\/]/).pop() || String(path);
@@ -182,6 +186,7 @@ function normalizeNodes(rawNodes) {
   return rawNodes.map((raw, index) => {
     const data = raw.data ?? {};
     const external = raw.external ?? data.external ?? false;
+    const nodeType = getNodeKind(raw, data);
     const fullLabel = String(
       data.label ??
         raw.label ??
@@ -192,7 +197,7 @@ function normalizeNodes(rawNodes) {
     return {
       ...raw,
       id: String(raw.id ?? raw.elementId ?? index),
-      type: getNodeKind(raw, data) === "File" ? "fileGroup" : "graphNode",
+      type: nodeType === "File" ? "fileHub" : "graphNode",
       position: { x: 0, y: 0 },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
@@ -202,13 +207,9 @@ function normalizeNodes(rawNodes) {
         fullLabel,
         displayName: basename(fullLabel),
         label: fullLabel,
-        nodeType: getNodeKind(raw, data),
+        nodeType,
       },
-      style: {
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
-        ...raw.style,
-      },
+      style: { ...raw.style },
     };
   });
 }
@@ -219,7 +220,7 @@ function normalizeEdges(rawEdges) {
     id: String(edge.id ?? `edge-${index}`),
     source: String(edge.source ?? edge.caller_id),
     target: String(edge.target ?? edge.callee_id),
-    type: "smoothstep",
+    type: "straight",
     markerEnd: {
       type: MarkerType.ArrowClosed,
       color: DEFAULT_EDGE_COLOR,
@@ -232,180 +233,113 @@ function normalizeEdges(rawEdges) {
       strokeWidth: 1.35,
       opacity: 0.35,
     },
+    interactionWidth: 16,
   }));
 }
 
-function buildCompoundNodes(nodes, edges) {
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
-  const fileNodes = nodes.filter((node) => node.data.nodeType === "File");
-  const functionNodes = nodes.filter((node) => node.data.nodeType === "Function");
-  const fileByPath = new Map();
-  fileNodes.forEach((file) => {
-    const path = file.data.path ?? file.data.fullLabel;
-    fileByPath.set(String(path), file.id);
-  });
-
-  const parentFromDefines = new Map();
+function getDegrees(nodes, edges) {
+  const degree = new Map();
+  nodes.forEach((node) => degree.set(node.id, 0));
   edges.forEach((edge) => {
-    const source = nodeById.get(edge.source);
-    const target = nodeById.get(edge.target);
-    if (source?.data.nodeType === "File" && target?.data.nodeType === "Function") {
-      parentFromDefines.set(target.id, source.id);
+    if (degree.has(edge.source)) {
+      degree.set(edge.source, degree.get(edge.source) + 1);
+    }
+    if (degree.has(edge.target)) {
+      degree.set(edge.target, degree.get(edge.target) + 1);
     }
   });
+  return degree;
+}
 
-  const orphanFunctions = functionNodes.filter((node) => {
-    const filePath = node.data.file;
-    return !parentFromDefines.has(node.id) && !fileByPath.has(String(filePath ?? ""));
-  });
-  let externalGroup = null;
-  if (orphanFunctions.length > 0) {
-    let externalId = "module:external-dependencies";
-    while (nodeById.has(externalId)) externalId = `${externalId}:fallback`;
-    externalGroup = {
-      id: externalId,
-      type: "fileGroup",
-      position: { x: 0, y: 0 },
-      data: {
-        nodeType: "File",
-        synthetic: true,
-        fullLabel: "External dependencies",
-        displayName: "External dependencies",
-        label: "External dependencies",
-        collapsed: true,
-      },
-      style: {},
-    };
-    fileNodes.push(externalGroup);
-  }
-
-  const parents = fileNodes.map((file) => {
-    const primary = PRIMARY_FILES.has(basename(file.data.path ?? file.data.fullLabel));
+function getNodeDimensions(node, maxDegree) {
+  const degreeRatio = Math.sqrt((node.data.degree ?? 0) / Math.max(1, maxDegree));
+  if (node.data.nodeType === "File") {
     return {
-      ...file,
-      type: "fileGroup",
-      data: {
-        ...file.data,
-        collapsed: file.data.synthetic ? true : !primary,
-      },
+      width: FILE_NODE_MIN_WIDTH + degreeRatio * 80,
+      height: FILE_NODE_MIN_HEIGHT + degreeRatio * 20,
+    };
+  }
+  return {
+    width: FUNCTION_NODE_WIDTH + degreeRatio * 30,
+    height: FUNCTION_NODE_HEIGHT + degreeRatio * 10,
+  };
+}
+
+function applyForceLayout(nodes, edges) {
+  if (nodes.length === 0) return [];
+  const degrees = getDegrees(nodes, edges);
+  const maxDegree = Math.max(1, ...degrees.values());
+  const dimensions = new Map();
+  const simulationNodes = nodes.map((node, index) => {
+    const angle = (index / nodes.length) * Math.PI * 2;
+    const radius = 180 + (index % 9) * 18;
+    const dimension = getNodeDimensions(
+      { ...node, data: { ...node.data, degree: degrees.get(node.id) ?? 0 } },
+      maxDegree,
+    );
+    dimensions.set(node.id, dimension);
+    return {
+      id: node.id,
+      x: Math.cos(angle) * radius,
+      y: Math.sin(angle) * radius,
+      radius: Math.max(dimension.width, dimension.height) / 2,
     };
   });
-  const children = functionNodes.map((node) => {
-    const parentId =
-      parentFromDefines.get(node.id) ??
-      fileByPath.get(String(node.data.file ?? "")) ??
-      externalGroup?.id;
+  const nodeIds = new Set(simulationNodes.map((node) => node.id));
+  const simulationLinks = edges
+    .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
+    .map((edge) => ({ source: edge.source, target: edge.target }));
+
+  const simulation = forceSimulation(simulationNodes)
+    .force(
+      "link",
+      forceLink(simulationLinks)
+        .id((node) => node.id)
+        .distance(LINK_DISTANCE)
+        .strength(0.55),
+    )
+    .force("charge", forceManyBody().strength(MANY_BODY_STRENGTH))
+    .force("center", forceCenter(0, 0).strength(0.9))
+    .force(
+      "collision",
+      forceCollide()
+        .radius((node) => node.radius + 12)
+        .strength(0.9)
+        .iterations(2),
+    )
+    .velocityDecay(0.42)
+    .stop();
+
+  for (let tick = 0; tick < 300; tick += 1) simulation.tick();
+  simulation.stop();
+
+  const positionById = new Map(
+    simulationNodes.map((node) => [node.id, { x: node.x, y: node.y }]),
+  );
+  return nodes.map((node) => {
+    const degree = degrees.get(node.id) ?? 0;
+    const dimension = dimensions.get(node.id);
+    const center = positionById.get(node.id);
     return {
       ...node,
-      parentId,
-      extent: "parent",
-      expandParent: false,
-      draggable: false,
+      position: {
+        x: center.x - dimension.width / 2,
+        y: center.y - dimension.height / 2,
+      },
+      data: { ...node.data, degree },
+      style: {
+        ...node.style,
+        width: dimension.width,
+        height: dimension.height,
+      },
     };
   });
-  return [...parents, ...children];
 }
 
-function layoutFileModules(nodes) {
-  const parents = nodes.filter((node) => node.data.nodeType === "File");
-  const childrenByParent = new Map(parents.map((node) => [node.id, []]));
-  nodes.forEach((node) => {
-    if (node.parentId && childrenByParent.has(node.parentId)) {
-      childrenByParent.get(node.parentId).push(node);
-    }
-  });
-  childrenByParent.forEach((children) => {
-    children.sort((left, right) =>
-      left.data.fullLabel.localeCompare(right.data.fullLabel),
-    );
-  });
-
-  const parentLayouts = parents
-    .map((parent) => {
-      const children = childrenByParent.get(parent.id) ?? [];
-      const collapsed = Boolean(parent.data.collapsed);
-      const columns = collapsed
-        ? 1
-        : Math.min(3, Math.max(1, Math.ceil(Math.sqrt(children.length))));
-      const rows = Math.max(1, Math.ceil(children.length / columns));
-      const width = collapsed
-        ? COLLAPSED_FILE_WIDTH
-        : FILE_PADDING * 2 + columns * NODE_WIDTH + (columns - 1) * CHILD_COLUMN_GAP;
-      const height = collapsed
-        ? COLLAPSED_FILE_HEIGHT
-        : FILE_HEADER_HEIGHT + FILE_PADDING * 2 + rows * NODE_HEIGHT + (rows - 1) * CHILD_ROW_GAP;
-      return { parent, children, collapsed, columns, width, height };
-    })
-    .sort((left, right) => {
-      const leftPrimary = PRIMARY_FILES.has(left.parent.data.displayName);
-      const rightPrimary = PRIMARY_FILES.has(right.parent.data.displayName);
-      if (leftPrimary !== rightPrimary) return leftPrimary ? -1 : 1;
-      return left.parent.data.fullLabel.localeCompare(right.parent.data.fullLabel);
-    });
-
-  const moduleColumns = Math.max(1, Math.ceil(Math.sqrt(parentLayouts.length)));
-  const positioned = new Map();
-  let y = LAYOUT_MARGIN;
-  for (let rowStart = 0; rowStart < parentLayouts.length; rowStart += moduleColumns) {
-    const row = parentLayouts.slice(rowStart, rowStart + moduleColumns);
-    let x = LAYOUT_MARGIN;
-    let rowHeight = 0;
-    row.forEach(({ parent, children, collapsed, columns, width, height }) => {
-      positioned.set(parent.id, {
-        ...parent,
-        position: { x, y },
-        data: { ...parent.data, childCount: children.length },
-        style: { width, height },
-      });
-      children.forEach((child, index) => {
-        positioned.set(child.id, {
-          ...child,
-          hidden: collapsed,
-          position: {
-            x: FILE_PADDING + (index % columns) * (NODE_WIDTH + CHILD_COLUMN_GAP),
-            y:
-              FILE_HEADER_HEIGHT +
-              FILE_PADDING +
-              Math.floor(index / columns) * (NODE_HEIGHT + CHILD_ROW_GAP),
-          },
-          style: { ...child.style, width: NODE_WIDTH, height: NODE_HEIGHT },
-        });
-      });
-      x += width + MODULE_COLUMN_GAP;
-      rowHeight = Math.max(rowHeight, height);
-    });
-    y += rowHeight + MODULE_ROW_GAP;
-  }
-  return [
-    ...parentLayouts.map(({ parent }) => positioned.get(parent.id)),
-    ...nodes
-      .filter((node) => node.parentId)
-      .map((node) => positioned.get(node.id))
-      .filter(Boolean),
-  ];
-}
-
-function getInitialCenter(nodes, edges) {
-  const parentByNode = new Map(
-    nodes.map((node) => [node.id, node.parentId ?? node.id]),
-  );
-  const degree = new Map();
-  edges.forEach((edge) => {
-    const sourceParent = parentByNode.get(edge.source);
-    const targetParent = parentByNode.get(edge.target);
-    if (!sourceParent || !targetParent || sourceParent === targetParent) return;
-    degree.set(sourceParent, (degree.get(sourceParent) ?? 0) + 1);
-    degree.set(targetParent, (degree.get(targetParent) ?? 0) + 1);
-  });
-  const files = nodes.filter(
-    (node) => node.data.nodeType === "File" && !node.data.synthetic,
-  );
-  const entryPoints = files.filter((node) =>
-    new Set(["api.py", "sessions.py"]).has(node.data.displayName),
-  );
-  const candidates = entryPoints.length > 0 ? entryPoints : files;
+function getInitialCenter(nodes) {
+  const candidates = nodes.filter((node) => !node.data.external);
   const target = candidates.sort(
-    (left, right) => (degree.get(right.id) ?? 0) - (degree.get(left.id) ?? 0),
+    (left, right) => (right.data.degree ?? 0) - (left.data.degree ?? 0),
   )[0];
   if (!target) return { x: 0, y: 0 };
   return {
@@ -414,14 +348,59 @@ function getInitialCenter(nodes, edges) {
   };
 }
 
+function routeEdgesToNearestHandles(edges, nodes) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+
+  return edges.map((edge) => {
+    const source = nodeById.get(edge.source);
+    const target = nodeById.get(edge.target);
+    if (!source || !target) return edge;
+
+    const sourceWidth = Number(source.style?.width) || FUNCTION_NODE_WIDTH;
+    const sourceHeight = Number(source.style?.height) || FUNCTION_NODE_HEIGHT;
+    const targetWidth = Number(target.style?.width) || FUNCTION_NODE_WIDTH;
+    const targetHeight = Number(target.style?.height) || FUNCTION_NODE_HEIGHT;
+    const sourceCenter = {
+      x: source.position.x + sourceWidth / 2,
+      y: source.position.y + sourceHeight / 2,
+    };
+    const targetCenter = {
+      x: target.position.x + targetWidth / 2,
+      y: target.position.y + targetHeight / 2,
+    };
+    const deltaX = targetCenter.x - sourceCenter.x;
+    const deltaY = targetCenter.y - sourceCenter.y;
+    const horizontalDistance =
+      Math.abs(deltaX) / Math.max(1, (sourceWidth + targetWidth) / 2);
+    const verticalDistance =
+      Math.abs(deltaY) / Math.max(1, (sourceHeight + targetHeight) / 2);
+
+    let sourceSide;
+    let targetSide;
+    if (horizontalDistance >= verticalDistance) {
+      sourceSide = deltaX >= 0 ? "right" : "left";
+      targetSide = deltaX >= 0 ? "left" : "right";
+    } else {
+      sourceSide = deltaY >= 0 ? "bottom" : "top";
+      targetSide = deltaY >= 0 ? "top" : "bottom";
+    }
+
+    return {
+      ...edge,
+      sourceHandle: `source-${sourceSide}`,
+      targetHandle: `target-${targetSide}`,
+    };
+  });
+}
+
 function normalizeGraph(payload) {
   const normalizedNodes = normalizeNodes(payload.nodes ?? payload.functions ?? []);
   const edges = normalizeEdges(payload.edges ?? payload.calls ?? []);
-  const nodes = layoutFileModules(buildCompoundNodes(normalizedNodes, edges));
+  const nodes = applyForceLayout(normalizedNodes, edges);
   return {
     nodes,
     edges,
-    initialCenter: getInitialCenter(nodes, edges),
+    initialCenter: getInitialCenter(nodes),
   };
 }
 
@@ -529,16 +508,16 @@ function App() {
     ? adjacencyIndex.get(focusedNodeId)
     : null;
 
-  const hiddenNodeIds = useMemo(
-    () => new Set(nodes.filter((node) => node.hidden).map((node) => node.id)),
-    [nodes],
-  );
   const graphCounts = useMemo(
     () => ({
       files: nodes.filter((node) => node.data.nodeType === "File").length,
       functions: nodes.filter((node) => node.data.nodeType === "Function").length,
     }),
     [nodes],
+  );
+  const routedEdges = useMemo(
+    () => routeEdgesToNearestHandles(edges, nodes),
+    [edges, nodes],
   );
 
   const visibleNodes = useMemo(() => {
@@ -571,13 +550,11 @@ function App() {
   const visibleEdges = useMemo(() => {
     const connectedEdgeIds = focusedConnections?.edgeIds ?? new Set();
 
-    return edges.map((edge) => {
-      const hidden = hiddenNodeIds.has(edge.source) || hiddenNodeIds.has(edge.target);
+    return routedEdges.map((edge) => {
       const isConnected = Boolean(focusedNodeId) && connectedEdgeIds.has(edge.id);
       return {
         ...edge,
-        hidden,
-        animated: isConnected && !hidden,
+        animated: isConnected,
         markerEnd: {
           ...edge.markerEnd,
           color: isConnected ? FOCUSED_EDGE_COLOR : DEFAULT_EDGE_COLOR,
@@ -592,27 +569,7 @@ function App() {
         zIndex: isConnected ? 15 : 0,
       };
     });
-  }, [edges, focusedConnections, focusedNodeId, hiddenNodeIds]);
-
-  const toggleFileNode = useCallback(
-    (_, selectedNode) => {
-      if (selectedNode.data.nodeType !== "File") return;
-      setFocusedNodeId(null);
-      setNodes((currentNodes) =>
-        layoutFileModules(
-          currentNodes.map((node) =>
-            node.id === selectedNode.id
-              ? {
-                  ...node,
-                  data: { ...node.data, collapsed: !node.data.collapsed },
-                }
-              : node,
-          ),
-        ),
-      );
-    },
-    [setNodes],
-  );
+  }, [focusedConnections, focusedNodeId, routedEdges]);
 
   const loadGraph = useCallback(async () => {
     setGraphStatus("loading");
@@ -897,10 +854,7 @@ function App() {
                   flowInstanceRef.current = instance;
                   setFlowReady(true);
                 }}
-                onNodeClick={toggleFileNode}
-                onNodeMouseEnter={(_, node) => {
-                  if (node.data.nodeType === "Function") setFocusedNodeId(node.id);
-                }}
+                onNodeMouseEnter={(_, node) => setFocusedNodeId(node.id)}
                 onNodeMouseLeave={() => setFocusedNodeId(null)}
                 defaultViewport={{ x: 0, y: 0, zoom: INITIAL_ZOOM }}
                 minZoom={0.15}
