@@ -174,11 +174,24 @@ app.include_router(webhooks.router)
 
 
 @app.get("/api/graph", tags=["graph"])
-async def get_graph() -> dict[str, list[dict[str, Any]]]:
-    """Return Neo4j nodes and edges in web graph component formats."""
+async def get_graph(
+    repo_name: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return one repository graph, or an empty graph without a scope."""
+
+    if repo_name is None:
+        return {"nodes": [], "edges": []}
 
     try:
-        return await fetch_graph_data()
+        normalized_repo_name = _normalize_repo_identifier(repo_name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        return await fetch_graph_data(normalized_repo_name)
     except AuthError as exc:
         logger.warning("Neo4j rejected the configured credentials")
         raise HTTPException(
@@ -217,7 +230,7 @@ async def chat(request: ChatRequest) -> dict[str, str]:
 @app.post("/api/ingest-repo", tags=["ingestion"])
 async def ingest_repository(
     request: IngestRepositoryRequest,
-) -> dict[str, str | int]:
+) -> dict[str, str]:
     """Download, parse, and persist a public GitHub repository on demand."""
 
     try:
@@ -281,10 +294,8 @@ async def ingest_repository(
             cleanup_downloaded_repo(extracted_root)
 
     return {
-        "status": "ingested",
+        "status": "success",
         "repo_name": canonical_repo_name,
-        "files_discovered": len(source_files),
-        "files_parsed": len(parsed_data),
     }
 
 

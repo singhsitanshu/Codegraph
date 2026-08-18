@@ -20,10 +20,9 @@ import {
 } from "@xyflow/react";
 
 import {
-  API_BASE,
+  fetchRepositoryGraph,
   ingestRepository,
   requestChat,
-  responseError,
 } from "./api.js";
 
 const FUNCTION_NODE_WIDTH = 150;
@@ -474,14 +473,14 @@ function App() {
   const [focusedNodeId, setFocusedNodeId] = useState(null);
   const [initialCenter, setInitialCenter] = useState(null);
   const [flowReady, setFlowReady] = useState(false);
-  const [graphStatus, setGraphStatus] = useState("loading");
+  const [graphStatus, setGraphStatus] = useState("idle");
   const [graphError, setGraphError] = useState("");
   const [messages, setMessages] = useState(starterMessages);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [chatError, setChatError] = useState("");
   const [repositoryInput, setRepositoryInput] = useState("");
-  const [activeRepoName, setActiveRepoName] = useState("");
+  const [activeRepo, setActiveRepo] = useState(null);
   const [ingestionStatus, setIngestionStatus] = useState("idle");
   const [ingestionError, setIngestionError] = useState("");
   const abortRef = useRef(null);
@@ -572,15 +571,21 @@ function App() {
     });
   }, [focusedConnections, focusedNodeId, routedEdges]);
 
-  const loadGraph = useCallback(async () => {
+  const loadGraph = useCallback(async (repoName) => {
+    if (!repoName) {
+      setNodes([]);
+      setEdges([]);
+      setInitialCenter(null);
+      setFocusedNodeId(null);
+      setGraphError("");
+      setGraphStatus("idle");
+      return;
+    }
+
     setGraphStatus("loading");
     setGraphError("");
     try {
-      const response = await fetch(`${API_BASE}/api/graph`);
-      if (!response.ok) {
-        throw new Error(await responseError(response, "Graph request failed"));
-      }
-      const graph = normalizeGraph(await response.json());
+      const graph = normalizeGraph(await fetchRepositoryGraph(repoName));
       setNodes(graph.nodes);
       setEdges(graph.edges);
       setInitialCenter(graph.initialCenter);
@@ -591,10 +596,6 @@ function App() {
       setGraphStatus("error");
     }
   }, [setEdges, setNodes]);
-
-  useEffect(() => {
-    loadGraph();
-  }, [loadGraph]);
 
   useEffect(() => {
     if (
@@ -631,11 +632,16 @@ function App() {
     setIngestionStatus("ingesting");
     setIngestionError("");
     setChatError("");
-    setActiveRepoName("");
+    setActiveRepo(null);
+    setNodes([]);
+    setEdges([]);
+    setInitialCenter(null);
+    setGraphError("");
+    setGraphStatus("idle");
 
     try {
       const result = await ingestRepository(repository);
-      setActiveRepoName(result.repo_name);
+      setActiveRepo(result.repo_name);
       setIngestionStatus("ready");
       setMessages([
         starterMessages[0],
@@ -645,7 +651,7 @@ function App() {
           content: `${result.repo_name} is indexed and ready for questions.`,
         },
       ]);
-      await loadGraph();
+      await loadGraph(result.repo_name);
     } catch (error) {
       setIngestionStatus("error");
       setIngestionError(
@@ -658,7 +664,7 @@ function App() {
     event.preventDefault();
     const prompt = input.trim();
     if (!prompt || streaming) return;
-    if (!activeRepoName || ingestionStatus !== "ready") {
+    if (!activeRepo || ingestionStatus !== "ready") {
       setChatError("Ingest a repository before asking code-graph questions");
       return;
     }
@@ -679,7 +685,7 @@ function App() {
     let accumulated = "";
 
     try {
-      const response = await requestChat(prompt, activeRepoName, {
+      const response = await requestChat(prompt, activeRepo, {
         signal: controller.signal,
       });
       const contentType = response.headers.get("content-type") ?? "";
@@ -771,7 +777,7 @@ function App() {
               />
               {ingestionStatus === "ingesting"
                 ? "Indexing"
-                : activeRepoName || "Select repository"}
+                : activeRepo || "Select repository"}
             </span>
           </header>
 
@@ -813,13 +819,13 @@ function App() {
                     {ingestionStatus === "ingesting" ? "Indexing…" : "Ingest"}
                   </button>
                 </div>
-                {(ingestionError || activeRepoName) && (
+                {(ingestionError || activeRepo) && (
                   <p
                     className={`mt-2 text-[10px] ${
                       ingestionError ? "text-[#b45348]" : "text-[#39705e]"
                     }`}
                   >
-                    {ingestionError || `Active repository: ${activeRepoName}`}
+                    {ingestionError || `Active repository: ${activeRepo}`}
                   </p>
                 )}
               </form>
@@ -837,12 +843,12 @@ function App() {
             >
               <textarea
                 aria-label="Message"
-                disabled={!activeRepoName || ingestionStatus !== "ready"}
+                disabled={!activeRepo || ingestionStatus !== "ready"}
                 className="max-h-32 min-h-12 w-full resize-none bg-transparent px-3 py-2 text-[13px] leading-5 text-[#263a33] outline-none placeholder:text-[#9ba7a2]"
                 placeholder={
-                  activeRepoName
+                  activeRepo
                     ? "Ask about a function or dependency…"
-                    : "Ingest a GitHub repository to enable chat…"
+                    : "Ingest a repository to start asking questions"
                 }
                 rows="2"
                 value={input}
@@ -857,7 +863,7 @@ function App() {
               <div className="flex items-center justify-between px-2 pb-1">
                 <span className={`text-[10px] ${chatError ? "text-[#b45348]" : "text-[#9aa6a1]"}`}>
                   {chatError ||
-                    (activeRepoName
+                    (activeRepo
                       ? "Enter to send · Shift + Enter for a new line"
                       : "Repository context is required")}
                 </span>
@@ -873,7 +879,7 @@ function App() {
                 ) : (
                   <button
                     type="submit"
-                    disabled={!input.trim() || !activeRepoName}
+                    disabled={!input.trim() || !activeRepo}
                     className="grid size-8 place-items-center rounded-xl bg-[#174f3d] text-white transition hover:bg-[#0f3e2f] disabled:cursor-not-allowed disabled:opacity-35"
                     aria-label="Send message"
                   >
@@ -900,8 +906,8 @@ function App() {
             </div>
             <button
               type="button"
-              onClick={loadGraph}
-              disabled={graphStatus === "loading"}
+              onClick={() => loadGraph(activeRepo)}
+              disabled={!activeRepo || graphStatus === "loading"}
               className="inline-flex items-center gap-2 rounded-xl border border-[#d7ded8] bg-white px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.11em] text-[#52645d] shadow-sm transition hover:border-[#bfcac2] disabled:opacity-50"
             >
               <Icon name="refresh" className={`size-3.5 ${graphStatus === "loading" ? "animate-spin" : ""}`} />
@@ -918,9 +924,33 @@ function App() {
                   </div>
                   <p className="mt-4 text-sm font-bold">Graph unavailable</p>
                   <p className="mt-1 text-xs text-[#7d8b85]">{graphError}</p>
-                  <button onClick={loadGraph} className="mt-4 text-xs font-bold text-[#276d54] underline underline-offset-4">
+                  <button
+                    onClick={() => loadGraph(activeRepo)}
+                    className="mt-4 text-xs font-bold text-[#276d54] underline underline-offset-4"
+                  >
                     Try again
                   </button>
+                </div>
+              </div>
+            ) : graphStatus === "loading" ? (
+              <div className="grid h-full place-items-center p-8 text-center">
+                <div>
+                  <Icon name="refresh" className="mx-auto size-5 animate-spin text-[#52645d]" />
+                  <p className="mt-3 text-xs font-bold text-[#677a72]">
+                    Loading {activeRepo}…
+                  </p>
+                </div>
+              </div>
+            ) : nodes.length === 0 ? (
+              <div className="grid h-full place-items-center p-8 text-center">
+                <div className="max-w-xs">
+                  <div className="mx-auto grid size-12 place-items-center rounded-2xl bg-white text-[#789084] shadow-sm">
+                    <Icon name="graph" className="size-5" />
+                  </div>
+                  <p className="mt-4 text-sm font-bold text-[#52645d]">
+                    Enter a GitHub URL above and click Ingest to visualize a
+                    repository graph.
+                  </p>
                 </div>
               </div>
             ) : (

@@ -10,8 +10,11 @@ from app.config import settings
 
 
 GRAPH_QUERY = """
-MATCH (n)
-OPTIONAL MATCH (n)-[r]->(m)
+MATCH (file:File {repo_name: $repo_name})
+OPTIONAL MATCH (file)-[:DEFINES]->(function:Function {repo_name: $repo_name})
+WITH collect(DISTINCT file) + collect(DISTINCT function) AS repository_nodes
+UNWIND repository_nodes AS n
+OPTIONAL MATCH (n)-[r:DEFINES|CALLS]->(m {repo_name: $repo_name})
 RETURN n, r, m
 LIMIT 200
 """
@@ -105,13 +108,13 @@ def _serialize_relationship(relationship: Relationship) -> dict[str, Any]:
     }
 
 
-async def fetch_graph_data() -> dict[str, list[dict[str, Any]]]:
-    """Query and serialize up to 200 Neo4j graph records."""
+async def fetch_graph_data(repo_name: str) -> dict[str, list[dict[str, Any]]]:
+    """Query and serialize one repository's Neo4j graph."""
 
     nodes: dict[str, dict[str, Any]] = {}
     edges: dict[str, dict[str, Any]] = {}
     async with get_neo4j_driver().session() as session:
-        result = await session.run(GRAPH_QUERY)
+        result = await session.run(GRAPH_QUERY, repo_name=repo_name)
         async for record in result:
             for node in (record["n"], record["m"]):
                 if isinstance(node, Node) and node.element_id not in nodes:

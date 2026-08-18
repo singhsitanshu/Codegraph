@@ -111,7 +111,10 @@ def test_api_graph_endpoint(db_cleanup: None) -> None:
     _save_mock_ast()
     client = TestClient(app)
 
-    response = client.get("/api/graph")
+    response = client.get(
+        "/api/graph",
+        params={"repo_name": TEST_REPO_NAME},
+    )
 
     assert response.status_code == 200
     payload = response.json()
@@ -122,6 +125,34 @@ def test_api_graph_endpoint(db_cleanup: None) -> None:
         or node.get("data", {}).get("label") == TEST_FILE_PATH
         for node in payload["nodes"]
     )
+
+
+def test_api_graph_is_blank_without_repository_scope() -> None:
+    """Do not query Neo4j or expose legacy nodes before repository selection."""
+
+    graph_fetch = AsyncMock(return_value={"nodes": ["legacy"], "edges": []})
+    with patch("app.main.fetch_graph_data", new=graph_fetch):
+        response = TestClient(app).get("/api/graph")
+
+    assert response.status_code == 200
+    assert response.json() == {"nodes": [], "edges": []}
+    graph_fetch.assert_not_awaited()
+
+
+def test_api_graph_passes_normalized_repository_scope() -> None:
+    """Fetch only the graph associated with the requested repository."""
+
+    expected = {"nodes": [{"id": "scoped"}], "edges": []}
+    graph_fetch = AsyncMock(return_value=expected)
+    with patch("app.main.fetch_graph_data", new=graph_fetch):
+        response = TestClient(app).get(
+            "/api/graph",
+            params={"repo_name": " test/mock-repository "},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == expected
+    graph_fetch.assert_awaited_once_with(TEST_REPO_NAME)
 
 
 def test_api_chat_endpoint() -> None:

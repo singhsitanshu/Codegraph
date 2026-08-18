@@ -3,7 +3,15 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.db import GRAPH_QUERY
 from app.db.graph_ops import save_parsed_ast_to_neo4j
+
+
+def test_graph_read_starts_from_repository_scoped_files() -> None:
+    assert "MATCH (file:File {repo_name: $repo_name})" in GRAPH_QUERY
+    assert "Function {repo_name: $repo_name}" in GRAPH_QUERY
+    assert "(m {repo_name: $repo_name})" in GRAPH_QUERY
+    assert "\nMATCH (n)\n" not in GRAPH_QUERY
 
 
 def test_every_graph_write_receives_repository_scope() -> None:

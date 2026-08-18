@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  fetchRepositoryGraph,
   ingestRepository,
   repositoryUrlFromInput,
   requestChat,
@@ -23,32 +24,48 @@ test("repository input accepts owner/name shorthand", () => {
   );
 });
 
-test("ingestion result scopes the subsequent chat request", async () => {
+test("ingestion result scopes graph and subsequent chat requests", async () => {
   const calls = [];
   const fetchImpl = async (url, options) => {
     calls.push({ url, options });
     if (url.endsWith("/api/ingest-repo")) {
       return jsonResponse({
-        status: "ingested",
+        status: "success",
         repo_name: "psf/requests",
-        files_discovered: 10,
-        files_parsed: 10,
       });
+    }
+    if (url.includes("/api/graph?")) {
+      return jsonResponse({ nodes: [], edges: [] });
     }
     return jsonResponse({ response: "Scoped answer" });
   };
 
   const ingestion = await ingestRepository("psf/requests", fetchImpl);
+  await fetchRepositoryGraph(ingestion.repo_name, fetchImpl);
   await requestChat("What calls get?", ingestion.repo_name, { fetchImpl });
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.deepEqual(JSON.parse(calls[0].options.body), {
     url: "https://github.com/psf/requests",
   });
-  assert.deepEqual(JSON.parse(calls[1].options.body), {
+  assert.equal(
+    calls[1].url,
+    "http://localhost:8000/api/graph?repo_name=psf%2Frequests",
+  );
+  assert.deepEqual(JSON.parse(calls[2].options.body), {
     message: "What calls get?",
     repo_name: "psf/requests",
   });
+});
+
+test("an unscoped graph stays blank without making a request", async () => {
+  let called = false;
+  const graph = await fetchRepositoryGraph(null, async () => {
+    called = true;
+  });
+
+  assert.deepEqual(graph, { nodes: [], edges: [] });
+  assert.equal(called, false);
 });
 
 test("chat is blocked locally without an ingested repository", async () => {

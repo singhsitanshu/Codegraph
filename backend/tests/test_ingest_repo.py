@@ -58,10 +58,8 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
 
     assert response.status_code == 200
     assert response.json() == {
-        "status": "ingested",
+        "status": "success",
         "repo_name": "psf/requests",
-        "files_discovered": 1,
-        "files_parsed": 1,
     }
     save.assert_awaited_once_with(
         parsed_data,

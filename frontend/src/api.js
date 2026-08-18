@@ -49,6 +49,21 @@ export async function ingestRepository(repositoryInput, fetchImpl = fetch) {
   return payload;
 }
 
+export async function fetchRepositoryGraph(repoName, fetchImpl = fetch) {
+  if (!repoName?.trim()) {
+    return { nodes: [], edges: [] };
+  }
+
+  const query = new URLSearchParams({ repo_name: repoName });
+  const response = await fetchImpl(`${API_BASE}/api/graph?${query}`, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(await responseError(response, "Graph request failed"));
+  }
+  return response.json();
+}
+
 export async function requestChat(
   message,
   repoName,
