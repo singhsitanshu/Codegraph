@@ -483,6 +483,8 @@ function App() {
   const [activeRepo, setActiveRepo] = useState(null);
   const [ingestionStatus, setIngestionStatus] = useState("idle");
   const [ingestionError, setIngestionError] = useState("");
+  const [progress, setProgress] = useState(0);
+  const [progressText, setProgressText] = useState("Idle");
   const abortRef = useRef(null);
   const messagesEndRef = useRef(null);
   const flowInstanceRef = useRef(null);
@@ -631,6 +633,8 @@ function App() {
     abortRef.current?.abort();
     setIngestionStatus("ingesting");
     setIngestionError("");
+    setProgress(0);
+    setProgressText("Starting ingestion...");
     setChatError("");
     setActiveRepo(null);
     setNodes([]);
@@ -639,8 +643,19 @@ function App() {
     setGraphError("");
     setGraphStatus("idle");
 
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
-      const result = await ingestRepository(repository);
+      const result = await ingestRepository(repository, {
+        signal: controller.signal,
+        onProgress: (update) => {
+          setProgress(update.progress);
+          setProgressText(update.status);
+          if (update.progress === 100 && update.repo_name) {
+            setActiveRepo(update.repo_name);
+          }
+        },
+      });
       setActiveRepo(result.repo_name);
       setIngestionStatus("ready");
       setMessages([
@@ -653,10 +668,14 @@ function App() {
       ]);
       await loadGraph(result.repo_name);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       setIngestionStatus("error");
+      setProgressText("Ingestion failed");
       setIngestionError(
         error instanceof Error ? error.message : "Repository ingestion failed",
       );
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
     }
   };
 
@@ -819,6 +838,27 @@ function App() {
                     {ingestionStatus === "ingesting" ? "Indexing…" : "Ingest"}
                   </button>
                 </div>
+                {ingestionStatus === "ingesting" && (
+                  <div className="mt-3" aria-live="polite">
+                    <div className="flex items-center justify-between gap-3 text-[10px] font-bold text-[#52645d]">
+                      <span>{progressText}</span>
+                      <span>{progress}%</span>
+                    </div>
+                    <div
+                      className="mt-1.5 h-2 overflow-hidden rounded-full bg-[#e3e9e4]"
+                      role="progressbar"
+                      aria-label="Repository ingestion progress"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                      aria-valuenow={progress}
+                    >
+                      <div
+                        className="h-full rounded-full bg-[#2f7d61] transition-[width] duration-300 ease-out"
+                        style={{ width: `${progress}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
                 {(ingestionError || activeRepo) && (
                   <p
                     className={`mt-2 text-[10px] ${

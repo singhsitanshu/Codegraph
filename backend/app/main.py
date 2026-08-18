@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -12,6 +13,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 from pydantic import BaseModel, Field, field_validator
 
@@ -24,7 +26,7 @@ from app.services.github_service import (
     cleanup_downloaded_repo,
     download_and_extract_repo,
 )
-from app.services.parser_service import parse_changed_files
+from app.services.parser_service import parse_changed_files_with_progress
 
 
 logging.basicConfig(
@@ -227,11 +229,145 @@ async def chat(request: ChatRequest) -> dict[str, str]:
     return {"response": ai_response}
 
 
+def _ndjson_record(**payload: object) -> str:
+    """Serialize one newline-delimited JSON progress record."""
+
+    return json.dumps(payload, separators=(",", ":")) + "\n"
+
+
+async def _stream_repository_ingestion(
+    owner: str,
+    repository: str,
+) -> AsyncIterator[str]:
+    """Run repository ingestion while emitting NDJSON progress records."""
+
+    canonical_repo_name = f"{owner}/{repository}"
+    extracted_root: str | None = None
+    current_progress = 0
+    try:
+        current_progress = 10
+        yield _ndjson_record(
+            status="Downloading repository...",
+            progress=current_progress,
+        )
+        extracted_root = await download_and_extract_repo(owner, repository)
+
+        current_progress = 20
+        yield _ndjson_record(
+            status="Repository downloaded and extracted.",
+            progress=current_progress,
+        )
+        source_files = await asyncio.to_thread(
+            _discover_repository_source_files,
+            extracted_root,
+        )
+
+        parsed_data_by_index: list[dict[str, Any] | None] = [
+            None for _ in source_files
+        ]
+        if source_files:
+            async for file_progress in parse_changed_files_with_progress(
+                source_files
+            ):
+                if file_progress.result is not None:
+                    parsed_data_by_index[file_progress.index] = file_progress.result
+                current_progress = 20 + int(
+                    file_progress.processed / file_progress.total * 60
+                )
+                yield _ndjson_record(
+                    status=(
+                        f"Parsing files ({file_progress.processed}/"
+                        f"{file_progress.total})..."
+                    ),
+                    progress=current_progress,
+                )
+        else:
+            current_progress = 80
+            yield _ndjson_record(
+                status="No supported source files found.",
+                progress=current_progress,
+            )
+
+        parsed_data = [
+            parsed_file
+            for parsed_file in parsed_data_by_index
+            if parsed_file is not None
+        ]
+        _use_repository_relative_paths(parsed_data, extracted_root)
+
+        current_progress = 85
+        yield _ndjson_record(
+            status="Saving graph to Neo4j...",
+            progress=current_progress,
+        )
+        await save_parsed_ast_to_neo4j(
+            parsed_data,
+            repo_name=canonical_repo_name,
+            replace_existing=True,
+        )
+
+        yield _ndjson_record(
+            status="Repository ingestion complete.",
+            progress=100,
+            repo_name=canonical_repo_name,
+        )
+    except httpx.HTTPStatusError as exc:
+        response_status = exc.response.status_code
+        if response_status == status.HTTP_404_NOT_FOUND:
+            detail = "GitHub repository was not found"
+        else:
+            detail = f"GitHub archive download failed with status {response_status}"
+        logger.warning("Unable to ingest %s: %s", canonical_repo_name, detail)
+        yield _ndjson_record(
+            status="Repository ingestion failed.",
+            progress=current_progress,
+            error=detail,
+        )
+    except (httpx.RequestError, zipfile.BadZipFile, ValueError) as exc:
+        logger.warning("Unable to download or extract %s: %s", canonical_repo_name, exc)
+        yield _ndjson_record(
+            status="Repository ingestion failed.",
+            progress=current_progress,
+            error="GitHub repository download or extraction failed",
+        )
+    except AuthError:
+        logger.warning("Neo4j rejected ingestion credentials")
+        yield _ndjson_record(
+            status="Repository ingestion failed.",
+            progress=current_progress,
+            error="Neo4j authentication failed during repository ingestion",
+        )
+    except ServiceUnavailable:
+        logger.warning("Neo4j is unavailable during repository ingestion")
+        yield _ndjson_record(
+            status="Repository ingestion failed.",
+            progress=current_progress,
+            error="Neo4j is unavailable during repository ingestion",
+        )
+    except Neo4jError:
+        logger.exception("Neo4j repository ingestion failed")
+        yield _ndjson_record(
+            status="Repository ingestion failed.",
+            progress=current_progress,
+            error="Neo4j repository ingestion failed",
+        )
+    except Exception:
+        logger.exception("Unexpected repository ingestion failure")
+        yield _ndjson_record(
+            status="Repository ingestion failed.",
+            progress=current_progress,
+            error="Unexpected repository ingestion failure",
+        )
+    finally:
+        if extracted_root is not None:
+            cleanup_downloaded_repo(extracted_root)
+
+
 @app.post("/api/ingest-repo", tags=["ingestion"])
 async def ingest_repository(
     request: IngestRepositoryRequest,
-) -> dict[str, str]:
-    """Download, parse, and persist a public GitHub repository on demand."""
+) -> StreamingResponse:
+    """Stream progress while ingesting a public GitHub repository."""
 
     try:
         owner, repository = _parse_github_repository_url(request.url)
@@ -241,62 +377,14 @@ async def ingest_repository(
             detail=str(exc),
         ) from exc
 
-    canonical_repo_name = f"{owner}/{repository}"
-    extracted_root: str | None = None
-    try:
-        extracted_root = await download_and_extract_repo(owner, repository)
-        source_files = await asyncio.to_thread(
-            _discover_repository_source_files,
-            extracted_root,
-        )
-        parsed_data = await parse_changed_files(source_files)
-        _use_repository_relative_paths(parsed_data, extracted_root)
-        await save_parsed_ast_to_neo4j(
-            parsed_data,
-            repo_name=canonical_repo_name,
-            replace_existing=True,
-        )
-    except httpx.HTTPStatusError as exc:
-        response_status = exc.response.status_code
-        if response_status == status.HTTP_404_NOT_FOUND:
-            detail = "GitHub repository or branch was not found"
-            api_status = status.HTTP_404_NOT_FOUND
-        else:
-            detail = f"GitHub archive download failed with status {response_status}"
-            api_status = status.HTTP_502_BAD_GATEWAY
-        raise HTTPException(status_code=api_status, detail=detail) from exc
-    except (httpx.RequestError, zipfile.BadZipFile, ValueError) as exc:
-        logger.warning("Unable to download or extract %s: %s", canonical_repo_name, exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="GitHub repository download or extraction failed",
-        ) from exc
-    except AuthError as exc:
-        logger.warning("Neo4j rejected ingestion credentials")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Neo4j authentication failed during repository ingestion",
-        ) from exc
-    except ServiceUnavailable as exc:
-        logger.warning("Neo4j is unavailable during repository ingestion")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Neo4j is unavailable during repository ingestion",
-        ) from exc
-    except Neo4jError as exc:
-        logger.exception("Neo4j repository ingestion failed")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Neo4j repository ingestion failed",
-        ) from exc
-    finally:
-        if extracted_root is not None:
-            cleanup_downloaded_repo(extracted_root)
-
-    return {
-        "status": "success",
-        "repo_name": canonical_repo_name,
-    }
+    return StreamingResponse(
+        _stream_repository_ingestion(owner, repository),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/health", tags=["health"])

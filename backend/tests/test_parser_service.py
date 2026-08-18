@@ -6,7 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
-from app.services.parser_service import CodeParser, parse_changed_files
+from app.services.parser_service import (
+    CodeParser,
+    parse_changed_files,
+    parse_changed_files_with_progress,
+)
 
 
 @pytest.mark.parametrize(
@@ -64,3 +68,25 @@ def test_parse_changed_files_skips_unreadable_file(tmp_path: Path) -> None:
     assert len(results) == 1
     assert results[0]["file_path"] == str(good_file)
     assert results[0]["defined_functions"] == ["good"]
+
+
+def test_parse_progress_advances_for_every_file(tmp_path: Path) -> None:
+    """Skipped files still count toward deterministic batch progress."""
+
+    missing_file = tmp_path / "missing.py"
+    good_file = tmp_path / "good.py"
+    good_file.write_bytes(b"def good():\n    return 1\n")
+
+    async def collect_progress():
+        return [
+            update
+            async for update in parse_changed_files_with_progress(
+                [str(missing_file), str(good_file)]
+            )
+        ]
+
+    updates = asyncio.run(collect_progress())
+
+    assert [update.processed for update in updates] == [1, 2]
+    assert all(update.total == 2 for update in updates)
+    assert sum(update.result is not None for update in updates) == 1

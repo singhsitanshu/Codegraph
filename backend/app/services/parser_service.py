@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
 
 logger = logging.getLogger(__name__)
+MAX_CONCURRENT_FILE_READS = 32
 
 
 PYTHON_FUNCTION_DEFINITIONS_QUERY = """
@@ -70,6 +72,16 @@ class _LanguageQueries:
     function_definitions: Query
     function_calls: Query
     class_definitions: Query
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedFileProgress:
+    """One completed file from a concurrently parsed batch."""
+
+    index: int
+    processed: int
+    total: int
+    result: dict[str, str | list[str]] | None
 
 
 class CodeParser:
@@ -270,33 +282,34 @@ class CodeParser:
             )
 
 
-async def parse_changed_files(
+async def parse_changed_files_with_progress(
     file_paths: list[str],
-) -> list[dict[str, str | list[str]]]:
-    """Parse a collection of changed source files from disk.
+) -> AsyncIterator[ParsedFileProgress]:
+    """Parse files concurrently and yield once whenever a file completes.
 
-    Files are read concurrently without blocking the FastAPI event loop. A
-    single :class:`CodeParser` instance is reused for the batch so languages and
-    queries are initialized only once. Results retain the order of ``file_paths``
-    after deleted, unsupported, or failed files are omitted.
-
-    Args:
-        file_paths: Python, TypeScript, or TSX paths available on local disk.
-
-    Returns:
-        Graph-ready relationship dictionaries for successfully parsed files.
+    Failed files yield a progress item whose ``result`` is ``None``. This lets
+    streaming callers advance their progress bar without persisting bad input.
+    The ``index`` field lets batch callers restore the input ordering even
+    though files can complete out of order.
     """
 
-    if not file_paths:
-        return []
+    total = len(file_paths)
+    if total == 0:
+        return
 
     code_parser = CodeParser()
+    file_read_slots = asyncio.Semaphore(MAX_CONCURRENT_FILE_READS)
 
-    async def parse_path(file_path: str) -> dict[str, str | list[str]] | None:
+    async def parse_path(
+        index: int,
+        file_path: str,
+    ) -> tuple[int, dict[str, str | list[str]] | None]:
         path = Path(file_path)
         try:
-            source_code = await asyncio.to_thread(path.read_bytes)
-            return await code_parser.parse_file(file_path, source_code)
+            async with file_read_slots:
+                source_code = await asyncio.to_thread(path.read_bytes)
+                result = await code_parser.parse_file(file_path, source_code)
+            return index, result
         except FileNotFoundError:
             logger.info("Skipping missing or deleted source file: %s", file_path)
         except UnicodeDecodeError as exc:
@@ -312,9 +325,39 @@ async def parse_changed_files(
                 exc,
                 exc_info=True,
             )
-        return None
+        return index, None
 
-    parsed_files = await asyncio.gather(
-        *(parse_path(file_path) for file_path in file_paths)
-    )
+    tasks = [
+        asyncio.create_task(parse_path(index, file_path))
+        for index, file_path in enumerate(file_paths)
+    ]
+    try:
+        for processed, completed_task in enumerate(
+            asyncio.as_completed(tasks),
+            start=1,
+        ):
+            index, result = await completed_task
+            yield ParsedFileProgress(
+                index=index,
+                processed=processed,
+                total=total,
+                result=result,
+            )
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def parse_changed_files(
+    file_paths: list[str],
+) -> list[dict[str, str | list[str]]]:
+    """Parse source files and return successful results in input order."""
+
+    parsed_files: list[dict[str, str | list[str]] | None] = [
+        None for _ in file_paths
+    ]
+    async for progress in parse_changed_files_with_progress(file_paths):
+        parsed_files[progress.index] = progress.result
     return [result for result in parsed_files if result is not None]

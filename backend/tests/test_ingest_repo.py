@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -13,6 +14,7 @@ from app.services.github_service import (
     cleanup_downloaded_repo,
     download_and_extract_repo,
 )
+from app.services.parser_service import ParsedFileProgress
 
 
 def test_parse_github_repository_url() -> None:
@@ -39,14 +41,22 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
     cleanup = Mock()
     save = AsyncMock()
 
+    async def parse_with_progress(_file_paths: list[str]):
+        yield ParsedFileProgress(
+            index=0,
+            processed=1,
+            total=1,
+            result=parsed_data[0],
+        )
+
     with (
         patch(
             "app.main.download_and_extract_repo",
             new=AsyncMock(return_value=str(repository_root)),
         ),
         patch(
-            "app.main.parse_changed_files",
-            new=AsyncMock(return_value=parsed_data),
+            "app.main.parse_changed_files_with_progress",
+            new=parse_with_progress,
         ),
         patch("app.main.save_parsed_ast_to_neo4j", new=save),
         patch("app.main.cleanup_downloaded_repo", new=cleanup),
@@ -57,8 +67,20 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         )
 
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "success",
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    progress_records = [
+        json.loads(line) for line in response.text.splitlines()
+    ]
+    assert [record["progress"] for record in progress_records] == [
+        10,
+        20,
+        80,
+        85,
+        100,
+    ]
+    assert progress_records[-1] == {
+        "status": "Repository ingestion complete.",
+        "progress": 100,
         "repo_name": "psf/requests",
     }
     save.assert_awaited_once_with(

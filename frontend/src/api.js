@@ -29,24 +29,67 @@ export function repositoryUrlFromInput(repositoryInput) {
   return `https://github.com/${normalized.replace(/^\/+|\/+$/g, "")}`;
 }
 
-export async function ingestRepository(repositoryInput, fetchImpl = fetch) {
+export async function ingestRepository(
+  repositoryInput,
+  { onProgress, signal, fetchImpl = fetch } = {},
+) {
   const response = await fetchImpl(`${API_BASE}/api/ingest-repo`, {
     method: "POST",
     headers: {
-      Accept: "application/json",
+      Accept: "application/x-ndjson",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ url: repositoryUrlFromInput(repositoryInput) }),
+    signal,
   });
   if (!response.ok) {
     throw new Error(await responseError(response, "Repository ingestion failed"));
   }
+  if (!response.body) {
+    throw new Error("This browser cannot stream repository ingestion progress");
+  }
 
-  const payload = await response.json();
-  if (typeof payload.repo_name !== "string" || !payload.repo_name.trim()) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let finalPayload = null;
+
+  const processLine = (line) => {
+    if (!line.trim()) return;
+    let payload;
+    try {
+      payload = JSON.parse(line);
+    } catch {
+      throw new Error("Repository ingestion returned malformed progress data");
+    }
+    if (typeof payload.progress === "number") {
+      onProgress?.(payload);
+    }
+    if (payload.error) {
+      throw new Error(payload.error);
+    }
+    if (payload.progress === 100) {
+      finalPayload = payload;
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    lines.forEach(processLine);
+    if (done) break;
+  }
+  processLine(buffer);
+
+  if (
+    typeof finalPayload?.repo_name !== "string" ||
+    !finalPayload.repo_name.trim()
+  ) {
     throw new Error("Repository ingestion returned no repository name");
   }
-  return payload;
+  return finalPayload;
 }
 
 export async function fetchRepositoryGraph(repoName, fetchImpl = fetch) {
