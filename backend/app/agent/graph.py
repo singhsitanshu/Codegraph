@@ -17,7 +17,8 @@ MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->
       (target:Function {name: $func_name, repo_name: $repo_name})
 OPTIONAL MATCH (file:File {repo_name: $repo_name})-[:DEFINES]->(caller)
 RETURN DISTINCT caller.name AS caller,
-       collect(DISTINCT file.path) AS file_paths
+       collect(DISTINCT file.path) AS file_paths,
+       coalesce(target.is_external, false) AS target_is_external
 ORDER BY caller
 LIMIT 100
 """
@@ -38,8 +39,16 @@ ORDER BY fn.name
 OUTGOING_DEPENDENCIES_QUERY = """
 MATCH (caller:Function {name: $func_name, repo_name: $repo_name})-[:CALLS]->
       (target:Function {repo_name: $repo_name})
-RETURN target.name AS target_name, target.file AS target_file
+RETURN target.name AS target_name,
+       target.file AS target_file,
+       target.is_external AS is_external
 ORDER BY target.name, target.file
+"""
+
+EXTERNAL_DEPENDENCIES_QUERY = """
+MATCH (fn:ExternalFunction {repo_name: $repo_name})
+RETURN fn.name AS function_name
+ORDER BY fn.name
 """
 
 
@@ -54,6 +63,7 @@ async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
             {
                 "repo_name": normalized_repo_name,
                 "function_name": normalized_name,
+                "target_is_external": False,
                 "callers": [],
             }
         )
@@ -70,6 +80,9 @@ async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
         {
             "repo_name": normalized_repo_name,
             "function_name": normalized_name,
+            "target_is_external": any(
+                record.get("target_is_external") is True for record in records
+            ),
             "callers": records,
         },
         default=str,
@@ -155,8 +168,11 @@ async def query_outgoing_dependencies(
         target_name = record.get("target_name")
         if not isinstance(target_name, str):
             continue
+        if record.get("is_external") is True:
+            dependencies.append(f"- {target_name} (External/Built-in)")
+            continue
         target_file = record.get("target_file")
-        location = target_file if isinstance(target_file, str) else "external/unknown"
+        location = target_file if isinstance(target_file, str) else "unknown file"
         dependencies.append(f"- {target_name} ({location})")
 
     if not dependencies:
@@ -165,6 +181,36 @@ async def query_outgoing_dependencies(
         [
             f"Outgoing dependencies for {normalized_function_name}:",
             *dependencies,
+        ]
+    )
+
+
+@tool
+async def list_external_dependencies(repo_name: str) -> str:
+    """List external, standard-library, or third-party repository calls."""
+
+    normalized_repo_name = repo_name.strip()
+    if not normalized_repo_name:
+        return "No external dependencies found."
+
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(
+            EXTERNAL_DEPENDENCIES_QUERY,
+            repo_name=normalized_repo_name,
+        )
+        records = await result.data()
+
+    function_names = [
+        record["function_name"]
+        for record in records
+        if isinstance(record.get("function_name"), str)
+    ]
+    if not function_names:
+        return "No external dependencies found."
+    return "\n".join(
+        [
+            "External dependencies:",
+            *(f"- {function_name}" for function_name in function_names),
         ]
     )
 
@@ -182,6 +228,7 @@ def _get_code_agent() -> Any:
         list_codebase_structure,
         list_functions_in_file,
         query_outgoing_dependencies,
+        list_external_dependencies,
     ]
     return create_react_agent(llm, tools=tools)
 

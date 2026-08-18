@@ -45,6 +45,8 @@ DETACH DELETE function
 def _cleanup_test_nodes() -> None:
     """Delete mock graph data so every database test is isolated."""
     if neo4j_client.driver is None:
+        neo4j_client.driver = neo4j_client._initialize_driver()
+    if neo4j_client.driver is None:
         pytest.skip("Neo4j is unavailable; integration tests require a live database")
 
     with neo4j_client.driver.session() as session:
@@ -56,8 +58,11 @@ def _cleanup_test_nodes() -> None:
 def db_cleanup() -> Iterator[None]:
     """Clean test nodes before and after each Neo4j integration test."""
     _cleanup_test_nodes()
-    yield
-    _cleanup_test_nodes()
+    try:
+        yield
+    finally:
+        _cleanup_test_nodes()
+        neo4j_client.close_driver()
 
 
 def _save_mock_ast() -> None:
@@ -100,21 +105,27 @@ def test_neo4j_ast_write(db_cleanup: None) -> None:
             path=TEST_FILE_PATH,
             repo_name=TEST_REPO_NAME,
         ).single(strict=True)["count"]
+        external_count = session.run(
+            "MATCH (function:Function:ExternalFunction {"
+            "name: 'external_api_call', repo_name: $repo_name, "
+            "is_external: true}) RETURN count(function) AS count",
+            repo_name=TEST_REPO_NAME,
+        ).single(strict=True)["count"]
 
     assert file_count == 1
     assert function_count == 2
     assert calls_count == 1
+    assert external_count == 1
 
 
 def test_api_graph_endpoint(db_cleanup: None) -> None:
     """Expose persisted mock AST data in the React Flow graph response."""
     _save_mock_ast()
-    client = TestClient(app)
-
-    response = client.get(
-        "/api/graph",
-        params={"repo_name": TEST_REPO_NAME},
-    )
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/graph",
+            params={"repo_name": TEST_REPO_NAME},
+        )
 
     assert response.status_code == 200
     payload = response.json()

@@ -11,6 +11,12 @@ WHERE (node:File OR node:Function) AND node.repo_name = $repo_name
 DETACH DELETE node
 """
 
+TAG_EXTERNAL_FUNCTIONS_QUERY = """
+MATCH (fn:Function {repo_name: $repo_name})
+WHERE NOT ()-[:DEFINES]->(fn)
+SET fn:ExternalFunction, fn.is_external = true
+"""
+
 MERGE_FILES_QUERY = """
 UNWIND $items AS item
 MERGE (file:File {path: item.file_path, repo_name: $repo_name})
@@ -159,6 +165,12 @@ async def save_parsed_ast_to_neo4j(
                 repo_name=normalized_repo_name,
             )
             await result.consume()
+
+        result = await transaction.run(
+            TAG_EXTERNAL_FUNCTIONS_QUERY,
+            repo_name=normalized_repo_name,
+        )
+        await result.consume()
 
     async with get_neo4j_driver().session() as session:
         await session.execute_write(persist)

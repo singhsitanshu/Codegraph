@@ -4,7 +4,10 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.db import GRAPH_QUERY
-from app.db.graph_ops import save_parsed_ast_to_neo4j
+from app.db.graph_ops import (
+    TAG_EXTERNAL_FUNCTIONS_QUERY,
+    save_parsed_ast_to_neo4j,
+)
 
 
 def test_graph_read_starts_from_repository_scoped_files() -> None:
@@ -46,8 +49,14 @@ def test_every_graph_write_receives_repository_scope() -> None:
             )
         )
 
-    assert transaction.run.await_count == 5
+    assert transaction.run.await_count == 6
     assert "DETACH DELETE node" in transaction.run.await_args_list[0].args[0]
+    assert (
+        transaction.run.await_args_list[-1].args[0]
+        == TAG_EXTERNAL_FUNCTIONS_QUERY
+    )
+    assert "SET fn:ExternalFunction" in TAG_EXTERNAL_FUNCTIONS_QUERY
+    assert "fn.is_external = true" in TAG_EXTERNAL_FUNCTIONS_QUERY
     for call in transaction.run.await_args_list:
         assert call.kwargs["repo_name"] == "owner/repository-a"
         assert "$repo_name" in call.args[0]

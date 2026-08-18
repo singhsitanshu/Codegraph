@@ -1,15 +1,20 @@
 """Unit tests for the repository-scoped LangGraph traversal tools."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent.graph import (
+    CALLERS_QUERY,
     CODEBASE_STRUCTURE_QUERY,
+    EXTERNAL_DEPENDENCIES_QUERY,
     FUNCTIONS_IN_FILE_QUERY,
     OUTGOING_DEPENDENCIES_QUERY,
     _get_code_agent,
+    list_external_dependencies,
     list_codebase_structure,
     list_functions_in_file,
+    query_graph_blast_radius,
     query_outgoing_dependencies,
 )
 
@@ -80,20 +85,75 @@ def test_query_outgoing_dependencies_formats_targets_and_locations() -> None:
             "function_name": " send ",
         },
         [
-            {"target_name": "prepare", "target_file": "src/client.py"},
-            {"target_name": "http_call", "target_file": None},
+            {
+                "target_name": "prepare",
+                "target_file": "src/client.py",
+                "is_external": False,
+            },
+            {
+                "target_name": "http_call",
+                "target_file": None,
+                "is_external": True,
+            },
         ],
     )
 
     assert output == (
         "Outgoing dependencies for send:\n"
         "- prepare (src/client.py)\n"
-        "- http_call (external/unknown)"
+        "- http_call (External/Built-in)"
     )
     run_query.assert_awaited_once_with(
         OUTGOING_DEPENDENCIES_QUERY,
         repo_name="owner/repository",
         func_name="send",
+    )
+
+
+def test_blast_radius_surfaces_external_target_status() -> None:
+    output, run_query = _invoke_tool(
+        query_graph_blast_radius,
+        {
+            "repo_name": "owner/repository",
+            "function_name": "Exception",
+        },
+        [
+            {
+                "caller": "validate",
+                "file_paths": ["src/validation.py"],
+                "target_is_external": True,
+            }
+        ],
+    )
+
+    payload = json.loads(output)
+    assert payload["target_is_external"] is True
+    assert payload["callers"][0]["target_is_external"] is True
+    run_query.assert_awaited_once_with(
+        CALLERS_QUERY,
+        repo_name="owner/repository",
+        func_name="Exception",
+    )
+
+
+def test_list_external_dependencies_formats_repository_boundary() -> None:
+    output, run_query = _invoke_tool(
+        list_external_dependencies,
+        {"repo_name": "owner/repository"},
+        [
+            {"function_name": "Exception"},
+            {"function_name": "requests_get"},
+        ],
+    )
+
+    assert output == (
+        "External dependencies:\n"
+        "- Exception\n"
+        "- requests_get"
+    )
+    run_query.assert_awaited_once_with(
+        EXTERNAL_DEPENDENCIES_QUERY,
+        repo_name="owner/repository",
     )
 
 
@@ -116,5 +176,6 @@ def test_code_agent_registers_all_repository_tools() -> None:
         "list_codebase_structure",
         "list_functions_in_file",
         "query_outgoing_dependencies",
+        "list_external_dependencies",
     ]
     _get_code_agent.cache_clear()
