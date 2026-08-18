@@ -35,25 +35,6 @@ def _github_headers(accept: str = "application/vnd.github+json") -> dict[str, st
     return headers
 
 
-async def _get_default_branch(
-    client: httpx.AsyncClient,
-    encoded_owner: str,
-    encoded_repo: str,
-) -> str:
-    """Read and validate a repository's configured default branch."""
-
-    metadata_url = f"{GITHUB_API_BASE_URL}/repos/{encoded_owner}/{encoded_repo}"
-    response = await client.get(metadata_url)
-    response.raise_for_status()
-    payload = response.json()
-    default_branch = (
-        payload.get("default_branch") if isinstance(payload, dict) else None
-    )
-    if not isinstance(default_branch, str) or not default_branch.strip():
-        raise ValueError("GitHub repository metadata has no default_branch")
-    return default_branch.strip()
-
-
 def _extract_zip_safely(archive_bytes: bytes, destination: Path) -> Path:
     """Extract a GitHub zipball without allowing paths outside destination."""
 
@@ -78,23 +59,19 @@ def _extract_zip_safely(archive_bytes: bytes, destination: Path) -> Path:
 async def download_and_extract_repo(
     repo_owner: str,
     repo_name: str,
-    branch: str | None = None,
 ) -> str:
-    """Download and extract a GitHub repository branch into temporary storage.
+    """Download and extract a GitHub repository into temporary storage.
 
     The returned extracted-root path remains valid until
     :func:`cleanup_downloaded_repo` is called. Callers should always release it
-    in a ``finally`` block. When ``branch`` is omitted, GitHub repository
-    metadata supplies the actual default branch.
+    in a ``finally`` block. Omitting a Git reference from GitHub's zipball URL
+    makes GitHub serve the repository's configured default branch.
     """
 
     normalized_owner = repo_owner.strip()
     normalized_repo = repo_name.strip()
-    normalized_branch = branch.strip() if branch is not None else None
     if not normalized_owner or not normalized_repo:
         raise ValueError("repo_owner and repo_name must not be blank")
-    if branch is not None and not normalized_branch:
-        raise ValueError("branch must not be blank when provided")
 
     encoded_owner = quote(normalized_owner, safe="")
     encoded_repo = quote(normalized_repo, safe="")
@@ -106,15 +83,9 @@ async def download_and_extract_repo(
             timeout=httpx.Timeout(60.0),
             headers=_github_headers(),
         ) as client:
-            selected_branch = normalized_branch or await _get_default_branch(
-                client,
-                encoded_owner,
-                encoded_repo,
-            )
-            encoded_branch = quote(selected_branch, safe="")
             archive_url = (
                 f"{GITHUB_API_BASE_URL}/repos/{encoded_owner}/{encoded_repo}/"
-                f"zipball/{encoded_branch}"
+                "zipball"
             )
             response = await client.get(archive_url)
             response.raise_for_status()

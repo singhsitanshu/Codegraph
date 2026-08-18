@@ -296,15 +296,13 @@ async def parse_changed_files(
         path = Path(file_path)
         try:
             source_code = await asyncio.to_thread(path.read_bytes)
+            return await code_parser.parse_file(file_path, source_code)
         except FileNotFoundError:
             logger.info("Skipping missing or deleted source file: %s", file_path)
-            return None
+        except UnicodeDecodeError as exc:
+            logger.warning("Skipping source file %s: %s", file_path, exc)
         except OSError as exc:
             logger.warning("Unable to read source file %s: %s", file_path, exc)
-            return None
-
-        try:
-            return await code_parser.parse_file(file_path, source_code)
         except ValueError as exc:
             logger.warning("Skipping unsupported source file %s: %s", file_path, exc)
         except Exception as exc:

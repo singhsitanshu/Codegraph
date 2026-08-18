@@ -84,13 +84,10 @@ def test_downloaded_repository_lives_until_explicit_cleanup() -> None:
     with zipfile.ZipFile(archive_buffer, mode="w") as archive:
         archive.writestr("psf-requests-sha/src/example.py", "def example(): pass\n")
 
-    metadata_response = Mock()
-    metadata_response.raise_for_status = Mock()
-    metadata_response.json = Mock(return_value={"default_branch": "main"})
     archive_response = Mock(content=archive_buffer.getvalue())
     archive_response.raise_for_status = Mock()
     client = MagicMock()
-    client.get = AsyncMock(side_effect=[metadata_response, archive_response])
+    client.get = AsyncMock(return_value=archive_response)
     client_context = MagicMock()
     client_context.__aenter__ = AsyncMock(return_value=client)
     client_context.__aexit__ = AsyncMock(return_value=None)
@@ -107,11 +104,8 @@ def test_downloaded_repository_lives_until_explicit_cleanup() -> None:
     temporary_parent = extracted_path.parent
     try:
         assert (extracted_path / "src" / "example.py").is_file()
-        assert client.get.await_args_list[0].args == (
-            "https://api.github.com/repos/psf/requests",
-        )
-        assert client.get.await_args_list[1].args == (
-            "https://api.github.com/repos/psf/requests/zipball/main",
+        client.get.assert_awaited_once_with(
+            "https://api.github.com/repos/psf/requests/zipball",
         )
     finally:
         cleanup_downloaded_repo(extracted_root)
