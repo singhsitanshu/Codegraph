@@ -22,6 +22,26 @@ ORDER BY caller
 LIMIT 100
 """
 
+CODEBASE_STRUCTURE_QUERY = """
+MATCH (f:File {repo_name: $repo_name})
+RETURN f.path AS file_path
+ORDER BY f.path
+"""
+
+FUNCTIONS_IN_FILE_QUERY = """
+MATCH (f:File {path: $file_path, repo_name: $repo_name})-[:DEFINES]->
+      (fn:Function)
+RETURN fn.name AS function_name
+ORDER BY fn.name
+"""
+
+OUTGOING_DEPENDENCIES_QUERY = """
+MATCH (caller:Function {name: $func_name, repo_name: $repo_name})-[:CALLS]->
+      (target:Function {repo_name: $repo_name})
+RETURN target.name AS target_name, target.file AS target_file
+ORDER BY target.name, target.file
+"""
+
 
 @tool
 async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
@@ -56,6 +76,99 @@ async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
     )
 
 
+@tool
+async def list_codebase_structure(repo_name: str) -> str:
+    """List every source file path in one ``owner/repository`` code graph."""
+
+    normalized_repo_name = repo_name.strip()
+    if not normalized_repo_name:
+        return ""
+
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(
+            CODEBASE_STRUCTURE_QUERY,
+            repo_name=normalized_repo_name,
+        )
+        records = await result.data()
+
+    return "\n".join(
+        record["file_path"]
+        for record in records
+        if isinstance(record.get("file_path"), str)
+    )
+
+
+@tool
+async def list_functions_in_file(repo_name: str, file_path: str) -> str:
+    """List functions defined in a file within one repository graph."""
+
+    normalized_repo_name = repo_name.strip()
+    normalized_file_path = file_path.strip()
+    if not normalized_repo_name or not normalized_file_path:
+        return "No functions found."
+
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(
+            FUNCTIONS_IN_FILE_QUERY,
+            repo_name=normalized_repo_name,
+            file_path=normalized_file_path,
+        )
+        records = await result.data()
+
+    function_names = [
+        record["function_name"]
+        for record in records
+        if isinstance(record.get("function_name"), str)
+    ]
+    if not function_names:
+        return f"No functions found in {normalized_file_path}."
+    return "\n".join(
+        [
+            f"Functions in {normalized_file_path}:",
+            *(f"- {function_name}" for function_name in function_names),
+        ]
+    )
+
+
+@tool
+async def query_outgoing_dependencies(
+    repo_name: str,
+    function_name: str,
+) -> str:
+    """List functions called by a function within one repository graph."""
+
+    normalized_repo_name = repo_name.strip()
+    normalized_function_name = function_name.strip()
+    if not normalized_repo_name or not normalized_function_name:
+        return "No outgoing dependencies found."
+
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(
+            OUTGOING_DEPENDENCIES_QUERY,
+            repo_name=normalized_repo_name,
+            func_name=normalized_function_name,
+        )
+        records = await result.data()
+
+    dependencies: list[str] = []
+    for record in records:
+        target_name = record.get("target_name")
+        if not isinstance(target_name, str):
+            continue
+        target_file = record.get("target_file")
+        location = target_file if isinstance(target_file, str) else "external/unknown"
+        dependencies.append(f"- {target_name} ({location})")
+
+    if not dependencies:
+        return f"No outgoing dependencies found for {normalized_function_name}."
+    return "\n".join(
+        [
+            f"Outgoing dependencies for {normalized_function_name}:",
+            *dependencies,
+        ]
+    )
+
+
 @lru_cache(maxsize=1)
 def _get_code_agent() -> Any:
     """Create and cache the Sonnet 5 ReAct graph on first chat request."""
@@ -64,7 +177,13 @@ def _get_code_agent() -> Any:
         model="claude-sonnet-5",
         api_key=settings.ANTHROPIC_API_KEY,
     )
-    return create_react_agent(llm, tools=[query_graph_blast_radius])
+    tools = [
+        query_graph_blast_radius,
+        list_codebase_structure,
+        list_functions_in_file,
+        query_outgoing_dependencies,
+    ]
+    return create_react_agent(llm, tools=tools)
 
 
 def _message_text(content: object) -> str:
