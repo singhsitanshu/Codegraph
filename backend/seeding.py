@@ -12,6 +12,7 @@ from app.db.graph_ops import save_parsed_ast_to_neo4j
 # UPDATE THIS: Use an absolute path to your cloned requests directory
 # Example: "/Users/yourname/projects/requests" or "C:/Users/yourname/projects/requests"
 REQUESTS_REPO_PATH = os.path.abspath("/Users/sitanshusingh/Downloads/requests")
+REQUESTS_REPO_NAME = "psf/requests"
 
 async def main():
     print("\n================ STARTING DIAGNOSTIC SEED ================")
@@ -65,7 +66,11 @@ async def main():
     # Check 4: Save to Neo4j
     print("\n[CHECK 4] Saving AST records to Neo4j...")
     try:
-        save_parsed_ast_to_neo4j(parsed_data)
+        await save_parsed_ast_to_neo4j(
+            parsed_data,
+            repo_name=REQUESTS_REPO_NAME,
+            replace_existing=True,
+        )
         print("✅ [CHECK 4 PASSED] Database write finished!")
     except Exception as e:
         print(f"❌ [CHECK 4 FAILED] Neo4j write failed: {e}")

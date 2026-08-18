@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import close_neo4j_driver
-from app.db import neo4j_client
+from app.agent.graph import query_graph_blast_radius
+from app.db import close_neo4j_driver, neo4j_client
 from app.db.graph_ops import save_parsed_ast_to_neo4j
 from app.main import app
 
 TEST_FILE_PATH = "TEST_MOCK_FILE.py"
+TEST_REPO_NAME = "test/mock-repository"
+OTHER_TEST_REPO_NAME = "test/other-repository"
 MOCK_DATA: list[dict[str, object]] = [
     {
         "file_path": TEST_FILE_PATH,
@@ -23,11 +26,17 @@ MOCK_DATA: list[dict[str, object]] = [
     }
 ]
 TEST_NODE_CLEANUP_QUERY = (
-    "MATCH (n) WHERE n.path = 'TEST_MOCK_FILE.py' "
-    "OR n.file = 'TEST_MOCK_FILE.py' DETACH DELETE n"
+    "MATCH (n) WHERE n.repo_name IN "
+    "['test/mock-repository', 'test/other-repository'] AND ("
+    "n.path = 'TEST_MOCK_FILE.py' "
+    "OR n.file = 'TEST_MOCK_FILE.py') DETACH DELETE n"
 )
 ORPHAN_EXTERNAL_CLEANUP_QUERY = """
-MATCH (function:Function {name: 'external_api_call', external: true})
+MATCH (function:Function {
+    name: 'external_api_call',
+    external: true,
+    repo_name: 'test/mock-repository'
+})
 WHERE NOT (function)<-[:CALLS]-()
 DETACH DELETE function
 """
@@ -56,7 +65,7 @@ def _save_mock_ast() -> None:
 
     async def save() -> None:
         try:
-            await save_parsed_ast_to_neo4j(MOCK_DATA)
+            await save_parsed_ast_to_neo4j(MOCK_DATA, repo_name=TEST_REPO_NAME)
         finally:
             await close_neo4j_driver()
 
@@ -70,20 +79,26 @@ def test_neo4j_ast_write(db_cleanup: None) -> None:
 
     with neo4j_client.driver.session() as session:
         file_count = session.run(
-            "MATCH (file:File {path: $path}) RETURN count(file) AS count",
+            "MATCH (file:File {path: $path, repo_name: $repo_name}) "
+            "RETURN count(file) AS count",
             path=TEST_FILE_PATH,
+            repo_name=TEST_REPO_NAME,
         ).single(strict=True)["count"]
         function_count = session.run(
-            "MATCH (function:Function {file: $path}) "
+            "MATCH (function:Function {file: $path, repo_name: $repo_name}) "
             "RETURN count(function) AS count",
             path=TEST_FILE_PATH,
+            repo_name=TEST_REPO_NAME,
         ).single(strict=True)["count"]
         calls_count = session.run(
-            "MATCH (:Function {name: 'mock_func_A', file: $path})"
+            "MATCH (:Function {name: 'mock_func_A', file: $path, "
+            "repo_name: $repo_name})"
             "-[calls:CALLS]->"
-            "(:Function {name: 'mock_func_B', file: $path}) "
+            "(:Function {name: 'mock_func_B', file: $path, "
+            "repo_name: $repo_name}) "
             "RETURN count(calls) AS count",
             path=TEST_FILE_PATH,
+            repo_name=TEST_REPO_NAME,
         ).single(strict=True)["count"]
 
     assert file_count == 1
@@ -119,8 +134,87 @@ def test_api_chat_endpoint() -> None:
     ):
         response = client.post(
             "/api/chat",
-            json={"message": "What calls mock_func?"},
+            json={
+                "message": "What calls mock_func?",
+                "repo_name": TEST_REPO_NAME,
+            },
         )
 
     assert response.status_code == 200
     assert response.json() == {"response": "Mocked LangGraph response"}
+
+
+def test_api_chat_rejects_unscoped_frontend_payload() -> None:
+    """Keep the required repository context visible in the API contract."""
+
+    code_agent = AsyncMock(return_value="This must not be called")
+    with patch("app.main.ask_code_agent", new=code_agent):
+        response = TestClient(app).post(
+            "/api/chat",
+            json={"message": "What calls mock_func?"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "repo_name"]
+    code_agent.assert_not_awaited()
+
+
+def test_blast_radius_does_not_cross_repository_boundaries(
+    db_cleanup: None,
+) -> None:
+    """Return callers from repository A without leaking repository B."""
+
+    repository_a = [
+        {
+            "file_path": TEST_FILE_PATH,
+            "defined_functions": ["caller_from_a", "shared_target"],
+            "outgoing_calls": ["shared_target"],
+        }
+    ]
+    repository_b = [
+        {
+            "file_path": TEST_FILE_PATH,
+            "defined_functions": ["caller_from_b", "shared_target"],
+            "outgoing_calls": ["shared_target"],
+        }
+    ]
+
+    async def save_and_query() -> tuple[dict[str, object], dict[str, object]]:
+        try:
+            await save_parsed_ast_to_neo4j(repository_b, OTHER_TEST_REPO_NAME)
+            await save_parsed_ast_to_neo4j(
+                repository_a,
+                TEST_REPO_NAME,
+                replace_existing=True,
+            )
+            result_a = await query_graph_blast_radius.ainvoke(
+                {
+                    "repo_name": TEST_REPO_NAME,
+                    "function_name": "shared_target",
+                }
+            )
+            result_b = await query_graph_blast_radius.ainvoke(
+                {
+                    "repo_name": OTHER_TEST_REPO_NAME,
+                    "function_name": "shared_target",
+                }
+            )
+            return json.loads(result_a), json.loads(result_b)
+        finally:
+            await close_neo4j_driver()
+
+    payload_a, payload_b = asyncio.run(save_and_query())
+    caller_names_a = {
+        caller["caller"]
+        for caller in payload_a["callers"]
+        if isinstance(caller, dict)
+    }
+    caller_names_b = {
+        caller["caller"]
+        for caller in payload_b["callers"]
+        if isinstance(caller, dict)
+    }
+    assert "caller_from_a" in caller_names_a
+    assert "caller_from_b" not in caller_names_a
+    assert "caller_from_b" in caller_names_b
+    assert "caller_from_a" not in caller_names_b

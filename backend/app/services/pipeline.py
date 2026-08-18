@@ -211,7 +211,10 @@ async def process_github_event(payload: dict[str, Any], event_type: str) -> None
             len(modified_files),
         )
 
-        await save_parsed_ast_to_neo4j(parsed_relationships)
+        await save_parsed_ast_to_neo4j(
+            parsed_relationships,
+            repo_name=f"{owner}/{repo}",
+        )
         logger.info(
             "Neo4j stage complete: persisted %d parsed file(s)",
             len(parsed_relationships),

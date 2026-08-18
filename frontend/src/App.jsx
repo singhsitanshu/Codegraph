@@ -19,7 +19,13 @@ import {
   useNodesState,
 } from "@xyflow/react";
 
-const API_BASE = "http://localhost:8000";
+import {
+  API_BASE,
+  ingestRepository,
+  requestChat,
+  responseError,
+} from "./api.js";
+
 const FUNCTION_NODE_WIDTH = 150;
 const FUNCTION_NODE_HEIGHT = 52;
 const FILE_NODE_MIN_WIDTH = 190;
@@ -425,15 +431,6 @@ function extractSseText(data) {
   }
 }
 
-async function responseError(response, fallback) {
-  try {
-    const payload = await response.json();
-    return payload.detail ?? payload.error ?? `${fallback} (${response.status})`;
-  } catch {
-    return `${fallback} (${response.status})`;
-  }
-}
-
 function extractSseError(data) {
   try {
     const payload = JSON.parse(data);
@@ -483,6 +480,10 @@ function App() {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [chatError, setChatError] = useState("");
+  const [repositoryInput, setRepositoryInput] = useState("");
+  const [activeRepoName, setActiveRepoName] = useState("");
+  const [ingestionStatus, setIngestionStatus] = useState("idle");
+  const [ingestionError, setIngestionError] = useState("");
   const abortRef = useRef(null);
   const messagesEndRef = useRef(null);
   const flowInstanceRef = useRef(null);
@@ -621,10 +622,46 @@ function App() {
 
   const stopStreaming = () => abortRef.current?.abort();
 
+  const submitRepository = async (event) => {
+    event.preventDefault();
+    const repository = repositoryInput.trim();
+    if (!repository || ingestionStatus === "ingesting") return;
+
+    abortRef.current?.abort();
+    setIngestionStatus("ingesting");
+    setIngestionError("");
+    setChatError("");
+    setActiveRepoName("");
+
+    try {
+      const result = await ingestRepository(repository);
+      setActiveRepoName(result.repo_name);
+      setIngestionStatus("ready");
+      setMessages([
+        starterMessages[0],
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `${result.repo_name} is indexed and ready for questions.`,
+        },
+      ]);
+      await loadGraph();
+    } catch (error) {
+      setIngestionStatus("error");
+      setIngestionError(
+        error instanceof Error ? error.message : "Repository ingestion failed",
+      );
+    }
+  };
+
   const sendMessage = async (event) => {
     event.preventDefault();
     const prompt = input.trim();
     if (!prompt || streaming) return;
+    if (!activeRepoName || ingestionStatus !== "ready") {
+      setChatError("Ingest a repository before asking code-graph questions");
+      return;
+    }
 
     const userMessage = { id: crypto.randomUUID(), role: "user", content: prompt };
     const assistantId = crypto.randomUUID();
@@ -642,18 +679,9 @@ function App() {
     let accumulated = "";
 
     try {
-      const response = await fetch(`${API_BASE}/api/chat`, {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/event-stream",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ message: prompt }),
+      const response = await requestChat(prompt, activeRepoName, {
         signal: controller.signal,
       });
-      if (!response.ok) {
-        throw new Error(await responseError(response, "Chat request failed"));
-      }
       const contentType = response.headers.get("content-type") ?? "";
       if (contentType.includes("application/json")) {
         const payload = await response.json();
@@ -706,7 +734,7 @@ function App() {
       } else {
         const message = error instanceof Error ? error.message : "Chat request failed";
         setChatError(message);
-        if (!accumulated) accumulated = "I couldn’t reach the agent. Please try again.";
+        if (!accumulated) accumulated = `Agent request failed: ${message}`;
       }
       setMessages((current) =>
         current.map((message) =>
@@ -736,8 +764,14 @@ function App() {
               </div>
             </div>
             <span className="inline-flex items-center gap-2 rounded-full border border-[#d8e2db] bg-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[#5d7069]">
-              <i className="size-1.5 rounded-full bg-[#65a56c] shadow-[0_0_0_3px_rgba(101,165,108,0.12)]" />
-              Agent ready
+              <i
+                className={`size-1.5 rounded-full ${
+                  ingestionStatus === "ready" ? "bg-[#65a56c]" : "bg-[#c6a34d]"
+                }`}
+              />
+              {ingestionStatus === "ingesting"
+                ? "Indexing"
+                : activeRepoName || "Select repository"}
             </span>
           </header>
 
@@ -751,6 +785,44 @@ function App() {
                   Explore how your code connects.
                 </h2>
               </div>
+              <form
+                onSubmit={submitRepository}
+                className="rounded-2xl border border-[#d8e1da] bg-[#fdfefb] p-3 shadow-[0_5px_18px_rgba(32,51,45,0.04)]"
+              >
+                <label
+                  htmlFor="repository"
+                  className="text-[10px] font-extrabold uppercase tracking-[0.15em] text-[#71817b]"
+                >
+                  GitHub repository
+                </label>
+                <div className="mt-2 flex gap-2">
+                  <input
+                    id="repository"
+                    type="text"
+                    value={repositoryInput}
+                    disabled={ingestionStatus === "ingesting"}
+                    onChange={(event) => setRepositoryInput(event.target.value)}
+                    placeholder="https://github.com/psf/requests or psf/requests"
+                    className="min-w-0 flex-1 rounded-xl border border-[#d7e0da] bg-white px-3 py-2 text-xs text-[#263a33] outline-none transition focus:border-[#92aa9f] disabled:opacity-60"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!repositoryInput.trim() || ingestionStatus === "ingesting"}
+                    className="rounded-xl bg-[#174f3d] px-4 py-2 text-[10px] font-extrabold uppercase tracking-[0.1em] text-white transition hover:bg-[#0f3e2f] disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {ingestionStatus === "ingesting" ? "Indexing…" : "Ingest"}
+                  </button>
+                </div>
+                {(ingestionError || activeRepoName) && (
+                  <p
+                    className={`mt-2 text-[10px] ${
+                      ingestionError ? "text-[#b45348]" : "text-[#39705e]"
+                    }`}
+                  >
+                    {ingestionError || `Active repository: ${activeRepoName}`}
+                  </p>
+                )}
+              </form>
               {messages.map((message) => (
                 <ChatMessage key={message.id} message={message} />
               ))}
@@ -765,8 +837,13 @@ function App() {
             >
               <textarea
                 aria-label="Message"
+                disabled={!activeRepoName || ingestionStatus !== "ready"}
                 className="max-h-32 min-h-12 w-full resize-none bg-transparent px-3 py-2 text-[13px] leading-5 text-[#263a33] outline-none placeholder:text-[#9ba7a2]"
-                placeholder="Ask about a function or dependency…"
+                placeholder={
+                  activeRepoName
+                    ? "Ask about a function or dependency…"
+                    : "Ingest a GitHub repository to enable chat…"
+                }
                 rows="2"
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
@@ -779,7 +856,10 @@ function App() {
               />
               <div className="flex items-center justify-between px-2 pb-1">
                 <span className={`text-[10px] ${chatError ? "text-[#b45348]" : "text-[#9aa6a1]"}`}>
-                  {chatError || "Enter to send · Shift + Enter for a new line"}
+                  {chatError ||
+                    (activeRepoName
+                      ? "Enter to send · Shift + Enter for a new line"
+                      : "Repository context is required")}
                 </span>
                 {streaming ? (
                   <button
@@ -793,7 +873,7 @@ function App() {
                 ) : (
                   <button
                     type="submit"
-                    disabled={!input.trim()}
+                    disabled={!input.trim() || !activeRepoName}
                     className="grid size-8 place-items-center rounded-xl bg-[#174f3d] text-white transition hover:bg-[#0f3e2f] disabled:cursor-not-allowed disabled:opacity-35"
                     aria-label="Send message"
                   >

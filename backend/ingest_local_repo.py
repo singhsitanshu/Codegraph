@@ -14,6 +14,7 @@ from app.services.parser_service import parse_changed_files
 
 
 TARGET_REPO_PATH = "/Users/sitanshusingh/Downloads/requests"
+TARGET_REPO_NAME = "psf/requests"
 IGNORED_DIRECTORIES = frozenset(
     {".git", "__pycache__", "venv", ".venv", "build", "tests", "docs"}
 )
@@ -65,7 +66,11 @@ async def ingest_repository() -> None:
     if not parsed_data:
         raise RuntimeError("Tree-sitter produced no parsed data; ingestion aborted")
 
-    await save_parsed_ast_to_neo4j(parsed_data)
+    await save_parsed_ast_to_neo4j(
+        parsed_data,
+        repo_name=TARGET_REPO_NAME,
+        replace_existing=True,
+    )
     print(f"Persisted AST data for {len(parsed_data)} files")
 
     counts = await asyncio.to_thread(verify_ingestion)

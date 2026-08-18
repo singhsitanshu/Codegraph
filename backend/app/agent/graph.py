@@ -13,9 +13,9 @@ from app.db import get_neo4j_driver
 
 
 CALLERS_QUERY = """
-MATCH (caller:Function)-[:CALLS]->(target:Function)
-WHERE toLower(target.name) = toLower($function_name)
-OPTIONAL MATCH (file:File)-[:DEFINES]->(caller)
+MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->
+      (target:Function {name: $func_name, repo_name: $repo_name})
+OPTIONAL MATCH (file:File {repo_name: $repo_name})-[:DEFINES]->(caller)
 RETURN DISTINCT caller.name AS caller,
        collect(DISTINCT file.path) AS file_paths
 ORDER BY caller
@@ -24,22 +24,34 @@ LIMIT 100
 
 
 @tool
-async def query_graph_blast_radius(function_name: str) -> str:
-    """Find functions that directly call a named function in the code graph."""
+async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
+    """Find direct callers of a function within one ``owner/repository`` graph."""
 
+    normalized_repo_name = repo_name.strip()
     normalized_name = function_name.strip()
-    if not normalized_name:
-        return json.dumps({"function_name": function_name, "callers": []})
+    if not normalized_repo_name or not normalized_name:
+        return json.dumps(
+            {
+                "repo_name": normalized_repo_name,
+                "function_name": normalized_name,
+                "callers": [],
+            }
+        )
 
     async with get_neo4j_driver().session() as session:
         result = await session.run(
             CALLERS_QUERY,
-            function_name=normalized_name,
+            repo_name=normalized_repo_name,
+            func_name=normalized_name,
         )
         records = await result.data()
 
     return json.dumps(
-        {"function_name": normalized_name, "callers": records},
+        {
+            "repo_name": normalized_repo_name,
+            "function_name": normalized_name,
+            "callers": records,
+        },
         default=str,
     )
 
@@ -69,11 +81,29 @@ def _message_text(content: object) -> str:
     return ""
 
 
-async def ask_code_agent(user_message: str) -> str:
-    """Ask the code-graph agent a question and return its final text response."""
+async def ask_code_agent(user_message: str, repo_name: str) -> str:
+    """Ask the code-graph agent a repository-scoped code question."""
+
+    normalized_repo_name = repo_name.strip()
+    if not normalized_repo_name:
+        raise ValueError("repo_name must not be blank")
 
     result = await _get_code_agent().ainvoke(
-        {"messages": [{"role": "user", "content": user_message}]}
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are analyzing only the GitHub repository "
+                        f"'{normalized_repo_name}'. When calling graph tools, "
+                        "always use that exact repository name. Do not mix "
+                        "results from other repositories."
+                    ),
+                },
+                {"role": "user", "content": user_message},
+            ],
+            "repo_name": normalized_repo_name,
+        }
     )
     messages = result.get("messages", [])
     if not messages:
