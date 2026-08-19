@@ -4,6 +4,7 @@ import logging
 import os
 from collections.abc import Generator
 from pathlib import Path
+from threading import Lock
 
 from dotenv import load_dotenv
 from neo4j import Driver, GraphDatabase, Session
@@ -16,6 +17,17 @@ load_dotenv(BACKEND_DIR / ".env", override=False)
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+DATABASE_INDEX_QUERIES = (
+    "CREATE INDEX file_repo_path IF NOT EXISTS "
+    "FOR (f:File) ON (f.repo_name, f.path)",
+    "CREATE INDEX func_repo_name IF NOT EXISTS "
+    "FOR (fn:Function) ON (fn.repo_name, fn.name)",
+    "CREATE INDEX ext_func_repo_name IF NOT EXISTS "
+    "FOR (ext:ExternalFunction) ON (ext.repo_name, ext.name)",
+)
+AWAIT_INDEXES_QUERY = "CALL db.awaitIndexes(300)"
+_database_initialized = False
+_database_initialization_lock = Lock()
 
 
 def _initialize_driver() -> Driver | None:
@@ -41,6 +53,30 @@ def _initialize_driver() -> Driver | None:
 
 
 driver: Driver | None = _initialize_driver()
+
+
+def initialize_database() -> None:
+    """Create and await the indexes required by repository-scoped merges."""
+
+    global driver, _database_initialized
+    if _database_initialized:
+        return
+
+    with _database_initialization_lock:
+        if _database_initialized:
+            return
+        if driver is None:
+            driver = _initialize_driver()
+        if driver is None:
+            raise RuntimeError("Neo4j driver is not initialized")
+
+        with driver.session() as session:
+            for query in DATABASE_INDEX_QUERIES:
+                session.run(query).consume()
+            session.run(AWAIT_INDEXES_QUERY).consume()
+
+        _database_initialized = True
+        logger.info("Neo4j repository indexes are online")
 
 
 def get_db_session() -> Generator[Session, None, None]:

@@ -15,6 +15,7 @@ from app.services.github_service import (
     download_and_extract_repo,
 )
 from app.services.parser_service import ParsedFileProgress
+from app.db.graph_ops import DatabaseWriteProgress
 
 
 def test_parse_github_repository_url() -> None:
@@ -39,7 +40,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         }
     ]
     cleanup = Mock()
-    save = AsyncMock()
+    save_calls = []
 
     async def parse_with_progress(_file_paths: list[str]):
         yield ParsedFileProgress(
@@ -48,6 +49,13 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
             total=1,
             result=parsed_data[0],
         )
+
+    async def save_with_progress(*args, **kwargs):
+        save_calls.append((args, kwargs))
+        yield DatabaseWriteProgress("Pass 1: Creating Files...", 86)
+        yield DatabaseWriteProgress("Pass 2: Creating Functions...", 90)
+        yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
+        yield DatabaseWriteProgress("Completing transaction...", 98)
 
     with (
         patch(
@@ -58,7 +66,10 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
             "app.main.parse_changed_files_with_progress",
             new=parse_with_progress,
         ),
-        patch("app.main.save_parsed_ast_to_neo4j", new=save),
+        patch(
+            "app.main.save_parsed_ast_to_neo4j_with_progress",
+            new=save_with_progress,
+        ),
         patch("app.main.cleanup_downloaded_repo", new=cleanup),
     ):
         response = TestClient(app).post(
@@ -76,6 +87,10 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         20,
         80,
         85,
+        86,
+        90,
+        94,
+        98,
         100,
     ]
     assert progress_records[-1] == {
@@ -83,11 +98,12 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         "progress": 100,
         "repo_name": "psf/requests",
     }
-    save.assert_awaited_once_with(
-        parsed_data,
-        repo_name="psf/requests",
-        replace_existing=True,
-    )
+    assert save_calls == [
+        (
+            (parsed_data,),
+            {"repo_name": "psf/requests", "replace_existing": True},
+        )
+    ]
     assert parsed_data[0]["file_path"] == "src/example.py"
     cleanup.assert_called_once_with(str(repository_root))
 

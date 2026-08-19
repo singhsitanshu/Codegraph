@@ -20,8 +20,8 @@ from pydantic import BaseModel, Field, field_validator
 from app.api import webhooks
 from app.agent.graph import ask_code_agent
 from app.db import close_neo4j_driver, fetch_graph_data
-from app.db.graph_ops import save_parsed_ast_to_neo4j
-from app.db.neo4j_client import close_driver
+from app.db.graph_ops import save_parsed_ast_to_neo4j_with_progress
+from app.db.neo4j_client import close_driver, initialize_database
 from app.services.github_service import (
     cleanup_downloaded_repo,
     download_and_extract_repo,
@@ -51,8 +51,9 @@ GITHUB_REPOSITORY_PART = re.compile(r"[A-Za-z0-9_.-]+")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Release synchronous and asynchronous Neo4j drivers on shutdown."""
+    """Initialize Neo4j schema and release drivers on shutdown."""
 
+    await asyncio.to_thread(initialize_database)
     yield
     close_driver()
     await close_neo4j_driver()
@@ -297,14 +298,19 @@ async def _stream_repository_ingestion(
 
         current_progress = 85
         yield _ndjson_record(
-            status="Saving graph to Neo4j...",
+            status="Batching data to Neo4j...",
             progress=current_progress,
         )
-        await save_parsed_ast_to_neo4j(
+        async for database_progress in save_parsed_ast_to_neo4j_with_progress(
             parsed_data,
             repo_name=canonical_repo_name,
             replace_existing=True,
-        )
+        ):
+            current_progress = database_progress.progress
+            yield _ndjson_record(
+                status=database_progress.status,
+                progress=current_progress,
+            )
 
         yield _ndjson_record(
             status="Repository ingestion complete.",
