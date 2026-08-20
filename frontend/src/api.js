@@ -107,6 +107,25 @@ export async function fetchRepositoryGraph(repoName, fetchImpl = fetch) {
   return response.json();
 }
 
+export async function deleteRepository(repoName, fetchImpl = fetch) {
+  const normalizedRepoName = repoName?.trim();
+  if (!normalizedRepoName) {
+    throw new Error("Select a repository before deleting it");
+  }
+
+  const response = await fetchImpl(
+    `${API_BASE}/api/repositories/${encodeURIComponent(normalizedRepoName)}`,
+    {
+      method: "DELETE",
+      headers: { Accept: "application/json" },
+    },
+  );
+  if (!response.ok) {
+    throw new Error(await responseError(response, "Repository deletion failed"));
+  }
+  return response.json();
+}
+
 export async function requestChat(
   message,
   repoName,

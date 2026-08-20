@@ -1,4 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   forceCenter,
   forceCollide,
@@ -20,6 +22,7 @@ import {
 } from "@xyflow/react";
 
 import {
+  deleteRepository,
   fetchRepositoryGraph,
   ingestRepository,
   requestChat,
@@ -449,13 +452,23 @@ function ChatMessage({ message }) {
         </div>
       )}
       <div
-        className={`max-w-[82%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-[13px] leading-6 ${
+        className={`max-w-[82%] rounded-2xl px-4 py-3 text-[13px] leading-6 ${
           isUser
-            ? "rounded-br-md bg-[#20332d] text-white"
+            ? "whitespace-pre-wrap rounded-br-md bg-[#20332d] text-white"
             : "rounded-bl-md border border-[#dce4de] bg-white text-[#3d4c47] shadow-[0_5px_18px_rgba(32,51,45,0.05)]"
         }`}
       >
-        {message.content || (
+        {message.content ? (
+          isUser ? (
+            message.content
+          ) : (
+            <div className="chat-markdown">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {message.content}
+              </ReactMarkdown>
+            </div>
+          )
+        ) : (
           <span className="inline-flex gap-1 py-2" aria-label="Generating response">
             <i className="typing-dot" />
             <i className="typing-dot [animation-delay:150ms]" />
@@ -483,6 +496,7 @@ function App() {
   const [activeRepo, setActiveRepo] = useState(null);
   const [ingestionStatus, setIngestionStatus] = useState("idle");
   const [ingestionError, setIngestionError] = useState("");
+  const [isDeleting, setIsDeleting] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState("Idle");
   const abortRef = useRef(null);
@@ -625,10 +639,45 @@ function App() {
 
   const stopStreaming = () => abortRef.current?.abort();
 
+  const deleteActiveRepository = async () => {
+    if (!activeRepo || isDeleting) return;
+    const confirmed = window.confirm(
+      `Delete ${activeRepo} and all of its graph data? This cannot be undone.`,
+    );
+    if (!confirmed) return;
+
+    abortRef.current?.abort();
+    setIsDeleting(true);
+    setIngestionError("");
+    try {
+      await deleteRepository(activeRepo);
+      setActiveRepo(null);
+      setNodes([]);
+      setEdges([]);
+      setInitialCenter(null);
+      setFocusedNodeId(null);
+      setGraphError("");
+      setGraphStatus("idle");
+      setIngestionStatus("idle");
+      setRepositoryInput("");
+      setMessages(starterMessages);
+      setInput("");
+      setChatError("");
+      setProgress(0);
+      setProgressText("Idle");
+    } catch (error) {
+      setIngestionError(
+        error instanceof Error ? error.message : "Repository deletion failed",
+      );
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   const submitRepository = async (event) => {
     event.preventDefault();
     const repository = repositoryInput.trim();
-    if (!repository || ingestionStatus === "ingesting") return;
+    if (!repository || ingestionStatus === "ingesting" || isDeleting) return;
 
     abortRef.current?.abort();
     setIngestionStatus("ingesting");
@@ -796,6 +845,8 @@ function App() {
               />
               {ingestionStatus === "ingesting"
                 ? "Indexing"
+                : isDeleting
+                  ? "Deleting"
                 : activeRepo || "Select repository"}
             </span>
           </header>
@@ -825,14 +876,18 @@ function App() {
                     id="repository"
                     type="text"
                     value={repositoryInput}
-                    disabled={ingestionStatus === "ingesting"}
+                    disabled={ingestionStatus === "ingesting" || isDeleting}
                     onChange={(event) => setRepositoryInput(event.target.value)}
                     placeholder="https://github.com/psf/requests or psf/requests"
                     className="min-w-0 flex-1 rounded-xl border border-[#d7e0da] bg-white px-3 py-2 text-xs text-[#263a33] outline-none transition focus:border-[#92aa9f] disabled:opacity-60"
                   />
                   <button
                     type="submit"
-                    disabled={!repositoryInput.trim() || ingestionStatus === "ingesting"}
+                    disabled={
+                      !repositoryInput.trim() ||
+                      ingestionStatus === "ingesting" ||
+                      isDeleting
+                    }
                     className="rounded-xl bg-[#174f3d] px-4 py-2 text-[10px] font-extrabold uppercase tracking-[0.1em] text-white transition hover:bg-[#0f3e2f] disabled:cursor-not-allowed disabled:opacity-40"
                   >
                     {ingestionStatus === "ingesting" ? "Indexing…" : "Ingest"}
@@ -860,13 +915,25 @@ function App() {
                   </div>
                 )}
                 {(ingestionError || activeRepo) && (
-                  <p
-                    className={`mt-2 text-[10px] ${
-                      ingestionError ? "text-[#b45348]" : "text-[#39705e]"
-                    }`}
-                  >
-                    {ingestionError || `Active repository: ${activeRepo}`}
-                  </p>
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <p
+                      className={`min-w-0 truncate text-[10px] ${
+                        ingestionError ? "text-[#b45348]" : "text-[#39705e]"
+                      }`}
+                    >
+                      {ingestionError || `Active repository: ${activeRepo}`}
+                    </p>
+                    {activeRepo && (
+                      <button
+                        type="button"
+                        onClick={deleteActiveRepository}
+                        disabled={isDeleting || ingestionStatus === "ingesting"}
+                        className="shrink-0 rounded-lg border border-[#e6c8c3] bg-[#fff8f6] px-2.5 py-1 text-[9px] font-extrabold uppercase tracking-[0.1em] text-[#a24f44] transition hover:bg-[#fbe9e5] disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isDeleting ? "Deleting..." : "Delete"}
+                      </button>
+                    )}
+                  </div>
                 )}
               </form>
               {messages.map((message) => (
@@ -883,7 +950,9 @@ function App() {
             >
               <textarea
                 aria-label="Message"
-                disabled={!activeRepo || ingestionStatus !== "ready"}
+                disabled={
+                  !activeRepo || ingestionStatus !== "ready" || isDeleting
+                }
                 className="max-h-32 min-h-12 w-full resize-none bg-transparent px-3 py-2 text-[13px] leading-5 text-[#263a33] outline-none placeholder:text-[#9ba7a2]"
                 placeholder={
                   activeRepo
@@ -919,7 +988,7 @@ function App() {
                 ) : (
                   <button
                     type="submit"
-                    disabled={!input.trim() || !activeRepo}
+                    disabled={!input.trim() || !activeRepo || isDeleting}
                     className="grid size-8 place-items-center rounded-xl bg-[#174f3d] text-white transition hover:bg-[#0f3e2f] disabled:cursor-not-allowed disabled:opacity-35"
                     aria-label="Send message"
                   >
@@ -947,7 +1016,7 @@ function App() {
             <button
               type="button"
               onClick={() => loadGraph(activeRepo)}
-              disabled={!activeRepo || graphStatus === "loading"}
+              disabled={!activeRepo || graphStatus === "loading" || isDeleting}
               className="inline-flex items-center gap-2 rounded-xl border border-[#d7ded8] bg-white px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.11em] text-[#52645d] shadow-sm transition hover:border-[#bfcac2] disabled:opacity-50"
             >
               <Icon name="refresh" className={`size-3.5 ${graphStatus === "loading" ? "animate-spin" : ""}`} />

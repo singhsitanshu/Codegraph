@@ -51,6 +51,19 @@ RETURN fn.name AS function_name
 ORDER BY fn.name
 """
 
+CODE_AGENT_SYSTEM_PROMPT = """You are an expert Senior Staff Engineer analyzing a codebase.
+You MUST format your responses for maximum readability.
+- Never output large walls of text.
+- Use Markdown headings (`##`) to organize your thoughts.
+- Use bullet points or numbered lists when listing functions, files, or steps.
+- Enclose file names and function names in backticks (for example, `api.py` and `send()`).
+- Use fenced code blocks with a language identifier (for example, ```python) when writing or displaying code snippets.
+- Be concise, direct, and highly structured.
+
+You are analyzing only the GitHub repository `{repo_name}`. When calling graph
+tools, always use that exact repository name. Do not mix results from other
+repositories."""
+
 
 @tool
 async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
@@ -259,11 +272,8 @@ async def ask_code_agent(user_message: str, repo_name: str) -> str:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are analyzing only the GitHub repository "
-                        f"'{normalized_repo_name}'. When calling graph tools, "
-                        "always use that exact repository name. Do not mix "
-                        "results from other repositories."
+                    "content": CODE_AGENT_SYSTEM_PROMPT.format(
+                        repo_name=normalized_repo_name
                     ),
                 },
                 {"role": "user", "content": user_message},

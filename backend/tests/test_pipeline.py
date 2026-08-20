@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.agent.graph import query_graph_blast_radius
 from app.db import close_neo4j_driver, neo4j_client
-from app.db.graph_ops import save_parsed_ast_to_neo4j
+from app.db.graph_ops import delete_repository_graph, save_parsed_ast_to_neo4j
 from app.main import app
 
 TEST_FILE_PATH = "TEST_MOCK_FILE.py"
@@ -136,6 +136,30 @@ def test_api_graph_endpoint(db_cleanup: None) -> None:
         or node.get("data", {}).get("label") == TEST_FILE_PATH
         for node in payload["nodes"]
     )
+
+
+def test_delete_repository_graph_removes_only_scoped_nodes(
+    db_cleanup: None,
+) -> None:
+    """Delete the live test repository graph without touching other scopes."""
+
+    _save_mock_ast()
+
+    async def delete() -> None:
+        try:
+            await delete_repository_graph(TEST_REPO_NAME)
+        finally:
+            await close_neo4j_driver()
+
+    asyncio.run(delete())
+    assert neo4j_client.driver is not None
+    with neo4j_client.driver.session() as session:
+        remaining_nodes = session.run(
+            "MATCH (node {repo_name: $repo_name}) RETURN count(node) AS count",
+            repo_name=TEST_REPO_NAME,
+        ).single(strict=True)["count"]
+
+    assert remaining_nodes == 0
 
 
 def test_api_graph_is_blank_without_repository_scope() -> None:

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent.graph import (
     CALLERS_QUERY,
+    CODE_AGENT_SYSTEM_PROMPT,
     CODEBASE_STRUCTURE_QUERY,
     EXTERNAL_DEPENDENCIES_QUERY,
     FUNCTIONS_IN_FILE_QUERY,
@@ -17,6 +18,20 @@ from app.agent.graph import (
     query_graph_blast_radius,
     query_outgoing_dependencies,
 )
+
+
+def test_code_agent_system_prompt_requires_structured_markdown() -> None:
+    rendered_prompt = CODE_AGENT_SYSTEM_PROMPT.format(
+        repo_name="owner/repository"
+    )
+
+    assert "expert Senior Staff Engineer" in rendered_prompt
+    assert "Never output large walls of text" in rendered_prompt
+    assert "Markdown headings (`##`)" in rendered_prompt
+    assert "bullet points or numbered lists" in rendered_prompt
+    assert "`api.py`" in rendered_prompt
+    assert "```python" in rendered_prompt
+    assert "owner/repository" in rendered_prompt
 
 
 def _invoke_tool(tool, arguments, records):

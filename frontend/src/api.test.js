@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  deleteRepository,
   fetchRepositoryGraph,
   ingestRepository,
   repositoryUrlFromInput,
@@ -102,6 +103,26 @@ test("an unscoped graph stays blank without making a request", async () => {
 
   assert.deepEqual(graph, { nodes: [], edges: [] });
   assert.equal(called, false);
+});
+
+test("repository deletion uses an encoded scoped DELETE request", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse({ status: "success", repo_name: "psf/requests" });
+  };
+
+  const result = await deleteRepository("psf/requests", fetchImpl);
+
+  assert.deepEqual(result, {
+    status: "success",
+    repo_name: "psf/requests",
+  });
+  assert.equal(
+    calls[0].url,
+    "http://localhost:8000/api/repositories/psf%2Frequests",
+  );
+  assert.equal(calls[0].options.method, "DELETE");
 });
 
 test("chat is blocked locally without an ingested repository", async () => {

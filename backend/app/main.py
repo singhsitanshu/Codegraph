@@ -20,7 +20,10 @@ from pydantic import BaseModel, Field, field_validator
 from app.api import webhooks
 from app.agent.graph import ask_code_agent
 from app.db import close_neo4j_driver, fetch_graph_data
-from app.db.graph_ops import save_parsed_ast_to_neo4j_with_progress
+from app.db.graph_ops import (
+    delete_repository_graph,
+    save_parsed_ast_to_neo4j_with_progress,
+)
 from app.db.neo4j_client import close_driver, initialize_database
 from app.services.github_service import (
     cleanup_downloaded_repo,
@@ -213,6 +216,42 @@ async def get_graph(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Neo4j graph query failed",
         ) from exc
+
+
+@app.delete("/api/repositories/{repo_name:path}", tags=["graph"])
+async def delete_repository(repo_name: str) -> dict[str, str]:
+    """Permanently delete one repository-scoped graph from Neo4j."""
+
+    try:
+        normalized_repo_name = _normalize_repo_identifier(repo_name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        await delete_repository_graph(normalized_repo_name)
+    except AuthError as exc:
+        logger.warning("Neo4j rejected repository deletion credentials")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Neo4j authentication failed during repository deletion",
+        ) from exc
+    except ServiceUnavailable as exc:
+        logger.warning("Neo4j is unavailable during repository deletion")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Neo4j is unavailable during repository deletion",
+        ) from exc
+    except Neo4jError as exc:
+        logger.exception("Neo4j repository deletion failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Neo4j repository deletion failed",
+        ) from exc
+
+    return {"status": "success", "repo_name": normalized_repo_name}
 
 
 @app.post("/api/chat", tags=["chat"])

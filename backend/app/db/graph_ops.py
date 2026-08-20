@@ -16,6 +16,11 @@ WHERE (node:File OR node:Function) AND node.repo_name = $repo_name
 DETACH DELETE node
 """
 
+DELETE_REPOSITORY_GRAPH_QUERY = """
+MATCH (n {repo_name: $repo_name})
+DETACH DELETE n
+"""
+
 MERGE_FILES_QUERY = """
 UNWIND $batch AS file
 MERGE (f:File {path: file.path, repo_name: $repo_name})
@@ -202,3 +207,21 @@ async def save_parsed_ast_to_neo4j(
         replace_existing=replace_existing,
     ):
         pass
+
+
+async def delete_repository_graph(repo_name: str) -> None:
+    """Delete every graph node scoped to one canonical repository name."""
+
+    normalized_repo_name = repo_name.strip()
+    if not normalized_repo_name:
+        raise ValueError("repo_name must not be blank")
+
+    async def delete(transaction: Any) -> None:
+        result = await transaction.run(
+            DELETE_REPOSITORY_GRAPH_QUERY,
+            repo_name=normalized_repo_name,
+        )
+        await result.consume()
+
+    async with get_neo4j_driver().session() as session:
+        await session.execute_write(delete)
