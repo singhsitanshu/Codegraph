@@ -29,7 +29,10 @@ from app.services.github_service import (
     cleanup_downloaded_repo,
     download_and_extract_repo,
 )
-from app.services.parser_service import parse_changed_files_with_progress
+from app.services.parser_service import (
+    SUPPORTED_EXTENSIONS,
+    parse_changed_files_with_progress,
+)
 
 
 logging.basicConfig(
@@ -38,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SOURCE_SUFFIXES = frozenset({".py", ".ts", ".tsx"})
+SUPPORTED_SOURCE_SUFFIXES = frozenset(SUPPORTED_EXTENSIONS)
 IGNORED_REPOSITORY_DIRECTORIES = frozenset(
     {
         ".git",

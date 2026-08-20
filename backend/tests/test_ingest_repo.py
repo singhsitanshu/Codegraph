@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app.main import _parse_github_repository_url, app
+from app.main import (
+    _discover_repository_source_files,
+    _parse_github_repository_url,
+    app,
+)
 from app.services.github_service import (
     cleanup_downloaded_repo,
     download_and_extract_repo,
@@ -22,6 +26,25 @@ def test_parse_github_repository_url() -> None:
     assert _parse_github_repository_url(
         "https://github.com/psf/requests.git/"
     ) == ("psf", "requests")
+
+
+def test_repository_discovery_includes_every_supported_language(
+    tmp_path: Path,
+) -> None:
+    supported_names = {
+        "module.py",
+        "client.js",
+        "component.jsx",
+        "types.ts",
+        "view.tsx",
+        "server.go",
+    }
+    for file_name in [*supported_names, "README.md"]:
+        (tmp_path / file_name).write_text("", encoding="utf-8")
+
+    discovered = _discover_repository_source_files(str(tmp_path))
+
+    assert {Path(file_path).name for file_path in discovered} == supported_names
 
 
 def test_ingest_repository_uses_relative_paths_and_always_cleans_up(

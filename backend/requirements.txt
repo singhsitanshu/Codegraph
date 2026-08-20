@@ -9,5 +9,7 @@ langgraph
 neo4j
 pytest
 tree-sitter
+tree-sitter-go
+tree-sitter-javascript
 tree-sitter-python
 tree-sitter-typescript

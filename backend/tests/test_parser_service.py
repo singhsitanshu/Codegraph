@@ -7,10 +7,102 @@ from unittest.mock import patch
 import pytest
 
 from app.services.parser_service import (
+    SUPPORTED_EXTENSIONS,
     CodeParser,
     parse_changed_files,
     parse_changed_files_with_progress,
 )
+
+
+def test_supported_extension_mapping_covers_all_requested_languages() -> None:
+    assert SUPPORTED_EXTENSIONS == {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".go": "go",
+    }
+
+
+@pytest.mark.parametrize(
+    ("file_path", "source", "functions", "calls", "classes"),
+    [
+        (
+            "module.py",
+            b"class Client:\n"
+            b"    def send(self):\n"
+            b"        api.call()\n"
+            b"def top():\n"
+            b"    send()\n",
+            ["send", "top"],
+            ["call", "send"],
+            ["Client"],
+        ),
+        (
+            "module.js",
+            b"class Client { send() { api.call() } }\n"
+            b"const build = () => send();\n"
+            b"function top() { build(); }\n",
+            ["send", "build", "top"],
+            ["call", "send", "build"],
+            ["Client"],
+        ),
+        (
+            "component.jsx",
+            b"const Button = () => <button />;\n"
+            b"function render() { mount(Button()); }\n",
+            ["Button", "render"],
+            ["mount", "Button"],
+            [],
+        ),
+        (
+            "module.ts",
+            b"abstract class Client { send(): void { api.call(); } }\n"
+            b"const build = (): void => send();\n"
+            b"function top(): void { build(); }\n",
+            ["send", "build", "top"],
+            ["call", "send", "build"],
+            ["Client"],
+        ),
+        (
+            "component.tsx",
+            b"const Panel = (): JSX.Element => <div />;\n"
+            b"function render(): void { mount(Panel()); }\n",
+            ["Panel", "render"],
+            ["mount", "Panel"],
+            [],
+        ),
+        (
+            "module.go",
+            b"package demo\n"
+            b"type Client struct{}\n"
+            b"func Top() { helper(); api.Call() }\n"
+            b"func (c *Client) Send() { Top() }\n",
+            ["Top", "Send"],
+            ["helper", "Call", "Top"],
+            ["Client"],
+        ),
+    ],
+)
+def test_code_parser_normalizes_supported_languages(
+    file_path: str,
+    source: bytes,
+    functions: list[str],
+    calls: list[str],
+    classes: list[str],
+) -> None:
+    async def parse():
+        return await CodeParser().parse_file(file_path, source)
+
+    result = asyncio.run(parse())
+
+    assert result == {
+        "file_path": file_path,
+        "defined_classes": classes,
+        "defined_functions": functions,
+        "outgoing_calls": calls,
+    }
 
 
 @pytest.mark.parametrize(

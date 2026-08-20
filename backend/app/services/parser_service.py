@@ -4,6 +4,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import tree_sitter_go
+import tree_sitter_javascript
 import tree_sitter_python
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
@@ -11,6 +13,14 @@ from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
 logger = logging.getLogger(__name__)
 MAX_CONCURRENT_FILE_READS = 32
+SUPPORTED_EXTENSIONS = {
+    ".py": "python",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".go": "go",
+}
 
 
 PYTHON_FUNCTION_DEFINITIONS_QUERY = """
@@ -29,6 +39,35 @@ PYTHON_FUNCTION_CALLS_QUERY = """
 
 PYTHON_CLASS_DEFINITIONS_QUERY = """
 (class_definition
+  name: (identifier) @name)
+"""
+
+JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY = """
+(function_declaration
+  name: (identifier) @name)
+
+(generator_function_declaration
+  name: (identifier) @name)
+
+(method_definition
+  name: (property_identifier) @name)
+
+(variable_declarator
+  name: (identifier) @name
+  value: [(arrow_function) (function_expression)])
+"""
+
+JAVASCRIPT_FUNCTION_CALLS_QUERY = """
+(call_expression
+  function: (identifier) @call)
+
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @call))
+"""
+
+JAVASCRIPT_CLASS_DEFINITIONS_QUERY = """
+(class_declaration
   name: (identifier) @name)
 """
 
@@ -64,6 +103,29 @@ TYPESCRIPT_CLASS_DEFINITIONS_QUERY = """
   name: (type_identifier) @name)
 """
 
+GO_FUNCTION_DEFINITIONS_QUERY = """
+(function_declaration
+  name: (identifier) @name)
+
+(method_declaration
+  name: (field_identifier) @name)
+"""
+
+GO_FUNCTION_CALLS_QUERY = """
+(call_expression
+  function: (identifier) @call)
+
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @call))
+"""
+
+GO_CLASS_DEFINITIONS_QUERY = """
+(type_spec
+  name: (type_identifier) @name
+  type: [(struct_type) (interface_type)])
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class _LanguageQueries:
@@ -85,7 +147,7 @@ class ParsedFileProgress:
 
 
 class CodeParser:
-    """Parse Python, TypeScript, and TSX source into graph-ready relationships.
+    """Normalize Python, JavaScript, TypeScript, TSX, and Go source graphs.
 
     Grammar packages are loaded from their precompiled Python wheels. No grammar
     compilation, C toolchain, or legacy ``Language.build_library`` call is used.
@@ -93,43 +155,69 @@ class CodeParser:
     single parser from being used concurrently by multiple background threads.
     """
 
-    _SUPPORTED_EXTENSIONS = frozenset({".py", ".ts", ".tsx"})
+    _SUPPORTED_EXTENSIONS = frozenset(SUPPORTED_EXTENSIONS)
     PYTHON_FUNCTION_DEFINITIONS_QUERY = PYTHON_FUNCTION_DEFINITIONS_QUERY
     PYTHON_FUNCTION_CALLS_QUERY = PYTHON_FUNCTION_CALLS_QUERY
     PYTHON_CLASS_DEFINITIONS_QUERY = PYTHON_CLASS_DEFINITIONS_QUERY
+    JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY = (
+        JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY
+    )
+    JAVASCRIPT_FUNCTION_CALLS_QUERY = JAVASCRIPT_FUNCTION_CALLS_QUERY
+    JAVASCRIPT_CLASS_DEFINITIONS_QUERY = JAVASCRIPT_CLASS_DEFINITIONS_QUERY
     TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY = TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY
     TYPESCRIPT_FUNCTION_CALLS_QUERY = TYPESCRIPT_FUNCTION_CALLS_QUERY
     TYPESCRIPT_CLASS_DEFINITIONS_QUERY = TYPESCRIPT_CLASS_DEFINITIONS_QUERY
+    GO_FUNCTION_DEFINITIONS_QUERY = GO_FUNCTION_DEFINITIONS_QUERY
+    GO_FUNCTION_CALLS_QUERY = GO_FUNCTION_CALLS_QUERY
+    GO_CLASS_DEFINITIONS_QUERY = GO_CLASS_DEFINITIONS_QUERY
 
     def __init__(self) -> None:
         """Initialize parsers and compile extraction queries for all grammars."""
 
         python_language = Language(tree_sitter_python.language())
+        javascript_language = Language(tree_sitter_javascript.language())
         typescript_language = Language(
             tree_sitter_typescript.language_typescript()
         )
         tsx_language = Language(tree_sitter_typescript.language_tsx())
+        go_language = Language(tree_sitter_go.language())
 
         self._languages: dict[str, Language] = {
             ".py": python_language,
+            ".js": javascript_language,
+            ".jsx": javascript_language,
             ".ts": typescript_language,
             ".tsx": tsx_language,
+            ".go": go_language,
         }
         self.python_parser = Parser(python_language)
+        self.javascript_parser = Parser(javascript_language)
         self.typescript_parser = Parser(typescript_language)
         self.tsx_parser = Parser(tsx_language)
+        self.go_parser = Parser(go_language)
         self._parsers: dict[str, Parser] = {
             ".py": self.python_parser,
+            ".js": self.javascript_parser,
+            ".jsx": self.javascript_parser,
             ".ts": self.typescript_parser,
             ".tsx": self.tsx_parser,
+            ".go": self.go_parser,
+        }
+        language_locks = {
+            language_name: asyncio.Lock()
+            for language_name in set(SUPPORTED_EXTENSIONS.values())
         }
         self._parse_locks: dict[str, asyncio.Lock] = {
-            extension: asyncio.Lock() for extension in self._SUPPORTED_EXTENSIONS
+            extension: language_locks[language_name]
+            for extension, language_name in SUPPORTED_EXTENSIONS.items()
         }
         self._queries: dict[str, _LanguageQueries] = {
             ".py": self._compile_python_queries(python_language),
+            ".js": self._compile_javascript_queries(javascript_language),
+            ".jsx": self._compile_javascript_queries(javascript_language),
             ".ts": self._compile_typescript_queries(typescript_language),
             ".tsx": self._compile_typescript_queries(tsx_language),
+            ".go": self._compile_go_queries(go_language),
         }
 
     @staticmethod
@@ -158,6 +246,32 @@ class CodeParser:
             ),
         )
 
+    @staticmethod
+    def _compile_javascript_queries(language: Language) -> _LanguageQueries:
+        """Compile JavaScript queries shared by ``.js`` and ``.jsx``."""
+
+        return _LanguageQueries(
+            function_definitions=Query(
+                language, JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY
+            ),
+            function_calls=Query(language, JAVASCRIPT_FUNCTION_CALLS_QUERY),
+            class_definitions=Query(
+                language, JAVASCRIPT_CLASS_DEFINITIONS_QUERY
+            ),
+        )
+
+    @staticmethod
+    def _compile_go_queries(language: Language) -> _LanguageQueries:
+        """Compile Go function, method, call, and type queries."""
+
+        return _LanguageQueries(
+            function_definitions=Query(
+                language, GO_FUNCTION_DEFINITIONS_QUERY
+            ),
+            function_calls=Query(language, GO_FUNCTION_CALLS_QUERY),
+            class_definitions=Query(language, GO_CLASS_DEFINITIONS_QUERY),
+        )
+
     @classmethod
     def _normalize_extension(cls, file_extension: str) -> str:
         """Normalize and validate a source file extension."""
@@ -174,7 +288,7 @@ class CodeParser:
         return normalized
 
     def get_parser(self, file_extension: str) -> Parser:
-        """Return the initialized parser for ``.py``, ``.ts``, or ``.tsx``.
+        """Return the initialized parser for any supported source extension.
 
         Args:
             file_extension: File suffix, with or without a leading period.
@@ -258,7 +372,7 @@ class CodeParser:
         Args:
             file_path: Logical or filesystem path used to select the grammar and
                 identify the resulting file record.
-            source_code: UTF-8 encoded Python, TypeScript, or TSX source bytes.
+            source_code: UTF-8 encoded source bytes in a supported language.
 
         Returns:
             A dictionary containing ``file_path``, ``defined_classes``,
