@@ -7,6 +7,7 @@ httpx
 langchain-anthropic
 langgraph
 neo4j
+openai
 pytest
 tree-sitter
 tree-sitter-go

@@ -25,6 +25,12 @@ MOCK_DATA: list[dict[str, object]] = [
         "outgoing_calls": ["mock_func_B", "external_api_call"],
     }
 ]
+
+
+async def _fake_embeddings(texts: list[str]) -> list[list[float]]:
+    return [[0.1, 0.2, 0.3] for _ in texts]
+
+
 TEST_NODE_CLEANUP_QUERY = (
     "MATCH (n) WHERE n.repo_name IN "
     "['test/mock-repository', 'test/other-repository'] AND ("
@@ -74,7 +80,11 @@ def _save_mock_ast() -> None:
         finally:
             await close_neo4j_driver()
 
-    asyncio.run(save())
+    with patch(
+        "app.db.graph_ops.generate_embeddings",
+        side_effect=_fake_embeddings,
+    ):
+        asyncio.run(save())
 
 
 def test_neo4j_ast_write(db_cleanup: None) -> None:
@@ -270,7 +280,11 @@ def test_blast_radius_does_not_cross_repository_boundaries(
         finally:
             await close_neo4j_driver()
 
-    payload_a, payload_b = asyncio.run(save_and_query())
+    with patch(
+        "app.db.graph_ops.generate_embeddings",
+        side_effect=_fake_embeddings,
+    ):
+        payload_a, payload_b = asyncio.run(save_and_query())
     caller_names_a = {
         caller["caller"]
         for caller in payload_a["callers"]

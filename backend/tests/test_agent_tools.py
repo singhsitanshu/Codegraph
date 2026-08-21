@@ -11,12 +11,14 @@ from app.agent.graph import (
     EXTERNAL_DEPENDENCIES_QUERY,
     FUNCTIONS_IN_FILE_QUERY,
     OUTGOING_DEPENDENCIES_QUERY,
+    SEMANTIC_CODE_SEARCH_QUERY,
     _get_code_agent,
     list_external_dependencies,
     list_codebase_structure,
     list_functions_in_file,
     query_graph_blast_radius,
     query_outgoing_dependencies,
+    semantic_code_search,
 )
 
 
@@ -172,6 +174,54 @@ def test_list_external_dependencies_formats_repository_boundary() -> None:
     )
 
 
+def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
+    embedding = [0.1, 0.2, 0.3]
+    result = MagicMock()
+    result.data = AsyncMock(
+        return_value=[
+            {
+                "function_name": "process_payment",
+                "file_path": "src/payments.py",
+                "score": 0.91234,
+            }
+        ]
+    )
+    session = MagicMock()
+    session.run = AsyncMock(return_value=result)
+    session_context = MagicMock()
+    session_context.__aenter__ = AsyncMock(return_value=session)
+    session_context.__aexit__ = AsyncMock(return_value=None)
+    driver = MagicMock()
+    driver.session.return_value = session_context
+    embed_query = AsyncMock(return_value=embedding)
+
+    with (
+        patch("app.agent.graph.get_neo4j_driver", return_value=driver),
+        patch("app.agent.graph.generate_embedding", new=embed_query),
+    ):
+        output = asyncio.run(
+            semantic_code_search.ainvoke(
+                {
+                    "query": "take a customer payment",
+                    "repo_name": " owner/repository ",
+                    "top_k": 5,
+                }
+            )
+        )
+
+    assert output == (
+        'Semantic code matches for "take a customer payment":\n'
+        "- process_payment (src/payments.py) — similarity 0.9123"
+    )
+    embed_query.assert_awaited_once_with("take a customer payment")
+    session.run.assert_awaited_once_with(
+        SEMANTIC_CODE_SEARCH_QUERY,
+        query_vector=embedding,
+        repo_name="owner/repository",
+        top_k=5,
+    )
+
+
 def test_code_agent_registers_all_repository_tools() -> None:
     _get_code_agent.cache_clear()
     compiled_agent = object()
@@ -192,5 +242,6 @@ def test_code_agent_registers_all_repository_tools() -> None:
         "list_functions_in_file",
         "query_outgoing_dependencies",
         "list_external_dependencies",
+        "semantic_code_search",
     ]
     _get_code_agent.cache_clear()

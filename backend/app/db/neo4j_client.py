@@ -24,6 +24,12 @@ DATABASE_INDEX_QUERIES = (
     "FOR (fn:Function) ON (fn.repo_name, fn.name)",
     "CREATE INDEX ext_func_repo_name IF NOT EXISTS "
     "FOR (ext:ExternalFunction) ON (ext.repo_name, ext.name)",
+    "CREATE VECTOR INDEX `function_embeddings` IF NOT EXISTS "
+    "FOR (fn:Function) ON (fn.embedding) "
+    "OPTIONS {indexConfig: {"
+    "`vector.dimensions`: 1536, "
+    "`vector.similarity_function`: 'cosine'"
+    "}}",
 )
 AWAIT_INDEXES_QUERY = "CALL db.awaitIndexes(300)"
 _database_initialized = False

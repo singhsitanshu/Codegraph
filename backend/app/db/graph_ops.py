@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from app.db import get_neo4j_driver
+from app.services.embedding_service import generate_embeddings
 
 
 DEFAULT_BATCH_SIZE = 100
@@ -39,6 +40,8 @@ MATCH (f:File {path: func.file_path, repo_name: $repo_name})
 MERGE (fn:Function {name: func.name, repo_name: $repo_name})
 REMOVE fn:ExternalFunction
 SET fn.file = coalesce(fn.file, func.file_path),
+    fn.file_path = func.file_path,
+    fn.embedding = func.embedding,
     fn.external = false,
     fn.is_external = false
 MERGE (f)-[:DEFINES]->(fn)
@@ -149,6 +152,15 @@ def _extract_etl_records(
     return files, functions, calls
 
 
+def _function_embedding_text(function: dict[str, str]) -> str:
+    """Build stable semantic context from currently available AST fields."""
+
+    return (
+        f"Function: {function['name']}\n"
+        f"File: {function['file_path']}"
+    )
+
+
 async def save_parsed_ast_to_neo4j_with_progress(
     parsed_data_list: list[dict[str, Any]],
     repo_name: str,
@@ -168,7 +180,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
     async with get_neo4j_driver().session() as session:
         async def run_transaction(
             query: str,
-            batch: list[dict[str, str]] | None = None,
+            batch: list[dict[str, Any]] | None = None,
         ) -> None:
             async def execute(transaction: Any) -> None:
                 parameters: dict[str, Any] = {
@@ -188,9 +200,19 @@ async def save_parsed_ast_to_neo4j_with_progress(
         for batch in chunk_data(files, batch_size):
             await run_transaction(MERGE_FILES_QUERY, batch)
 
-        yield DatabaseWriteProgress("Pass 2: Creating Functions...", 90)
+        yield DatabaseWriteProgress(
+            "Pass 2: Embedding and Creating Functions...",
+            90,
+        )
         for batch in chunk_data(functions, batch_size):
-            await run_transaction(MERGE_FUNCTIONS_QUERY, batch)
+            embeddings = await generate_embeddings(
+                [_function_embedding_text(function) for function in batch]
+            )
+            embedded_batch = [
+                {**function, "embedding": embedding}
+                for function, embedding in zip(batch, embeddings, strict=True)
+            ]
+            await run_transaction(MERGE_FUNCTIONS_QUERY, embedded_batch)
 
         yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
         for batch in chunk_data(calls, batch_size):

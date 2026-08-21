@@ -33,6 +33,10 @@ def _mock_driver():
     return driver, session, transaction
 
 
+async def _fake_embeddings(texts: list[str]) -> list[list[float]]:
+    return [[0.1, 0.2, 0.3] for _ in texts]
+
+
 def test_graph_read_starts_from_repository_scoped_files() -> None:
     assert "MATCH (file:File {repo_name: $repo_name})" in GRAPH_QUERY
     assert "Function {repo_name: $repo_name}" in GRAPH_QUERY
@@ -57,7 +61,13 @@ def test_three_pass_write_receives_repository_scope() -> None:
         }
     ]
 
-    with patch("app.db.graph_ops.get_neo4j_driver", return_value=driver):
+    with (
+        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
+        patch(
+            "app.db.graph_ops.generate_embeddings",
+            side_effect=_fake_embeddings,
+        ) as embed_batch,
+    ):
         asyncio.run(
             save_parsed_ast_to_neo4j(
                 parsed_data,
@@ -82,7 +92,11 @@ def test_three_pass_write_receives_repository_scope() -> None:
         {"path": "src/example.py"}
     ]
     assert transaction.run.await_args_list[2].kwargs["batch"] == [
-        {"name": "example", "file_path": "src/example.py"}
+        {
+            "name": "example",
+            "file_path": "src/example.py",
+            "embedding": [0.1, 0.2, 0.3],
+        }
     ]
     assert transaction.run.await_args_list[3].kwargs["batch"] == [
         {
@@ -94,6 +108,9 @@ def test_three_pass_write_receives_repository_scope() -> None:
     for call in transaction.run.await_args_list:
         assert call.kwargs["repo_name"] == "owner/repository-a"
         assert "$repo_name" in call.args[0]
+    embed_batch.assert_awaited_once_with(
+        ["Function: example\nFile: src/example.py"]
+    )
 
 
 def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
@@ -107,7 +124,13 @@ def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
         for index in range(205)
     ]
 
-    with patch("app.db.graph_ops.get_neo4j_driver", return_value=driver):
+    with (
+        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
+        patch(
+            "app.db.graph_ops.generate_embeddings",
+            side_effect=_fake_embeddings,
+        ) as embed_batch,
+    ):
         asyncio.run(
             save_parsed_ast_to_neo4j(
                 parsed_data,
@@ -131,6 +154,9 @@ def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
         5,
     ]
     assert all(len(call.kwargs["batch"]) <= 100 for call in batch_calls)
+    assert [
+        len(call.args[0]) for call in embed_batch.await_args_list
+    ] == [100, 100, 5]
 
 
 def test_external_postprocessing_remains_repository_scoped() -> None:

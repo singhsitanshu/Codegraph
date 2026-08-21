@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     NEO4J_USER: str = "neo4j"
     NEO4J_PASSWORD: str = "password"
     ANTHROPIC_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
 
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env",

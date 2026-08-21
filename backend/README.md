@@ -24,6 +24,10 @@ curl -X POST http://localhost:8000/api/ingest-repo \
 The downloader reads the repository's current `default_branch` from GitHub,
 so the endpoint works with `main`, `master`, or another configured branch.
 Set `GITHUB_TOKEN` in `.env` for private repositories and higher API limits.
+Set `OPENAI_API_KEY` as well; ingestion batches function metadata through
+`text-embedding-3-small` and stores the resulting vectors for semantic search.
+Repositories ingested before this feature must be re-ingested to populate their
+function embeddings.
 
 ## Legacy unscoped Neo4j data
 

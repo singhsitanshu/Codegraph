@@ -10,6 +10,7 @@ from langgraph.prebuilt import create_react_agent
 
 from app.config import settings
 from app.db import get_neo4j_driver
+from app.services.embedding_service import generate_embedding
 
 
 CALLERS_QUERY = """
@@ -49,6 +50,20 @@ EXTERNAL_DEPENDENCIES_QUERY = """
 MATCH (fn:ExternalFunction {repo_name: $repo_name})
 RETURN fn.name AS function_name
 ORDER BY fn.name
+"""
+
+SEMANTIC_CODE_SEARCH_QUERY = """
+CALL db.index.vector.queryNodes(
+    'function_embeddings',
+    $top_k,
+    $query_vector
+)
+YIELD node, score
+WHERE node.repo_name = $repo_name
+RETURN node.name AS function_name,
+       node.file_path AS file_path,
+       score
+ORDER BY score DESC
 """
 
 CODE_AGENT_SYSTEM_PROMPT = """You are an expert Senior Staff Engineer analyzing a codebase.
@@ -228,6 +243,57 @@ async def list_external_dependencies(repo_name: str) -> str:
     )
 
 
+@tool
+async def semantic_code_search(
+    query: str,
+    repo_name: str,
+    top_k: int = 5,
+) -> str:
+    """Find functions related to a natural-language query in one repository."""
+
+    normalized_query = query.strip()
+    normalized_repo_name = repo_name.strip()
+    if not normalized_query or not normalized_repo_name:
+        return "No semantic code matches found."
+
+    normalized_top_k = max(1, min(top_k, 20))
+    query_vector = await generate_embedding(normalized_query)
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(
+            SEMANTIC_CODE_SEARCH_QUERY,
+            query_vector=query_vector,
+            repo_name=normalized_repo_name,
+            top_k=normalized_top_k,
+        )
+        records = await result.data()
+
+    matches: list[str] = []
+    for record in records:
+        function_name = record.get("function_name")
+        if not isinstance(function_name, str):
+            continue
+        file_path = record.get("file_path")
+        location = file_path if isinstance(file_path, str) else "unknown file"
+        score = record.get("score")
+        score_text = (
+            f"{float(score):.4f}"
+            if isinstance(score, (int, float))
+            else "unknown"
+        )
+        matches.append(
+            f"- {function_name} ({location}) — similarity {score_text}"
+        )
+
+    if not matches:
+        return f'No semantic code matches found for "{normalized_query}".'
+    return "\n".join(
+        [
+            f'Semantic code matches for "{normalized_query}":',
+            *matches,
+        ]
+    )
+
+
 @lru_cache(maxsize=1)
 def _get_code_agent() -> Any:
     """Create and cache the Sonnet 5 ReAct graph on first chat request."""
@@ -242,6 +308,7 @@ def _get_code_agent() -> Any:
         list_functions_in_file,
         query_outgoing_dependencies,
         list_external_dependencies,
+        semantic_code_search,
     ]
     return create_react_agent(llm, tools=tools)
 
