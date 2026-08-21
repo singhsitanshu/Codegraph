@@ -21,6 +21,12 @@ MATCH (n {repo_name: $repo_name})
 DETACH DELETE n
 """
 
+DELETE_ALL_REPOSITORY_GRAPHS_QUERY = """
+MATCH (n)
+WHERE n.repo_name IS NOT NULL
+DETACH DELETE n
+"""
+
 MERGE_FILES_QUERY = """
 UNWIND $batch AS file
 MERGE (f:File {path: file.path, repo_name: $repo_name})
@@ -221,6 +227,17 @@ async def delete_repository_graph(repo_name: str) -> None:
             DELETE_REPOSITORY_GRAPH_QUERY,
             repo_name=normalized_repo_name,
         )
+        await result.consume()
+
+    async with get_neo4j_driver().session() as session:
+        await session.execute_write(delete)
+
+
+async def delete_all_repository_graphs() -> None:
+    """Delete repository-scoped nodes left behind by prior app sessions."""
+
+    async def delete(transaction: Any) -> None:
+        result = await transaction.run(DELETE_ALL_REPOSITORY_GRAPHS_QUERY)
         await result.consume()
 
     async with get_neo4j_driver().session() as session:

@@ -21,6 +21,7 @@ from app.api import webhooks
 from app.agent.graph import ask_code_agent
 from app.db import close_neo4j_driver, fetch_graph_data
 from app.db.graph_ops import (
+    delete_all_repository_graphs,
     delete_repository_graph,
     save_parsed_ast_to_neo4j_with_progress,
 )
@@ -57,12 +58,15 @@ GITHUB_REPOSITORY_PART = re.compile(r"[A-Za-z0-9_.-]+")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Initialize Neo4j schema and release drivers on shutdown."""
+    """Initialize Neo4j, clear stale session graphs, and release drivers."""
 
     await asyncio.to_thread(initialize_database)
-    yield
-    close_driver()
-    await close_neo4j_driver()
+    try:
+        await delete_all_repository_graphs()
+        yield
+    finally:
+        close_driver()
+        await close_neo4j_driver()
 
 
 class ChatRequest(BaseModel):
@@ -103,6 +107,19 @@ class IngestRepositoryRequest(BaseModel):
         if not stripped:
             raise ValueError("url must not be blank")
         return stripped
+
+
+class RepositoryCleanupRequest(BaseModel):
+    """Repository graph to remove during browser lifecycle cleanup."""
+
+    repo_name: str = Field(min_length=3, max_length=201)
+
+    @field_validator("repo_name")
+    @classmethod
+    def repo_name_must_be_canonical(cls, value: str) -> str:
+        """Normalize the cleanup scope before it reaches Neo4j."""
+
+        return _normalize_repo_identifier(value)
 
 
 def _normalize_repo_identifier(repo_name: str) -> str:
@@ -221,17 +238,8 @@ async def get_graph(
         ) from exc
 
 
-@app.delete("/api/repositories/{repo_name:path}", tags=["graph"])
-async def delete_repository(repo_name: str) -> dict[str, str]:
-    """Permanently delete one repository-scoped graph from Neo4j."""
-
-    try:
-        normalized_repo_name = _normalize_repo_identifier(repo_name)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
+async def _delete_repository_scope(normalized_repo_name: str) -> dict[str, str]:
+    """Delete one validated scope and map Neo4j failures to API errors."""
 
     try:
         await delete_repository_graph(normalized_repo_name)
@@ -255,6 +263,27 @@ async def delete_repository(repo_name: str) -> dict[str, str]:
         ) from exc
 
     return {"status": "success", "repo_name": normalized_repo_name}
+
+
+@app.delete("/api/repo", tags=["graph"])
+async def cleanup_repository(request: RepositoryCleanupRequest) -> dict[str, str]:
+    """Delete the active graph from a browser unload keepalive request."""
+
+    return await _delete_repository_scope(request.repo_name)
+
+
+@app.delete("/api/repositories/{repo_name:path}", tags=["graph"])
+async def delete_repository(repo_name: str) -> dict[str, str]:
+    """Permanently delete one repository-scoped graph from Neo4j."""
+
+    try:
+        normalized_repo_name = _normalize_repo_identifier(repo_name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    return await _delete_repository_scope(normalized_repo_name)
 
 
 @app.post("/api/chat", tags=["chat"])

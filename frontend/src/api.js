@@ -126,6 +126,18 @@ export async function deleteRepository(repoName, fetchImpl = fetch) {
   return response.json();
 }
 
+export function cleanupRepositoryOnUnload(repoName, fetchImpl = fetch) {
+  const normalizedRepoName = repoName?.trim();
+  if (!normalizedRepoName) return null;
+
+  return fetchImpl("/api/repo", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repo_name: normalizedRepoName }),
+    keepalive: true,
+  });
+}
+
 export async function requestChat(
   message,
   repoName,

@@ -121,11 +121,12 @@ def test_neo4j_ast_write(db_cleanup: None) -> None:
 def test_api_graph_endpoint(db_cleanup: None) -> None:
     """Expose persisted mock AST data in the React Flow graph response."""
     _save_mock_ast()
-    with TestClient(app) as client:
-        response = client.get(
-            "/api/graph",
-            params={"repo_name": TEST_REPO_NAME},
-        )
+    with patch("app.main.delete_all_repository_graphs", new=AsyncMock()):
+        with TestClient(app) as client:
+            response = client.get(
+                "/api/graph",
+                params={"repo_name": TEST_REPO_NAME},
+            )
 
     assert response.status_code == 200
     payload = response.json()

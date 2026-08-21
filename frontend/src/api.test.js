@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  cleanupRepositoryOnUnload,
   deleteRepository,
   fetchRepositoryGraph,
   ingestRepository,
@@ -123,6 +124,24 @@ test("repository deletion uses an encoded scoped DELETE request", async () => {
     "http://localhost:8000/api/repositories/psf%2Frequests",
   );
   assert.equal(calls[0].options.method, "DELETE");
+});
+
+test("browser unload cleanup uses a same-origin keepalive request", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse({ status: "success" });
+  };
+
+  await cleanupRepositoryOnUnload(" psf/requests ", fetchImpl);
+
+  assert.equal(calls[0].url, "/api/repo");
+  assert.deepEqual(calls[0].options, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repo_name: "psf/requests" }),
+    keepalive: true,
+  });
 });
 
 test("chat is blocked locally without an ingested repository", async () => {

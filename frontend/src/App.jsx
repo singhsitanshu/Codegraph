@@ -22,6 +22,7 @@ import {
 } from "@xyflow/react";
 
 import {
+  cleanupRepositoryOnUnload,
   deleteRepository,
   fetchRepositoryGraph,
   ingestRepository,
@@ -634,6 +635,19 @@ function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    const handleUnload = () => {
+      try {
+        cleanupRepositoryOnUnload(activeRepo)?.catch(() => {});
+      } catch {
+        // Navigation must not be blocked if the best-effort cleanup cannot start.
+      }
+    };
+
+    window.addEventListener("beforeunload", handleUnload);
+    return () => window.removeEventListener("beforeunload", handleUnload);
+  }, [activeRepo]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
