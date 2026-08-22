@@ -5,6 +5,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent.graph import (
+    ARCHITECTURAL_SUBSYSTEMS_QUERY,
     CALLERS_QUERY,
     CODE_AGENT_SYSTEM_PROMPT,
     CODEBASE_STRUCTURE_QUERY,
@@ -13,6 +14,7 @@ from app.agent.graph import (
     OUTGOING_DEPENDENCIES_QUERY,
     SEMANTIC_CODE_SEARCH_QUERY,
     _get_code_agent,
+    analyze_architectural_subsystems,
     list_external_dependencies,
     list_codebase_structure,
     list_functions_in_file,
@@ -34,6 +36,9 @@ def test_code_agent_system_prompt_requires_structured_markdown() -> None:
     assert "`api.py`" in rendered_prompt
     assert "```python" in rendered_prompt
     assert "owner/repository" in rendered_prompt
+    assert "analyze_architectural_subsystems" in rendered_prompt
+    assert "mathematical clusters" in rendered_prompt
+    assert "sample_functions" in rendered_prompt
 
 
 def _invoke_tool(tool, arguments, records):
@@ -222,6 +227,27 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
     )
 
 
+def test_analyze_architectural_subsystems_returns_scoped_communities() -> None:
+    records = [
+        {
+            "community": 4,
+            "size": 12,
+            "sample_functions": ["connect", "execute", "commit"],
+        }
+    ]
+    output, run_query = _invoke_tool(
+        analyze_architectural_subsystems,
+        {"repo_name": " owner/repository "},
+        records,
+    )
+
+    assert json.loads(output) == records
+    run_query.assert_awaited_once_with(
+        ARCHITECTURAL_SUBSYSTEMS_QUERY,
+        repo_name="owner/repository",
+    )
+
+
 def test_code_agent_registers_all_repository_tools() -> None:
     _get_code_agent.cache_clear()
     compiled_agent = object()
@@ -243,5 +269,6 @@ def test_code_agent_registers_all_repository_tools() -> None:
         "query_outgoing_dependencies",
         "list_external_dependencies",
         "semantic_code_search",
+        "analyze_architectural_subsystems",
     ]
     _get_code_agent.cache_clear()

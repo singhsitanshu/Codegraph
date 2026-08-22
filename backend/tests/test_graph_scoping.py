@@ -67,6 +67,10 @@ def test_three_pass_write_receives_repository_scope() -> None:
             "app.db.graph_ops.generate_embeddings",
             side_effect=_fake_embeddings,
         ) as embed_batch,
+        patch(
+            "app.db.graph_ops.run_leiden_clustering",
+            new=AsyncMock(),
+        ) as cluster_graph,
     ):
         asyncio.run(
             save_parsed_ast_to_neo4j(
@@ -111,6 +115,7 @@ def test_three_pass_write_receives_repository_scope() -> None:
     embed_batch.assert_awaited_once_with(
         ["Function: example\nFile: src/example.py"]
     )
+    cluster_graph.assert_awaited_once_with("owner/repository-a")
 
 
 def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
@@ -130,6 +135,10 @@ def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
             "app.db.graph_ops.generate_embeddings",
             side_effect=_fake_embeddings,
         ) as embed_batch,
+        patch(
+            "app.db.graph_ops.run_leiden_clustering",
+            new=AsyncMock(),
+        ) as cluster_graph,
     ):
         asyncio.run(
             save_parsed_ast_to_neo4j(
@@ -157,6 +166,7 @@ def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
     assert [
         len(call.args[0]) for call in embed_batch.await_args_list
     ] == [100, 100, 5]
+    cluster_graph.assert_awaited_once_with("owner/large-repository")
 
 
 def test_external_postprocessing_remains_repository_scoped() -> None:

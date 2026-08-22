@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from app.db import get_neo4j_driver
+from app.db.gds_ops import run_leiden_clustering
 from app.services.embedding_service import generate_embeddings
 
 
@@ -219,7 +220,13 @@ async def save_parsed_ast_to_neo4j_with_progress(
             await run_transaction(MERGE_CALLS_QUERY, batch)
 
         await run_transaction(TAG_EXTERNAL_FUNCTIONS_QUERY)
-        yield DatabaseWriteProgress("Completing transaction...", 98)
+
+    yield DatabaseWriteProgress(
+        "Detecting architectural communities...",
+        97,
+    )
+    await run_leiden_clustering(normalized_repo_name)
+    yield DatabaseWriteProgress("Completing transaction...", 98)
 
 
 async def save_parsed_ast_to_neo4j(

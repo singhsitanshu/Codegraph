@@ -70,15 +70,22 @@ def _serialize_node(node: Node) -> dict[str, Any]:
         or properties.get("path")
         or (labels[0] if labels else node_id)
     )
+    community = properties.get("leiden_community")
+    file_path = properties.get("file_path") or properties.get("path")
     data = {
         **properties,
         "id": node_id,
         "label": str(label),
         "labels": labels,
+        "community": community,
+        "file_path": file_path,
     }
     return {
         "id": node_id,
+        "label": str(label),
         "labels": labels,
+        "community": community,
+        "file_path": file_path,
         "data": data,
     }
 

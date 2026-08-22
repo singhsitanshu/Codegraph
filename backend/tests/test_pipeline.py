@@ -83,6 +83,9 @@ def _save_mock_ast() -> None:
     with patch(
         "app.db.graph_ops.generate_embeddings",
         side_effect=_fake_embeddings,
+    ), patch(
+        "app.db.graph_ops.run_leiden_clustering",
+        new=AsyncMock(),
     ):
         asyncio.run(save())
 
@@ -283,6 +286,9 @@ def test_blast_radius_does_not_cross_repository_boundaries(
     with patch(
         "app.db.graph_ops.generate_embeddings",
         side_effect=_fake_embeddings,
+    ), patch(
+        "app.db.graph_ops.run_leiden_clustering",
+        new=AsyncMock(),
     ):
         payload_a, payload_b = asyncio.run(save_and_query())
     caller_names_a = {

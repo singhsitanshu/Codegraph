@@ -78,6 +78,10 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         yield DatabaseWriteProgress("Pass 1: Creating Files...", 86)
         yield DatabaseWriteProgress("Pass 2: Creating Functions...", 90)
         yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
+        yield DatabaseWriteProgress(
+            "Detecting architectural communities...",
+            97,
+        )
         yield DatabaseWriteProgress("Completing transaction...", 98)
 
     with (
@@ -113,6 +117,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         86,
         90,
         94,
+        97,
         98,
         100,
     ]

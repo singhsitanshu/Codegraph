@@ -66,6 +66,17 @@ RETURN node.name AS function_name,
 ORDER BY score DESC
 """
 
+ARCHITECTURAL_SUBSYSTEMS_QUERY = """
+MATCH (f:Function {repo_name: $repo_name})
+WHERE f.leiden_community IS NOT NULL
+WITH f.leiden_community AS community,
+     count(f) AS size,
+     collect(f.name)[0..7] AS sample_functions
+ORDER BY size DESC
+LIMIT 10
+RETURN community, size, sample_functions
+"""
+
 CODE_AGENT_SYSTEM_PROMPT = """You are an expert Senior Staff Engineer analyzing a codebase.
 You MUST format your responses for maximum readability.
 - Never output large walls of text.
@@ -77,7 +88,13 @@ You MUST format your responses for maximum readability.
 
 You are analyzing only the GitHub repository `{repo_name}`. When calling graph
 tools, always use that exact repository name. Do not mix results from other
-repositories."""
+repositories.
+
+When asked to explain the architecture or high-level structure of a repository,
+use the `analyze_architectural_subsystems` tool. It returns mathematical clusters
+(communities). Analyze the `sample_functions` in each community to deduce what
+that subsystem does (for example, "Community 1 appears to handle Database I/O"),
+and present a high-level architectural summary."""
 
 
 @tool
@@ -294,6 +311,24 @@ async def semantic_code_search(
     )
 
 
+@tool
+async def analyze_architectural_subsystems(repo_name: str) -> str:
+    """Return the largest Leiden communities in one repository code graph."""
+
+    normalized_repo_name = repo_name.strip()
+    if not normalized_repo_name:
+        return json.dumps([])
+
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(
+            ARCHITECTURAL_SUBSYSTEMS_QUERY,
+            repo_name=normalized_repo_name,
+        )
+        records = await result.data()
+
+    return json.dumps(records, default=str)
+
+
 @lru_cache(maxsize=1)
 def _get_code_agent() -> Any:
     """Create and cache the Sonnet 5 ReAct graph on first chat request."""
@@ -309,6 +344,7 @@ def _get_code_agent() -> Any:
         query_outgoing_dependencies,
         list_external_dependencies,
         semantic_code_search,
+        analyze_architectural_subsystems,
     ]
     return create_react_agent(llm, tools=tools)
 

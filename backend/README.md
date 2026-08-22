@@ -29,6 +29,17 @@ Set `OPENAI_API_KEY` as well; ingestion batches function metadata through
 Repositories ingested before this feature must be re-ingested to populate their
 function embeddings.
 
+The Neo4j server must also have a compatible Graph Data Science plugin
+installed. After dependencies are written, ingestion projects only the active
+repository's function-call graph, runs Leiden community detection, writes each
+function's `leiden_community`, and drops the temporary in-memory graph.
+The included development `docker-compose.yml` installs and allows the GDS
+procedures. Recreate the Neo4j service once after pulling this change:
+
+```bash
+docker compose up -d --force-recreate neo4j
+```
+
 ## Legacy unscoped Neo4j data
 
 Nodes created before repository scoping cannot be assigned safely because they

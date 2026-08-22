@@ -28,6 +28,7 @@ import {
   ingestRepository,
   requestChat,
 } from "./api.js";
+import { getCommunityColor } from "./utils/colors.js";
 
 const FUNCTION_NODE_WIDTH = 150;
 const FUNCTION_NODE_HEIGHT = 52;
@@ -115,6 +116,7 @@ const GraphNode = memo(function GraphNode({ data }) {
   const isExternal = Boolean(data.external);
   const isFocused = data.focusState === "focused";
   const isNeighbor = data.focusState === "neighbor";
+  const communityColor = data.communityColor;
   const borderClass = isFocused
     ? "border-[#23a47d] ring-4 ring-[#23a47d]/20"
     : isNeighbor
@@ -129,6 +131,15 @@ const GraphNode = memo(function GraphNode({ data }) {
   return (
     <div
       className={`relative flex h-full w-full items-center gap-2.5 rounded-xl border px-3 py-2 transition-[border-color,box-shadow] duration-150 ${borderClass} ${surfaceClass}`}
+      style={
+        communityColor
+          ? {
+              background: `color-mix(in srgb, ${communityColor} 14%, white)`,
+              borderColor: isFocused ? "#23a47d" : communityColor,
+              boxShadow: `0 0 14px color-mix(in srgb, ${communityColor} 32%, transparent)`,
+            }
+          : undefined
+      }
       title={data.fullLabel}
       aria-label={`${data.nodeType}: ${data.fullLabel}`}
     >
@@ -159,6 +170,7 @@ const GraphNode = memo(function GraphNode({ data }) {
 const FileHubNode = memo(function FileHubNode({ data }) {
   const isFocused = data.focusState === "focused";
   const isNeighbor = data.focusState === "neighbor";
+  const communityColor = data.communityColor;
   return (
     <div
       className={`flex h-full w-full items-center gap-3 overflow-hidden rounded-[20px] border bg-[#1e293b] px-4 text-white shadow-[0_16px_42px_rgba(15,23,42,0.22)] transition-[border-color,box-shadow] duration-150 ${
@@ -168,6 +180,15 @@ const FileHubNode = memo(function FileHubNode({ data }) {
             ? "border-[#74b9a1]"
             : "border-[#334155]"
       }`}
+      style={
+        communityColor
+          ? {
+              background: `color-mix(in srgb, ${communityColor} 24%, #1e293b)`,
+              borderColor: isFocused ? "#3dd6a4" : communityColor,
+              boxShadow: `0 0 16px color-mix(in srgb, ${communityColor} 34%, transparent)`,
+            }
+          : undefined
+      }
       title={data.fullLabel}
       aria-label={`File hub: ${data.fullLabel}, ${data.degree} connections`}
     >
@@ -195,6 +216,12 @@ function normalizeNodes(rawNodes) {
   return rawNodes.map((raw, index) => {
     const data = raw.data ?? {};
     const external = raw.external ?? data.external ?? false;
+    const community =
+      raw.community ??
+      data.community ??
+      raw.leiden_community ??
+      data.leiden_community ??
+      null;
     const nodeType = getNodeKind(raw, data);
     const fullLabel = String(
       data.label ??
@@ -212,6 +239,7 @@ function normalizeNodes(rawNodes) {
       targetPosition: Position.Top,
       data: {
         ...data,
+        community,
         external,
         fullLabel,
         displayName: basename(fullLabel),
@@ -500,6 +528,7 @@ function App() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState("Idle");
+  const [showClusters, setShowClusters] = useState(false);
   const abortRef = useRef(null);
   const messagesEndRef = useRef(null);
   const flowInstanceRef = useRef(null);
@@ -563,6 +592,51 @@ function App() {
       };
     });
   }, [focusedConnections, focusedNodeId, nodes]);
+
+  const styledNodes = useMemo(() => {
+    if (!showClusters) return visibleNodes;
+
+    return visibleNodes.map((node) => {
+      const communityColor = getCommunityColor(node.data?.community);
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          communityColor,
+        },
+        style: {
+          ...node.style,
+          boxShadow: `0 0 12px color-mix(in srgb, ${communityColor} 28%, transparent)`,
+          transition: "opacity 150ms ease, box-shadow 180ms ease",
+        },
+      };
+    });
+  }, [showClusters, visibleNodes]);
+
+  const communityLegend = useMemo(() => {
+    const counts = new Map();
+    let unassignedCount = 0;
+
+    nodes.forEach((node) => {
+      const community = node.data?.community;
+      if (community === null || community === undefined) {
+        unassignedCount += 1;
+        return;
+      }
+      counts.set(community, (counts.get(community) ?? 0) + 1);
+    });
+
+    return {
+      communities: [...counts.entries()]
+        .sort(([left], [right]) => Number(left) - Number(right))
+        .map(([id, count]) => ({
+          id,
+          count,
+          color: getCommunityColor(id),
+        })),
+      unassignedCount,
+    };
+  }, [nodes]);
 
   const visibleEdges = useMemo(() => {
     const connectedEdgeIds = focusedConnections?.edgeIds ?? new Set();
@@ -679,6 +753,7 @@ function App() {
       setChatError("");
       setProgress(0);
       setProgressText("Idle");
+      setShowClusters(false);
     } catch (error) {
       setIngestionError(
         error instanceof Error ? error.message : "Repository deletion failed",
@@ -705,6 +780,7 @@ function App() {
     setInitialCenter(null);
     setGraphError("");
     setGraphStatus("idle");
+    setShowClusters(false);
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -1027,15 +1103,44 @@ function App() {
                 {graphCounts.files} files · {graphCounts.functions} functions · {edges.length} relationships
               </p>
             </div>
-            <button
-              type="button"
-              onClick={() => loadGraph(activeRepo)}
-              disabled={!activeRepo || graphStatus === "loading" || isDeleting}
-              className="inline-flex items-center gap-2 rounded-xl border border-[#d7ded8] bg-white px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.11em] text-[#52645d] shadow-sm transition hover:border-[#bfcac2] disabled:opacity-50"
-            >
-              <Icon name="refresh" className={`size-3.5 ${graphStatus === "loading" ? "animate-spin" : ""}`} />
-              Refresh
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                aria-pressed={showClusters}
+                aria-label={
+                  showClusters
+                    ? "Hide architectural clusters"
+                    : "Show architectural clusters"
+                }
+                onClick={() => setShowClusters((current) => !current)}
+                disabled={nodes.length === 0 || graphStatus === "loading"}
+                className={`inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-[9px] font-extrabold uppercase tracking-[0.09em] shadow-sm transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                  showClusters
+                    ? "border-[#5145a6] bg-[#5b4fc4] text-white"
+                    : "border-[#d7ded8] bg-white text-[#52645d] hover:border-[#bfcac2]"
+                }`}
+              >
+                <span
+                  aria-hidden="true"
+                  className={`size-2.5 rounded-full ${
+                    showClusters ? "bg-[#d9d5ff]" : "bg-[#8f83e8]"
+                  }`}
+                />
+                <span className="hidden 2xl:inline">
+                  {showClusters ? "Hide Sub-Systems" : "Architectural Clusters"}
+                </span>
+                <span className="2xl:hidden">Clusters</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => loadGraph(activeRepo)}
+                disabled={!activeRepo || graphStatus === "loading" || isDeleting}
+                className="inline-flex items-center gap-2 rounded-xl border border-[#d7ded8] bg-white px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.11em] text-[#52645d] shadow-sm transition hover:border-[#bfcac2] disabled:opacity-50"
+              >
+                <Icon name="refresh" className={`size-3.5 ${graphStatus === "loading" ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+            </div>
           </div>
 
           <div className="absolute inset-0 pt-[76px]">
@@ -1077,8 +1182,9 @@ function App() {
                 </div>
               </div>
             ) : (
-              <ReactFlow
-                nodes={visibleNodes}
+              <>
+                <ReactFlow
+                nodes={styledNodes}
                 edges={visibleEdges}
                 nodeTypes={nodeTypes}
                 onNodesChange={onNodesChange}
@@ -1102,13 +1208,66 @@ function App() {
                   zoomable
                   position="bottom-left"
                   nodeColor={(node) => {
+                    if (showClusters) {
+                      return getCommunityColor(node.data?.community);
+                    }
                     if (node.data?.nodeType === "File") return "#1e293b";
                     if (node.data?.external) return "#d5a24e";
                     return "#4f9c82";
                   }}
                   maskColor="rgba(238, 241, 235, 0.75)"
                 />
-              </ReactFlow>
+                </ReactFlow>
+                {showClusters && (
+                  <aside
+                  aria-label="Architectural cluster legend"
+                  className="absolute bottom-[126px] left-4 z-20 w-52 overflow-hidden rounded-2xl border border-[#d7ded8] bg-white/95 shadow-[0_12px_34px_rgba(32,51,45,0.14)] backdrop-blur"
+                >
+                  <div className="border-b border-[#e3e8e4] px-3.5 py-3">
+                    <p className="text-[10px] font-extrabold uppercase tracking-[0.13em] text-[#52645d]">
+                      Architectural clusters
+                    </p>
+                    <p className="mt-1 text-[9px] text-[#87948f]">
+                      Leiden function communities
+                    </p>
+                  </div>
+                  <div className="max-h-44 overflow-y-auto px-3.5 py-2.5">
+                    {communityLegend.communities.map((community) => (
+                      <div
+                        key={community.id}
+                        className="flex items-center justify-between gap-3 py-1.5 text-[10px]"
+                      >
+                        <span className="flex min-w-0 items-center gap-2 font-bold text-[#43554f]">
+                          <span
+                            className="size-2.5 shrink-0 rounded-full"
+                            style={{ backgroundColor: community.color }}
+                          />
+                          <span className="truncate">Cluster #{community.id}</span>
+                        </span>
+                        <span className="shrink-0 text-[#8a9892]">
+                          {community.count} {community.count === 1 ? "node" : "nodes"}
+                        </span>
+                      </div>
+                    ))}
+                    {communityLegend.unassignedCount > 0 && (
+                      <div className="flex items-center justify-between gap-3 py-1.5 text-[10px]">
+                        <span className="flex min-w-0 items-center gap-2 font-bold text-[#60716b]">
+                          <span
+                            className="size-2.5 shrink-0 rounded-full"
+                            style={{ backgroundColor: getCommunityColor(null) }}
+                          />
+                          <span>Unassigned</span>
+                        </span>
+                        <span className="shrink-0 text-[#8a9892]">
+                          {communityLegend.unassignedCount}{" "}
+                          {communityLegend.unassignedCount === 1 ? "node" : "nodes"}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  </aside>
+                )}
+              </>
             )}
           </div>
         </section>
