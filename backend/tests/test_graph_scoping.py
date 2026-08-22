@@ -41,6 +41,8 @@ def test_graph_read_starts_from_repository_scoped_files() -> None:
     assert "MATCH (file:File {repo_name: $repo_name})" in GRAPH_QUERY
     assert "Function {repo_name: $repo_name}" in GRAPH_QUERY
     assert "(m {repo_name: $repo_name})" in GRAPH_QUERY
+    assert "IN_COMMUNITY" in GRAPH_QUERY
+    assert "n_community.name AS n_community_name" in GRAPH_QUERY
     assert "\nMATCH (n)\n" not in GRAPH_QUERY
 
 
@@ -71,6 +73,10 @@ def test_three_pass_write_receives_repository_scope() -> None:
             "app.db.graph_ops.run_leiden_clustering",
             new=AsyncMock(),
         ) as cluster_graph,
+        patch(
+            "app.db.graph_ops.label_and_store_communities",
+            new=AsyncMock(),
+        ) as label_communities,
     ):
         asyncio.run(
             save_parsed_ast_to_neo4j(
@@ -116,6 +122,7 @@ def test_three_pass_write_receives_repository_scope() -> None:
         ["Function: example\nFile: src/example.py"]
     )
     cluster_graph.assert_awaited_once_with("owner/repository-a")
+    label_communities.assert_awaited_once_with("owner/repository-a")
 
 
 def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
@@ -139,6 +146,10 @@ def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
             "app.db.graph_ops.run_leiden_clustering",
             new=AsyncMock(),
         ) as cluster_graph,
+        patch(
+            "app.db.graph_ops.label_and_store_communities",
+            new=AsyncMock(),
+        ) as label_communities,
     ):
         asyncio.run(
             save_parsed_ast_to_neo4j(
@@ -167,9 +178,14 @@ def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
         len(call.args[0]) for call in embed_batch.await_args_list
     ] == [100, 100, 5]
     cluster_graph.assert_awaited_once_with("owner/large-repository")
+    label_communities.assert_awaited_once_with("owner/large-repository")
 
 
 def test_external_postprocessing_remains_repository_scoped() -> None:
     assert "SET fn:ExternalFunction" in TAG_EXTERNAL_FUNCTIONS_QUERY
     assert "fn.is_external = true" in TAG_EXTERNAL_FUNCTIONS_QUERY
     assert "$repo_name" in TAG_EXTERNAL_FUNCTIONS_QUERY
+
+
+def test_repository_replacement_includes_community_nodes() -> None:
+    assert "node:Community" in DELETE_REPOSITORY_QUERY

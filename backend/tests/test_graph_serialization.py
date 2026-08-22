@@ -20,6 +20,31 @@ def test_function_serialization_exposes_leiden_community_alias() -> None:
     assert serialized["id"] == "func_123"
     assert serialized["label"] == "process_payment"
     assert serialized["community"] == 1
+    assert serialized["community_id"] == 1
+    assert serialized["community_name"] == "Cluster #1"
+    assert serialized["community_description"] is None
     assert serialized["file_path"] == "services/payment.py"
     assert serialized["data"]["community"] == 1
+    assert serialized["data"]["community_id"] == 1
+    assert serialized["data"]["community_name"] == "Cluster #1"
     assert serialized["data"]["leiden_community"] == 1
+
+
+def test_function_serialization_exposes_stored_community_metadata() -> None:
+    node = FakeNode(
+        name="process_payment",
+        file_path="services/payment.py",
+        leiden_community=1,
+    )
+
+    serialized = _serialize_node(
+        node,
+        community_name="Payment Processing",
+        community_description="Coordinates customer payment workflows.",
+    )
+
+    assert serialized["community_name"] == "Payment Processing"
+    assert serialized["community_description"] == (
+        "Coordinates customer payment workflows."
+    )
+    assert serialized["data"]["community_name"] == "Payment Processing"

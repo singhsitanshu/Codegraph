@@ -28,7 +28,9 @@ import {
   ingestRepository,
   requestChat,
 } from "./api.js";
+import GraphLegend from "./components/GraphLegend.tsx";
 import { getCommunityColor } from "./utils/colors.js";
+import { buildCommunityLegend } from "./utils/communities.js";
 
 const FUNCTION_NODE_WIDTH = 150;
 const FUNCTION_NODE_HEIGHT = 52;
@@ -217,11 +219,21 @@ function normalizeNodes(rawNodes) {
     const data = raw.data ?? {};
     const external = raw.external ?? data.external ?? false;
     const community =
+      raw.community_id ??
+      data.community_id ??
       raw.community ??
       data.community ??
       raw.leiden_community ??
       data.leiden_community ??
       null;
+    const communityName =
+      raw.community_name ??
+      data.community_name ??
+      (community === null || community === undefined
+        ? null
+        : `Cluster #${community}`);
+    const communityDescription =
+      raw.community_description ?? data.community_description ?? null;
     const nodeType = getNodeKind(raw, data);
     const fullLabel = String(
       data.label ??
@@ -240,6 +252,8 @@ function normalizeNodes(rawNodes) {
       data: {
         ...data,
         community,
+        communityName,
+        communityDescription,
         external,
         fullLabel,
         displayName: basename(fullLabel),
@@ -613,30 +627,10 @@ function App() {
     });
   }, [showClusters, visibleNodes]);
 
-  const communityLegend = useMemo(() => {
-    const counts = new Map();
-    let unassignedCount = 0;
-
-    nodes.forEach((node) => {
-      const community = node.data?.community;
-      if (community === null || community === undefined) {
-        unassignedCount += 1;
-        return;
-      }
-      counts.set(community, (counts.get(community) ?? 0) + 1);
-    });
-
-    return {
-      communities: [...counts.entries()]
-        .sort(([left], [right]) => Number(left) - Number(right))
-        .map(([id, count]) => ({
-          id,
-          count,
-          color: getCommunityColor(id),
-        })),
-      unassignedCount,
-    };
-  }, [nodes]);
+  const communityLegend = useMemo(
+    () => buildCommunityLegend(nodes),
+    [nodes],
+  );
 
   const visibleEdges = useMemo(() => {
     const connectedEdgeIds = focusedConnections?.edgeIds ?? new Set();
@@ -1219,53 +1213,7 @@ function App() {
                 />
                 </ReactFlow>
                 {showClusters && (
-                  <aside
-                  aria-label="Architectural cluster legend"
-                  className="absolute bottom-[126px] left-4 z-20 w-52 overflow-hidden rounded-2xl border border-[#d7ded8] bg-white/95 shadow-[0_12px_34px_rgba(32,51,45,0.14)] backdrop-blur"
-                >
-                  <div className="border-b border-[#e3e8e4] px-3.5 py-3">
-                    <p className="text-[10px] font-extrabold uppercase tracking-[0.13em] text-[#52645d]">
-                      Architectural clusters
-                    </p>
-                    <p className="mt-1 text-[9px] text-[#87948f]">
-                      Leiden function communities
-                    </p>
-                  </div>
-                  <div className="max-h-44 overflow-y-auto px-3.5 py-2.5">
-                    {communityLegend.communities.map((community) => (
-                      <div
-                        key={community.id}
-                        className="flex items-center justify-between gap-3 py-1.5 text-[10px]"
-                      >
-                        <span className="flex min-w-0 items-center gap-2 font-bold text-[#43554f]">
-                          <span
-                            className="size-2.5 shrink-0 rounded-full"
-                            style={{ backgroundColor: community.color }}
-                          />
-                          <span className="truncate">Cluster #{community.id}</span>
-                        </span>
-                        <span className="shrink-0 text-[#8a9892]">
-                          {community.count} {community.count === 1 ? "node" : "nodes"}
-                        </span>
-                      </div>
-                    ))}
-                    {communityLegend.unassignedCount > 0 && (
-                      <div className="flex items-center justify-between gap-3 py-1.5 text-[10px]">
-                        <span className="flex min-w-0 items-center gap-2 font-bold text-[#60716b]">
-                          <span
-                            className="size-2.5 shrink-0 rounded-full"
-                            style={{ backgroundColor: getCommunityColor(null) }}
-                          />
-                          <span>Unassigned</span>
-                        </span>
-                        <span className="shrink-0 text-[#8a9892]">
-                          {communityLegend.unassignedCount}{" "}
-                          {communityLegend.unassignedCount === 1 ? "node" : "nodes"}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                  </aside>
+                  <GraphLegend legend={communityLegend} />
                 )}
               </>
             )}

@@ -24,6 +24,10 @@ DATABASE_INDEX_QUERIES = (
     "FOR (fn:Function) ON (fn.repo_name, fn.name)",
     "CREATE INDEX ext_func_repo_name IF NOT EXISTS "
     "FOR (ext:ExternalFunction) ON (ext.repo_name, ext.name)",
+    "CREATE INDEX community_repo_id IF NOT EXISTS "
+    "FOR (c:Community) ON (c.repo_name, c.community_id)",
+    "CREATE INDEX func_repo_community IF NOT EXISTS "
+    "FOR (fn:Function) ON (fn.repo_name, fn.leiden_community)",
     "CREATE VECTOR INDEX `function_embeddings` IF NOT EXISTS "
     "FOR (fn:Function) ON (fn.embedding) "
     "OPTIONS {indexConfig: {"

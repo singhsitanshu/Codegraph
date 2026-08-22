@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 
 from app.db import get_neo4j_driver
 from app.db.gds_ops import run_leiden_clustering
+from app.services.community_summarizer import label_and_store_communities
 from app.services.embedding_service import generate_embeddings
 
 
@@ -14,7 +15,8 @@ BatchItem = TypeVar("BatchItem")
 
 DELETE_REPOSITORY_QUERY = """
 MATCH (node)
-WHERE (node:File OR node:Function) AND node.repo_name = $repo_name
+WHERE (node:File OR node:Function OR node:Community)
+  AND node.repo_name = $repo_name
 DETACH DELETE node
 """
 
@@ -226,7 +228,12 @@ async def save_parsed_ast_to_neo4j_with_progress(
         97,
     )
     await run_leiden_clustering(normalized_repo_name)
-    yield DatabaseWriteProgress("Completing transaction...", 98)
+    yield DatabaseWriteProgress(
+        "Labeling architectural communities...",
+        98,
+    )
+    await label_and_store_communities(normalized_repo_name)
+    yield DatabaseWriteProgress("Completing transaction...", 99)
 
 
 async def save_parsed_ast_to_neo4j(

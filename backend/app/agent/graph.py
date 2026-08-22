@@ -67,14 +67,13 @@ ORDER BY score DESC
 """
 
 ARCHITECTURAL_SUBSYSTEMS_QUERY = """
-MATCH (f:Function {repo_name: $repo_name})
-WHERE f.leiden_community IS NOT NULL
-WITH f.leiden_community AS community,
-     count(f) AS size,
-     collect(f.name)[0..7] AS sample_functions
-ORDER BY size DESC
-LIMIT 10
-RETURN community, size, sample_functions
+MATCH (c:Community {repo_name: $repo_name})
+OPTIONAL MATCH (f:Function {repo_name: $repo_name})-[:IN_COMMUNITY]->(c)
+RETURN c.community_id AS id,
+       c.name AS module_title,
+       c.description AS module_description,
+       count(f) AS function_count
+ORDER BY function_count DESC
 """
 
 CODE_AGENT_SYSTEM_PROMPT = """You are an expert Senior Staff Engineer analyzing a codebase.
@@ -91,10 +90,9 @@ tools, always use that exact repository name. Do not mix results from other
 repositories.
 
 When asked to explain the architecture or high-level structure of a repository,
-use the `analyze_architectural_subsystems` tool. It returns mathematical clusters
-(communities). Analyze the `sample_functions` in each community to deduce what
-that subsystem does (for example, "Community 1 appears to handle Database I/O"),
-and present a high-level architectural summary."""
+use the `analyze_architectural_subsystems` tool. It returns labeled architectural
+modules with a title, description, and function count. Use those stored labels
+to present a high-level architectural summary."""
 
 
 @tool

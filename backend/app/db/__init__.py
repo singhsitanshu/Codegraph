@@ -15,7 +15,19 @@ OPTIONAL MATCH (file)-[:DEFINES]->(function:Function {repo_name: $repo_name})
 WITH collect(DISTINCT file) + collect(DISTINCT function) AS repository_nodes
 UNWIND repository_nodes AS n
 OPTIONAL MATCH (n)-[r:DEFINES|CALLS]->(m {repo_name: $repo_name})
-RETURN n, r, m
+OPTIONAL MATCH (n:Function)-[:IN_COMMUNITY]->(
+    n_community:Community {repo_name: $repo_name}
+)
+OPTIONAL MATCH (m:Function)-[:IN_COMMUNITY]->(
+    m_community:Community {repo_name: $repo_name}
+)
+RETURN n,
+       r,
+       m,
+       n_community.name AS n_community_name,
+       n_community.description AS n_community_description,
+       m_community.name AS m_community_name,
+       m_community.description AS m_community_description
 LIMIT 200
 """
 
@@ -58,7 +70,11 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
-def _serialize_node(node: Node) -> dict[str, Any]:
+def _serialize_node(
+    node: Node,
+    community_name: str | None = None,
+    community_description: str | None = None,
+) -> dict[str, Any]:
     """Serialize a Neo4j node for both React Flow and Cytoscape consumers."""
 
     node_id = node.element_id
@@ -70,21 +86,36 @@ def _serialize_node(node: Node) -> dict[str, Any]:
         or properties.get("path")
         or (labels[0] if labels else node_id)
     )
-    community = properties.get("leiden_community")
+    community_id = properties.get("leiden_community")
+    resolved_community_name = (
+        community_name.strip()
+        if isinstance(community_name, str) and community_name.strip()
+        else (
+            f"Cluster #{community_id}"
+            if community_id is not None
+            else None
+        )
+    )
     file_path = properties.get("file_path") or properties.get("path")
     data = {
         **properties,
         "id": node_id,
         "label": str(label),
         "labels": labels,
-        "community": community,
+        "community": community_id,
+        "community_id": community_id,
+        "community_name": resolved_community_name,
+        "community_description": community_description,
         "file_path": file_path,
     }
     return {
         "id": node_id,
         "label": str(label),
         "labels": labels,
-        "community": community,
+        "community": community_id,
+        "community_id": community_id,
+        "community_name": resolved_community_name,
+        "community_description": community_description,
         "file_path": file_path,
         "data": data,
     }
@@ -123,9 +154,25 @@ async def fetch_graph_data(repo_name: str) -> dict[str, list[dict[str, Any]]]:
     async with get_neo4j_driver().session() as session:
         result = await session.run(GRAPH_QUERY, repo_name=repo_name)
         async for record in result:
-            for node in (record["n"], record["m"]):
+            node_contexts = (
+                (
+                    record["n"],
+                    record["n_community_name"],
+                    record["n_community_description"],
+                ),
+                (
+                    record["m"],
+                    record["m_community_name"],
+                    record["m_community_description"],
+                ),
+            )
+            for node, community_name, community_description in node_contexts:
                 if isinstance(node, Node) and node.element_id not in nodes:
-                    nodes[node.element_id] = _serialize_node(node)
+                    nodes[node.element_id] = _serialize_node(
+                        node,
+                        community_name=community_name,
+                        community_description=community_description,
+                    )
 
             relationship = record["r"]
             if (

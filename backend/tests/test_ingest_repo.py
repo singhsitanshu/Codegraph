@@ -82,7 +82,11 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
             "Detecting architectural communities...",
             97,
         )
-        yield DatabaseWriteProgress("Completing transaction...", 98)
+        yield DatabaseWriteProgress(
+            "Labeling architectural communities...",
+            98,
+        )
+        yield DatabaseWriteProgress("Completing transaction...", 99)
 
     with (
         patch(
@@ -119,6 +123,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         94,
         97,
         98,
+        99,
         100,
     ]
     assert progress_records[-1] == {

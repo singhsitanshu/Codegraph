@@ -37,8 +37,8 @@ def test_code_agent_system_prompt_requires_structured_markdown() -> None:
     assert "```python" in rendered_prompt
     assert "owner/repository" in rendered_prompt
     assert "analyze_architectural_subsystems" in rendered_prompt
-    assert "mathematical clusters" in rendered_prompt
-    assert "sample_functions" in rendered_prompt
+    assert "labeled architectural" in rendered_prompt
+    assert "function count" in rendered_prompt
 
 
 def _invoke_tool(tool, arguments, records):
@@ -230,9 +230,10 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
 def test_analyze_architectural_subsystems_returns_scoped_communities() -> None:
     records = [
         {
-            "community": 4,
-            "size": 12,
-            "sample_functions": ["connect", "execute", "commit"],
+            "id": 4,
+            "module_title": "Database Transactions",
+            "module_description": "Coordinates database transaction state.",
+            "function_count": 12,
         }
     ]
     output, run_query = _invoke_tool(
