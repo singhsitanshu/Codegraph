@@ -1,11 +1,14 @@
 """OpenAI embedding utilities for code-graph semantic search."""
 
+import logging
 from functools import lru_cache
 
 from openai import AsyncOpenAI
 
 from app.config import settings
 
+
+logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIMENSIONS = 1536
@@ -40,6 +43,11 @@ async def generate_embeddings(texts: list[str]) -> list[list[float]]:
         raise RuntimeError("OpenAI returned an unexpected embedding count")
     if any(len(embedding) != EMBEDDING_DIMENSIONS for embedding in embeddings):
         raise RuntimeError("OpenAI returned an unexpected embedding dimension")
+    logger.info(
+        "Generated %d OpenAI code embedding(s) with %s",
+        len(embeddings),
+        EMBEDDING_MODEL,
+    )
     return embeddings
 
 

@@ -57,6 +57,14 @@ def test_run_leiden_clustering_projects_writes_and_drops_graph() -> None:
     dropped.consume.assert_awaited_once_with()
 
 
+def test_projection_uses_modern_undirected_cypher_aggregation() -> None:
+    assert "gds.graph.project.cypher" not in PROJECT_CODEBASE_GRAPH_QUERY
+    assert "WITH gds.graph.project(" in PROJECT_CODEBASE_GRAPH_QUERY
+    assert "OPTIONAL MATCH" in PROJECT_CODEBASE_GRAPH_QUERY
+    assert "undirectedRelationshipTypes: ['*']" in PROJECT_CODEBASE_GRAPH_QUERY
+    assert "gds.graph.drop($graph_name, false)" in DROP_CODEBASE_GRAPH_QUERY
+
+
 def test_run_leiden_clustering_drops_graph_when_algorithm_fails() -> None:
     projection = _consumable_result()
     leiden = MagicMock()
@@ -71,6 +79,32 @@ def test_run_leiden_clustering_drops_graph_when_algorithm_fails() -> None:
         asyncio.run(run_leiden_clustering("owner/repository"))
 
     assert session.run.await_count == 3
+    dropped.consume.assert_awaited_once_with()
+
+
+def test_run_leiden_clustering_drops_graph_when_projection_consume_fails() -> None:
+    projection = _consumable_result()
+    projection.consume = AsyncMock(side_effect=RuntimeError("projection failed"))
+    dropped = _consumable_result()
+    driver, session = _mock_driver([projection, dropped])
+
+    with (
+        patch("app.db.gds_ops.get_neo4j_driver", return_value=driver),
+        pytest.raises(RuntimeError, match="projection failed"),
+    ):
+        asyncio.run(run_leiden_clustering("owner/repository"))
+
+    assert session.run.await_args_list == [
+        call(
+            PROJECT_CODEBASE_GRAPH_QUERY,
+            graph_name="codebase_graph_owner/repository",
+            repo_name="owner/repository",
+        ),
+        call(
+            DROP_CODEBASE_GRAPH_QUERY,
+            graph_name="codebase_graph_owner/repository",
+        ),
+    ]
     dropped.consume.assert_awaited_once_with()
 
 
