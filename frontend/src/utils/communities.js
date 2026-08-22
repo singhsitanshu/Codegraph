@@ -1,5 +1,15 @@
 import { getCommunityColor } from "./colors.js";
 
+export function toggleClusterSelection(activeClusters, communityId) {
+  const nextClusters = new Set(activeClusters);
+  if (nextClusters.has(communityId)) {
+    nextClusters.delete(communityId);
+  } else {
+    nextClusters.add(communityId);
+  }
+  return nextClusters;
+}
+
 export function buildCommunityLegend(nodes) {
   const communities = new Map();
   let unassignedCount = 0;

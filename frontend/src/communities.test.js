@@ -1,7 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildCommunityLegend } from "./utils/communities.js";
+import {
+  buildCommunityLegend,
+  toggleClusterSelection,
+} from "./utils/communities.js";
+
+test("cluster selection toggles multiple communities without mutating state", () => {
+  const initial = new Set([1]);
+  const withSecondCluster = toggleClusterSelection(initial, 2);
+  const withoutFirstCluster = toggleClusterSelection(withSecondCluster, 1);
+
+  assert.deepEqual([...initial], [1]);
+  assert.deepEqual([...withSecondCluster], [1, 2]);
+  assert.deepEqual([...withoutFirstCluster], [2]);
+});
 
 test("community legend uses stored labels, descriptions, and counts", () => {
   const legend = buildCommunityLegend([

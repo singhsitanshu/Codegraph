@@ -30,7 +30,10 @@ import {
 } from "./api.js";
 import GraphLegend from "./components/GraphLegend.tsx";
 import { getCommunityColor } from "./utils/colors.js";
-import { buildCommunityLegend } from "./utils/communities.js";
+import {
+  buildCommunityLegend,
+  toggleClusterSelection,
+} from "./utils/communities.js";
 
 const FUNCTION_NODE_WIDTH = 150;
 const FUNCTION_NODE_HEIGHT = 52;
@@ -543,6 +546,7 @@ function App() {
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState("Idle");
   const [showClusters, setShowClusters] = useState(false);
+  const [activeClusters, setActiveClusters] = useState(() => new Set());
   const abortRef = useRef(null);
   const messagesEndRef = useRef(null);
   const flowInstanceRef = useRef(null);
@@ -610,22 +614,33 @@ function App() {
   const styledNodes = useMemo(() => {
     if (!showClusters) return visibleNodes;
 
+    const isFilterActive = activeClusters.size > 0;
     return visibleNodes.map((node) => {
       const communityColor = getCommunityColor(node.data?.community);
+      const isSelected = activeClusters.has(node.data?.community);
+      const shouldDim = isFilterActive && !isSelected;
+      const currentOpacity = Number(node.style?.opacity ?? 1);
       return {
         ...node,
         data: {
           ...node.data,
           communityColor,
+          clusterFilterState: shouldDim ? "dimmed" : "active",
         },
         style: {
           ...node.style,
-          boxShadow: `0 0 12px color-mix(in srgb, ${communityColor} 28%, transparent)`,
-          transition: "opacity 150ms ease, box-shadow 180ms ease",
+          background: shouldDim ? "#334155" : node.style?.background,
+          borderColor: shouldDim ? "#475569" : communityColor,
+          boxShadow: shouldDim
+            ? "none"
+            : `0 0 12px color-mix(in srgb, ${communityColor} 28%, transparent)`,
+          filter: shouldDim ? "grayscale(0.55)" : node.style?.filter,
+          opacity: shouldDim ? Math.min(currentOpacity, 0.15) : currentOpacity,
+          transition: "all 300ms ease",
         },
       };
     });
-  }, [showClusters, visibleNodes]);
+  }, [activeClusters, showClusters, visibleNodes]);
 
   const communityLegend = useMemo(
     () => buildCommunityLegend(nodes),
@@ -656,12 +671,55 @@ function App() {
     });
   }, [focusedConnections, focusedNodeId, routedEdges]);
 
+  const styledEdges = useMemo(() => {
+    if (!showClusters || activeClusters.size === 0) return visibleEdges;
+
+    const nodeCommunities = new Map(
+      nodes.map((node) => [node.id, node.data?.community]),
+    );
+    return visibleEdges.map((edge) => {
+      const sourceActive = activeClusters.has(nodeCommunities.get(edge.source));
+      const targetActive = activeClusters.has(nodeCommunities.get(edge.target));
+      const shouldDim = !(sourceActive || targetActive);
+      const currentOpacity = Number(edge.style?.opacity ?? 0.35);
+      const stroke = shouldDim ? "#334155" : edge.style?.stroke;
+
+      return {
+        ...edge,
+        animated: shouldDim ? false : edge.animated,
+        markerEnd: {
+          ...edge.markerEnd,
+          color: stroke,
+        },
+        style: {
+          ...edge.style,
+          opacity: shouldDim
+            ? Math.min(currentOpacity, 0.05)
+            : Math.max(currentOpacity, 0.6),
+          stroke,
+          transition: "opacity 300ms ease, stroke 300ms ease",
+        },
+      };
+    });
+  }, [activeClusters, nodes, showClusters, visibleEdges]);
+
+  const toggleCluster = useCallback((communityId) => {
+    setActiveClusters((current) =>
+      toggleClusterSelection(current, communityId),
+    );
+  }, []);
+
+  const clearClusterFilters = useCallback(() => {
+    setActiveClusters(new Set());
+  }, []);
+
   const loadGraph = useCallback(async (repoName) => {
     if (!repoName) {
       setNodes([]);
       setEdges([]);
       setInitialCenter(null);
       setFocusedNodeId(null);
+      setActiveClusters(new Set());
       setGraphError("");
       setGraphStatus("idle");
       return;
@@ -748,6 +806,7 @@ function App() {
       setProgress(0);
       setProgressText("Idle");
       setShowClusters(false);
+      setActiveClusters(new Set());
     } catch (error) {
       setIngestionError(
         error instanceof Error ? error.message : "Repository deletion failed",
@@ -775,6 +834,7 @@ function App() {
     setGraphError("");
     setGraphStatus("idle");
     setShowClusters(false);
+    setActiveClusters(new Set());
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -1179,7 +1239,7 @@ function App() {
               <>
                 <ReactFlow
                 nodes={styledNodes}
-                edges={visibleEdges}
+                edges={styledEdges}
                 nodeTypes={nodeTypes}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
@@ -1203,6 +1263,12 @@ function App() {
                   position="bottom-left"
                   nodeColor={(node) => {
                     if (showClusters) {
+                      if (
+                        activeClusters.size > 0 &&
+                        !activeClusters.has(node.data?.community)
+                      ) {
+                        return "#cbd5e1";
+                      }
                       return getCommunityColor(node.data?.community);
                     }
                     if (node.data?.nodeType === "File") return "#1e293b";
@@ -1213,7 +1279,12 @@ function App() {
                 />
                 </ReactFlow>
                 {showClusters && (
-                  <GraphLegend legend={communityLegend} />
+                  <GraphLegend
+                    legend={communityLegend}
+                    activeClusters={activeClusters}
+                    onToggleCluster={toggleCluster}
+                    onClearClusters={clearClusterFilters}
+                  />
                 )}
               </>
             )}
