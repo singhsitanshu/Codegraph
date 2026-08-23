@@ -15,6 +15,7 @@ import {
   Handle,
   MarkerType,
   MiniMap,
+  Panel,
   Position,
   ReactFlow,
   useEdgesState,
@@ -1277,15 +1278,20 @@ function App() {
                   }}
                   maskColor="rgba(238, 241, 235, 0.75)"
                 />
-                </ReactFlow>
                 {showClusters && (
-                  <GraphLegend
-                    legend={communityLegend}
-                    activeClusters={activeClusters}
-                    onToggleCluster={toggleCluster}
-                    onClearClusters={clearClusterFilters}
-                  />
+                  <Panel
+                    position="top-left"
+                    className="!m-4 w-80 max-w-[calc(100%_-_2rem)] overflow-hidden rounded-2xl border border-[#d7ded8] bg-white/95 shadow-[0_12px_34px_rgba(32,51,45,0.14)] backdrop-blur"
+                  >
+                    <GraphLegend
+                      legend={communityLegend}
+                      activeClusters={activeClusters}
+                      onToggleCluster={toggleCluster}
+                      onClearClusters={clearClusterFilters}
+                    />
+                  </Panel>
                 )}
+              </ReactFlow>
               </>
             )}
           </div>
