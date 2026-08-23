@@ -9,6 +9,11 @@ from app.db import get_neo4j_driver
 logger = logging.getLogger(__name__)
 
 
+COUNT_REPOSITORY_FUNCTIONS_QUERY = """
+MATCH (f:Function {repo_name: $repo_name})
+RETURN count(f) AS node_count
+"""
+
 PROJECT_CODEBASE_GRAPH_QUERY = """
 MATCH (s:Function {repo_name: $repo_name})
 OPTIONAL MATCH (s)-[r:CALLS]->(t:Function {repo_name: $repo_name})
@@ -52,8 +57,21 @@ async def run_leiden_clustering(repo_name: str) -> dict[str, Any]:
     if not normalized_repo_name:
         raise ValueError("repo_name must not be blank")
 
-    graph_name = f"codebase_graph_{normalized_repo_name}"
     async with get_neo4j_driver().session() as session:
+        count_result = await session.run(
+            COUNT_REPOSITORY_FUNCTIONS_QUERY,
+            repo_name=normalized_repo_name,
+        )
+        count_records = await count_result.data()
+        node_count = count_records[0]["node_count"] if count_records else 0
+        if node_count == 0:
+            logger.warning(
+                "Skipping clustering for %s: 0 nodes found",
+                normalized_repo_name,
+            )
+            return {"communityCount": 0, "modularity": 0.0}
+
+        graph_name = f"codebase_graph_{normalized_repo_name}"
         try:
             projection = await session.run(
                 PROJECT_CODEBASE_GRAPH_QUERY,

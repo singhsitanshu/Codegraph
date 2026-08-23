@@ -22,6 +22,7 @@ def test_supported_extension_mapping_covers_all_requested_languages() -> None:
         ".ts": "typescript",
         ".tsx": "tsx",
         ".go": "go",
+        ".java": "java",
     }
 
 
@@ -81,6 +82,17 @@ def test_supported_extension_mapping_covers_all_requested_languages() -> None:
             b"func (c *Client) Send() { Top() }\n",
             ["Top", "Send"],
             ["helper", "Call", "Top"],
+            ["Client"],
+        ),
+        (
+            "Client.java",
+            b"package demo;\n"
+            b"class Client {\n"
+            b"  Client() { initialize(); }\n"
+            b"  void send() { api.call(); helper(); }\n"
+            b"}\n",
+            ["Client", "send"],
+            ["initialize", "call", "helper"],
             ["Client"],
         ),
     ],

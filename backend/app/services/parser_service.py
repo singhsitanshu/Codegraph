@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import tree_sitter_go
+import tree_sitter_java
 import tree_sitter_javascript
 import tree_sitter_python
 import tree_sitter_typescript
@@ -20,6 +21,7 @@ SUPPORTED_EXTENSIONS = {
     ".ts": "typescript",
     ".tsx": "tsx",
     ".go": "go",
+    ".java": "java",
 }
 
 
@@ -126,6 +128,26 @@ GO_CLASS_DEFINITIONS_QUERY = """
   type: [(struct_type) (interface_type)])
 """
 
+JAVA_FUNCTION_DEFINITIONS_QUERY = """
+(method_declaration
+  name: (identifier) @name
+  body: (block))
+
+(constructor_declaration
+  name: (identifier) @name
+  body: (constructor_body))
+"""
+
+JAVA_FUNCTION_CALLS_QUERY = """
+(method_invocation
+  name: (identifier) @call)
+"""
+
+JAVA_CLASS_DEFINITIONS_QUERY = """
+(class_declaration
+  name: (identifier) @name)
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class _LanguageQueries:
@@ -147,7 +169,7 @@ class ParsedFileProgress:
 
 
 class CodeParser:
-    """Normalize Python, JavaScript, TypeScript, TSX, and Go source graphs.
+    """Normalize Python, JavaScript, TypeScript, TSX, Go, and Java graphs.
 
     Grammar packages are loaded from their precompiled Python wheels. No grammar
     compilation, C toolchain, or legacy ``Language.build_library`` call is used.
@@ -170,6 +192,9 @@ class CodeParser:
     GO_FUNCTION_DEFINITIONS_QUERY = GO_FUNCTION_DEFINITIONS_QUERY
     GO_FUNCTION_CALLS_QUERY = GO_FUNCTION_CALLS_QUERY
     GO_CLASS_DEFINITIONS_QUERY = GO_CLASS_DEFINITIONS_QUERY
+    JAVA_FUNCTION_DEFINITIONS_QUERY = JAVA_FUNCTION_DEFINITIONS_QUERY
+    JAVA_FUNCTION_CALLS_QUERY = JAVA_FUNCTION_CALLS_QUERY
+    JAVA_CLASS_DEFINITIONS_QUERY = JAVA_CLASS_DEFINITIONS_QUERY
 
     def __init__(self) -> None:
         """Initialize parsers and compile extraction queries for all grammars."""
@@ -181,6 +206,7 @@ class CodeParser:
         )
         tsx_language = Language(tree_sitter_typescript.language_tsx())
         go_language = Language(tree_sitter_go.language())
+        java_language = Language(tree_sitter_java.language())
 
         self._languages: dict[str, Language] = {
             ".py": python_language,
@@ -189,12 +215,14 @@ class CodeParser:
             ".ts": typescript_language,
             ".tsx": tsx_language,
             ".go": go_language,
+            ".java": java_language,
         }
         self.python_parser = Parser(python_language)
         self.javascript_parser = Parser(javascript_language)
         self.typescript_parser = Parser(typescript_language)
         self.tsx_parser = Parser(tsx_language)
         self.go_parser = Parser(go_language)
+        self.java_parser = Parser(java_language)
         self._parsers: dict[str, Parser] = {
             ".py": self.python_parser,
             ".js": self.javascript_parser,
@@ -202,6 +230,7 @@ class CodeParser:
             ".ts": self.typescript_parser,
             ".tsx": self.tsx_parser,
             ".go": self.go_parser,
+            ".java": self.java_parser,
         }
         language_locks = {
             language_name: asyncio.Lock()
@@ -218,6 +247,7 @@ class CodeParser:
             ".ts": self._compile_typescript_queries(typescript_language),
             ".tsx": self._compile_typescript_queries(tsx_language),
             ".go": self._compile_go_queries(go_language),
+            ".java": self._compile_java_queries(java_language),
         }
 
     @staticmethod
@@ -270,6 +300,18 @@ class CodeParser:
             ),
             function_calls=Query(language, GO_FUNCTION_CALLS_QUERY),
             class_definitions=Query(language, GO_CLASS_DEFINITIONS_QUERY),
+        )
+
+    @staticmethod
+    def _compile_java_queries(language: Language) -> _LanguageQueries:
+        """Compile Java method, constructor, invocation, and class queries."""
+
+        return _LanguageQueries(
+            function_definitions=Query(
+                language, JAVA_FUNCTION_DEFINITIONS_QUERY
+            ),
+            function_calls=Query(language, JAVA_FUNCTION_CALLS_QUERY),
+            class_definitions=Query(language, JAVA_CLASS_DEFINITIONS_QUERY),
         )
 
     @classmethod

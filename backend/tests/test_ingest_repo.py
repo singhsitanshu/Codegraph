@@ -38,6 +38,7 @@ def test_repository_discovery_includes_every_supported_language(
         "types.ts",
         "view.tsx",
         "server.go",
+        "Client.java",
     }
     for file_name in [*supported_names, "README.md"]:
         (tmp_path / file_name).write_text("", encoding="utf-8")

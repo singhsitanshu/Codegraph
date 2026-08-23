@@ -12,5 +12,6 @@ pytest
 tree-sitter
 tree-sitter-go
 tree-sitter-javascript
+tree-sitter-java
 tree-sitter-python
 tree-sitter-typescript
