@@ -3,6 +3,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import tree_sitter_go
 import tree_sitter_java
@@ -10,6 +11,8 @@ import tree_sitter_javascript
 import tree_sitter_python
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
+
+from app.utils.tokens import count_tokens
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +30,7 @@ SUPPORTED_EXTENSIONS = {
 
 PYTHON_FUNCTION_DEFINITIONS_QUERY = """
 (function_definition
-  name: (identifier) @name)
+  name: (identifier) @name) @definition
 """
 
 PYTHON_FUNCTION_CALLS_QUERY = """
@@ -46,17 +49,17 @@ PYTHON_CLASS_DEFINITIONS_QUERY = """
 
 JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY = """
 (function_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @definition
 
 (generator_function_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @definition
 
 (method_definition
-  name: (property_identifier) @name)
+  name: (property_identifier) @name) @definition
 
 (variable_declarator
   name: (identifier) @name
-  value: [(arrow_function) (function_expression)])
+  value: [(arrow_function) (function_expression)]) @definition
 """
 
 JAVASCRIPT_FUNCTION_CALLS_QUERY = """
@@ -75,17 +78,17 @@ JAVASCRIPT_CLASS_DEFINITIONS_QUERY = """
 
 TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY = """
 (function_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @definition
 
 (generator_function_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @definition
 
 (method_definition
-  name: (property_identifier) @name)
+  name: (property_identifier) @name) @definition
 
 (variable_declarator
   name: (identifier) @name
-  value: [(arrow_function) (function_expression)])
+  value: [(arrow_function) (function_expression)]) @definition
 """
 
 TYPESCRIPT_FUNCTION_CALLS_QUERY = """
@@ -107,10 +110,10 @@ TYPESCRIPT_CLASS_DEFINITIONS_QUERY = """
 
 GO_FUNCTION_DEFINITIONS_QUERY = """
 (function_declaration
-  name: (identifier) @name)
+  name: (identifier) @name) @definition
 
 (method_declaration
-  name: (field_identifier) @name)
+  name: (field_identifier) @name) @definition
 """
 
 GO_FUNCTION_CALLS_QUERY = """
@@ -131,11 +134,11 @@ GO_CLASS_DEFINITIONS_QUERY = """
 JAVA_FUNCTION_DEFINITIONS_QUERY = """
 (method_declaration
   name: (identifier) @name
-  body: (block))
+  body: (block)) @definition
 
 (constructor_declaration
   name: (identifier) @name
-  body: (constructor_body))
+  body: (constructor_body)) @definition
 """
 
 JAVA_FUNCTION_CALLS_QUERY = """
@@ -165,7 +168,8 @@ class ParsedFileProgress:
     index: int
     processed: int
     total: int
-    result: dict[str, str | list[str]] | None
+    result: dict[str, Any] | None
+    source_tokens: int = 0
 
 
 class CodeParser:
@@ -362,12 +366,43 @@ class CodeParser:
             for node in nodes
         ]
 
+    @staticmethod
+    def _capture_function_records(
+        query: Query,
+        root_node: Node,
+        source_code: bytes,
+    ) -> list[dict[str, str]]:
+        """Pair each function name with its exact Tree-sitter source span."""
+
+        records: list[tuple[int, dict[str, str]]] = []
+        for _, captures in QueryCursor(query).matches(root_node):
+            name_nodes = captures.get("name", [])
+            definition_nodes = captures.get("definition", [])
+            if len(name_nodes) != 1 or len(definition_nodes) != 1:
+                continue
+            name_node = name_nodes[0]
+            definition_node = definition_nodes[0]
+            name = source_code[
+                name_node.start_byte : name_node.end_byte
+            ].decode("utf-8", errors="replace")
+            raw_code = source_code[
+                definition_node.start_byte : definition_node.end_byte
+            ].decode("utf-8", errors="replace")
+            records.append(
+                (
+                    definition_node.start_byte,
+                    {"name": name, "raw_code": raw_code},
+                )
+            )
+        records.sort(key=lambda item: item[0])
+        return [record for _, record in records]
+
     def _parse_source(
         self,
         file_path: str,
         extension: str,
         source_code: bytes,
-    ) -> dict[str, str | list[str]]:
+    ) -> dict[str, Any]:
         """Synchronously parse and query source code in a worker thread."""
 
         parser = self.get_parser(extension)
@@ -378,6 +413,12 @@ class CodeParser:
         if root_node.has_error:
             logger.warning("Tree-sitter found syntax errors while parsing %s", file_path)
 
+        functions = self._capture_function_records(
+            queries.function_definitions,
+            root_node,
+            source_code,
+        )
+
         return {
             "file_path": file_path,
             "defined_classes": self._capture_text(
@@ -386,12 +427,8 @@ class CodeParser:
                 root_node,
                 source_code,
             ),
-            "defined_functions": self._capture_text(
-                queries.function_definitions,
-                "name",
-                root_node,
-                source_code,
-            ),
+            "defined_functions": [function["name"] for function in functions],
+            "functions": functions,
             "outgoing_calls": self._capture_text(
                 queries.function_calls,
                 "call",
@@ -404,7 +441,7 @@ class CodeParser:
         self,
         file_path: str,
         source_code: bytes,
-    ) -> dict[str, str | list[str]]:
+    ) -> dict[str, Any]:
         """Extract classes, functions, and outgoing calls from one source file.
 
         Parsing is CPU-bound and therefore runs in a worker thread so callers do
@@ -418,7 +455,8 @@ class CodeParser:
 
         Returns:
             A dictionary containing ``file_path``, ``defined_classes``,
-            ``defined_functions``, and ``outgoing_calls``.
+            ``defined_functions``, structured ``functions`` with raw code, and
+            ``outgoing_calls``.
 
         Raises:
             TypeError: If ``source_code`` is not bytes.
@@ -459,13 +497,20 @@ async def parse_changed_files_with_progress(
     async def parse_path(
         index: int,
         file_path: str,
-    ) -> tuple[int, dict[str, str | list[str]] | None]:
+    ) -> tuple[int, dict[str, Any] | None, int]:
         path = Path(file_path)
+        source_tokens = 0
         try:
             async with file_read_slots:
                 source_code = await asyncio.to_thread(path.read_bytes)
+                source_text = source_code.decode("utf-8", errors="replace")
+                source_tokens = await asyncio.to_thread(
+                    count_tokens,
+                    source_text,
+                )
                 result = await code_parser.parse_file(file_path, source_code)
-            return index, result
+            result["source_tokens"] = source_tokens
+            return index, result, source_tokens
         except FileNotFoundError:
             logger.info("Skipping missing or deleted source file: %s", file_path)
         except UnicodeDecodeError as exc:
@@ -481,7 +526,7 @@ async def parse_changed_files_with_progress(
                 exc,
                 exc_info=True,
             )
-        return index, None
+        return index, None, source_tokens
 
     tasks = [
         asyncio.create_task(parse_path(index, file_path))
@@ -492,12 +537,13 @@ async def parse_changed_files_with_progress(
             asyncio.as_completed(tasks),
             start=1,
         ):
-            index, result = await completed_task
+            index, result, source_tokens = await completed_task
             yield ParsedFileProgress(
                 index=index,
                 processed=processed,
                 total=total,
                 result=result,
+                source_tokens=source_tokens,
             )
     finally:
         for task in tasks:
@@ -508,10 +554,10 @@ async def parse_changed_files_with_progress(
 
 async def parse_changed_files(
     file_paths: list[str],
-) -> list[dict[str, str | list[str]]]:
+) -> list[dict[str, Any]]:
     """Parse source files and return successful results in input order."""
 
-    parsed_files: list[dict[str, str | list[str]] | None] = [
+    parsed_files: list[dict[str, Any] | None] = [
         None for _ in file_paths
     ]
     async for progress in parse_changed_files_with_progress(file_paths):

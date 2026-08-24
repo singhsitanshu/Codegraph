@@ -40,6 +40,28 @@ procedures. Recreate the Neo4j service once after pulling this change:
 docker compose up -d --force-recreate neo4j
 ```
 
+## Graph-RAG token efficiency
+
+Full repository ingestion counts every supported source file with the
+`gpt-4o` tiktoken encoding and stores the baseline on the repository's scoped
+`Repository` node. Chat requests count the Neo4j tool outputs actually added
+to the LangGraph trace and return the comparison alongside the answer:
+
+```json
+{
+  "response": "...",
+  "metrics": {
+    "full_repo_tokens": 150000,
+    "context_tokens": 4200,
+    "tokens_saved": 145800,
+    "efficiency_percentage": 97.2
+  }
+}
+```
+
+Re-ingest repositories created before this feature to populate their token
+baseline. Until then, their full-repository metric is reported as zero.
+
 ## Legacy unscoped Neo4j data
 
 Nodes created before repository scoping cannot be assigned safely because they

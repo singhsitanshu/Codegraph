@@ -72,6 +72,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
             processed=1,
             total=1,
             result=parsed_data[0],
+            source_tokens=23,
         )
 
     async def save_with_progress(*args, **kwargs):
@@ -131,11 +132,16 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         "status": "Repository ingestion complete.",
         "progress": 100,
         "repo_name": "psf/requests",
+        "total_repo_tokens": 23,
     }
     assert save_calls == [
         (
             (parsed_data,),
-            {"repo_name": "psf/requests", "replace_existing": True},
+            {
+                "repo_name": "psf/requests",
+                "replace_existing": True,
+                "total_repo_tokens": 23,
+            },
         )
     ]
     assert parsed_data[0]["file_path"] == "src/example.py"

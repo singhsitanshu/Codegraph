@@ -18,8 +18,8 @@ from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 from pydantic import BaseModel, Field, field_validator
 
 from app.api import webhooks
-from app.agent.graph import ask_code_agent
-from app.db import close_neo4j_driver, fetch_graph_data
+from app.agent.graph import ask_code_agent_with_metrics
+from app.db import close_neo4j_driver, fetch_graph_data, fetch_node_code
 from app.db.graph_ops import (
     delete_all_repository_graphs,
     delete_repository_graph,
@@ -238,6 +238,59 @@ async def get_graph(
         ) from exc
 
 
+@app.get("/api/node/{node_id}/code", tags=["graph"])
+async def get_node_code(
+    node_id: str,
+    repo_name: str,
+) -> dict[str, str]:
+    """Return one repository-scoped function's source code on demand."""
+
+    normalized_node_id = node_id.strip()
+    if not normalized_node_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="node_id must not be blank",
+        )
+    try:
+        normalized_repo_name = _normalize_repo_identifier(repo_name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        source = await fetch_node_code(
+            normalized_node_id,
+            normalized_repo_name,
+        )
+    except AuthError as exc:
+        logger.warning("Neo4j rejected the node source query credentials")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Neo4j authentication failed; check backend/.env credentials",
+        ) from exc
+    except ServiceUnavailable as exc:
+        logger.warning("Neo4j is unavailable during node source lookup")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Neo4j is unavailable",
+        ) from exc
+    except Neo4jError as exc:
+        logger.exception("Neo4j node source query failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Neo4j node source query failed",
+        ) from exc
+
+    if source is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Source code was not found for this function",
+        )
+    return source
+
+
 async def _delete_repository_scope(normalized_repo_name: str) -> dict[str, str]:
     """Delete one validated scope and map Neo4j failures to API errors."""
 
@@ -287,18 +340,24 @@ async def delete_repository(repo_name: str) -> dict[str, str]:
 
 
 @app.post("/api/chat", tags=["chat"])
-async def chat(request: ChatRequest) -> dict[str, str]:
+async def chat(request: ChatRequest) -> dict[str, Any]:
     """Answer a code-graph question with the LangGraph Claude agent."""
 
     try:
-        ai_response = await ask_code_agent(request.message, request.repo_name)
+        agent_result = await ask_code_agent_with_metrics(
+            request.message,
+            request.repo_name,
+        )
     except Exception as exc:
         logger.exception("Code agent request failed")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="The code agent could not complete the request",
         ) from exc
-    return {"response": ai_response}
+    return {
+        "response": agent_result["answer"],
+        "metrics": agent_result["metrics"],
+    }
 
 
 def _ndjson_record(**payload: object) -> str:
@@ -316,6 +375,7 @@ async def _stream_repository_ingestion(
     canonical_repo_name = f"{owner}/{repository}"
     extracted_root: str | None = None
     current_progress = 0
+    total_repo_tokens = 0
     try:
         current_progress = 10
         yield _ndjson_record(
@@ -341,6 +401,7 @@ async def _stream_repository_ingestion(
             async for file_progress in parse_changed_files_with_progress(
                 source_files
             ):
+                total_repo_tokens += file_progress.source_tokens
                 if file_progress.result is not None:
                     parsed_data_by_index[file_progress.index] = file_progress.result
                 current_progress = 20 + int(
@@ -366,6 +427,11 @@ async def _stream_repository_ingestion(
             if parsed_file is not None
         ]
         _use_repository_relative_paths(parsed_data, extracted_root)
+        logger.info(
+            "Full repository token baseline for %s: %d",
+            canonical_repo_name,
+            total_repo_tokens,
+        )
 
         current_progress = 85
         yield _ndjson_record(
@@ -376,6 +442,7 @@ async def _stream_repository_ingestion(
             parsed_data,
             repo_name=canonical_repo_name,
             replace_existing=True,
+            total_repo_tokens=total_repo_tokens,
         ):
             current_progress = database_progress.progress
             yield _ndjson_record(
@@ -387,6 +454,7 @@ async def _stream_repository_ingestion(
             status="Repository ingestion complete.",
             progress=100,
             repo_name=canonical_repo_name,
+            total_repo_tokens=total_repo_tokens,
         )
     except httpx.HTTPStatusError as exc:
         response_status = exc.response.status_code

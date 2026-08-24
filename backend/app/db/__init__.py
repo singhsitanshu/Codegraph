@@ -31,6 +31,21 @@ RETURN n,
 LIMIT 200
 """
 
+NODE_CODE_QUERY = """
+MATCH (function:Function {repo_name: $repo_name})
+WHERE elementId(function) = $node_id
+RETURN function.raw_code AS code,
+       function.file_path AS file_path,
+       function.name AS name
+LIMIT 1
+"""
+
+REPOSITORY_TOKEN_QUERY = """
+MATCH (repository:Repository {repo_name: $repo_name})
+RETURN coalesce(repository.total_tokens, 0) AS total_tokens
+LIMIT 1
+"""
+
 _driver: AsyncDriver | None = None
 
 
@@ -80,6 +95,7 @@ def _serialize_node(
     node_id = node.element_id
     labels = sorted(node.labels)
     properties = _json_value(dict(node))
+    properties.pop("raw_code", None)
     label = (
         properties.get("qualified_name")
         or properties.get("name")
@@ -191,3 +207,40 @@ async def fetch_graph_data(repo_name: str) -> dict[str, list[dict[str, Any]]]:
         }
 
     return {"nodes": serialized_nodes, "edges": list(edges.values())}
+
+
+async def fetch_node_code(
+    node_id: str,
+    repo_name: str,
+) -> dict[str, str] | None:
+    """Fetch one function's source without adding it to the graph payload."""
+
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(
+            NODE_CODE_QUERY,
+            node_id=node_id,
+            repo_name=repo_name,
+        )
+        record = await result.single()
+    if record is None:
+        return None
+    return {
+        "code": record["code"] or "",
+        "file_path": record["file_path"] or "",
+        "name": record["name"] or "",
+    }
+
+
+async def fetch_repository_total_tokens(repo_name: str) -> int:
+    """Return the stored full-source token count for one repository."""
+
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(
+            REPOSITORY_TOKEN_QUERY,
+            repo_name=repo_name,
+        )
+        record = await result.single()
+    if record is None:
+        return 0
+    total_tokens = record["total_tokens"]
+    return total_tokens if isinstance(total_tokens, int) else int(total_tokens)

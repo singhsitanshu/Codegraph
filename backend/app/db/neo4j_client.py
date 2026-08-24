@@ -18,6 +18,8 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 DATABASE_INDEX_QUERIES = (
+    "CREATE INDEX repository_repo_name IF NOT EXISTS "
+    "FOR (r:Repository) ON (r.repo_name)",
     "CREATE INDEX file_repo_path IF NOT EXISTS "
     "FOR (f:File) ON (f.repo_name, f.path)",
     "CREATE INDEX func_repo_name IF NOT EXISTS "

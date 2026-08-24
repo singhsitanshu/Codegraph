@@ -14,6 +14,14 @@ from app.services.parser_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def deterministic_token_counter():
+    """Keep parser tests offline while verifying token totals are propagated."""
+
+    with patch("app.services.parser_service.count_tokens", return_value=17):
+        yield
+
+
 def test_supported_extension_mapping_covers_all_requested_languages() -> None:
     assert SUPPORTED_EXTENSIONS == {
         ".py": "python",
@@ -109,12 +117,38 @@ def test_code_parser_normalizes_supported_languages(
 
     result = asyncio.run(parse())
 
-    assert result == {
-        "file_path": file_path,
-        "defined_classes": classes,
-        "defined_functions": functions,
-        "outgoing_calls": calls,
-    }
+    assert result["file_path"] == file_path
+    assert result["defined_classes"] == classes
+    assert result["defined_functions"] == functions
+    assert result["outgoing_calls"] == calls
+    assert [function["name"] for function in result["functions"]] == functions
+    assert result.get("source_tokens") is None
+    assert all(
+        function["name"] in function["raw_code"]
+        for function in result["functions"]
+    )
+
+
+def test_code_parser_extracts_exact_function_source() -> None:
+    source = (
+        b"def first(value):\n"
+        b"    return value + 1\n\n"
+        b"def second():\n"
+        b"    return first(2)\n"
+    )
+
+    result = asyncio.run(CodeParser().parse_file("module.py", source))
+
+    assert result["functions"] == [
+        {
+            "name": "first",
+            "raw_code": "def first(value):\n    return value + 1",
+        },
+        {
+            "name": "second",
+            "raw_code": "def second():\n    return first(2)",
+        },
+    ]
 
 
 @pytest.mark.parametrize(
@@ -158,6 +192,44 @@ def test_parse_changed_files_skips_one_parser_failure(
     assert results == [good_result]
 
 
+def test_failed_parse_still_contributes_to_repository_token_baseline(
+    tmp_path: Path,
+) -> None:
+    good_file = tmp_path / "good.py"
+    bad_file = tmp_path / "bad.py"
+    good_file.write_bytes(b"def good():\n    return 1\n")
+    bad_file.write_bytes(b"def bad():\n    return 2\n")
+
+    async def parse_file(
+        _parser: CodeParser,
+        file_path: str,
+        _source_code: bytes,
+    ) -> dict[str, object]:
+        if file_path == str(bad_file):
+            raise RuntimeError("Tree-sitter failure")
+        return {
+            "file_path": file_path,
+            "defined_classes": [],
+            "defined_functions": ["good"],
+            "functions": [],
+            "outgoing_calls": [],
+        }
+
+    async def collect_progress():
+        return [
+            update
+            async for update in parse_changed_files_with_progress(
+                [str(good_file), str(bad_file)]
+            )
+        ]
+
+    with patch.object(CodeParser, "parse_file", new=parse_file):
+        updates = asyncio.run(collect_progress())
+
+    assert sum(update.source_tokens for update in updates) == 34
+    assert sum(update.result is not None for update in updates) == 1
+
+
 def test_parse_changed_files_skips_unreadable_file(tmp_path: Path) -> None:
     """A file read failure must not abort parsing of readable neighbors."""
 
@@ -194,3 +266,6 @@ def test_parse_progress_advances_for_every_file(tmp_path: Path) -> None:
     assert [update.processed for update in updates] == [1, 2]
     assert all(update.total == 2 for update in updates)
     assert sum(update.result is not None for update in updates) == 1
+    assert sum(update.source_tokens for update in updates) == 17
+    successful_update = next(update for update in updates if update.result)
+    assert successful_update.result["source_tokens"] == 17

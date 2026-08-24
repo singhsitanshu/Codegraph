@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent.graph import (
@@ -14,7 +15,9 @@ from app.agent.graph import (
     OUTGOING_DEPENDENCIES_QUERY,
     SEMANTIC_CODE_SEARCH_QUERY,
     _get_code_agent,
+    _tool_context_text,
     analyze_architectural_subsystems,
+    ask_code_agent_with_metrics,
     list_external_dependencies,
     list_codebase_structure,
     list_functions_in_file,
@@ -273,3 +276,50 @@ def test_code_agent_registers_all_repository_tools() -> None:
         "analyze_architectural_subsystems",
     ]
     _get_code_agent.cache_clear()
+
+
+def test_tool_context_includes_only_context_sent_by_graph_tools() -> None:
+    messages = [
+        SimpleNamespace(type="human", content="question"),
+        SimpleNamespace(type="tool", content="first graph result"),
+        SimpleNamespace(type="ai", content="planning"),
+        SimpleNamespace(type="tool", content={"community": 4}),
+    ]
+
+    assert _tool_context_text(messages) == (
+        'first graph result\n{"community": 4}'
+    )
+
+
+def test_code_agent_reports_graph_context_efficiency() -> None:
+    messages = [SimpleNamespace(type="tool", content="scoped context")]
+
+    with (
+        patch(
+            "app.agent.graph._run_code_agent",
+            new=AsyncMock(return_value=("Structured answer", messages)),
+        ),
+        patch(
+            "app.agent.graph.fetch_repository_total_tokens",
+            new=AsyncMock(return_value=1_000),
+        ) as fetch_total,
+        patch("app.agent.graph.count_tokens", return_value=125) as count,
+    ):
+        result = asyncio.run(
+            ask_code_agent_with_metrics(
+                "Explain the architecture",
+                " owner/repository ",
+            )
+        )
+
+    assert result == {
+        "answer": "Structured answer",
+        "metrics": {
+            "full_repo_tokens": 1_000,
+            "context_tokens": 125,
+            "tokens_saved": 875,
+            "efficiency_percentage": 87.5,
+        },
+    }
+    count.assert_called_once_with("scoped context")
+    fetch_total.assert_awaited_once_with("owner/repository")

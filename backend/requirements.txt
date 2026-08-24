@@ -9,6 +9,7 @@ langgraph
 neo4j
 openai
 pytest
+tiktoken
 tree-sitter
 tree-sitter-go
 tree-sitter-javascript

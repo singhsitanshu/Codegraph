@@ -8,6 +8,7 @@ from app.db import get_neo4j_driver
 from app.db.gds_ops import run_leiden_clustering
 from app.services.community_summarizer import label_and_store_communities
 from app.services.embedding_service import generate_embeddings
+from app.utils.tokens import DEFAULT_TOKEN_MODEL
 
 
 DEFAULT_BATCH_SIZE = 100
@@ -15,7 +16,7 @@ BatchItem = TypeVar("BatchItem")
 
 DELETE_REPOSITORY_QUERY = """
 MATCH (node)
-WHERE (node:File OR node:Function OR node:Community)
+WHERE (node:Repository OR node:File OR node:Function OR node:Community)
   AND node.repo_name = $repo_name
 DETACH DELETE node
 """
@@ -33,8 +34,19 @@ DETACH DELETE n
 
 MERGE_FILES_QUERY = """
 UNWIND $batch AS file
+MERGE (repository:Repository {repo_name: $repo_name})
+ON CREATE SET repository.name = $repo_name
 MERGE (f:File {path: file.path, repo_name: $repo_name})
 SET f.updated_at = datetime()
+MERGE (repository)-[:CONTAINS]->(f)
+"""
+
+MERGE_REPOSITORY_TOKENS_QUERY = """
+MERGE (repository:Repository {repo_name: $repo_name})
+SET repository.name = $repo_name,
+    repository.total_tokens = $total_tokens,
+    repository.tokenizer_model = $tokenizer_model,
+    repository.tokens_updated_at = datetime()
 """
 
 MERGE_FUNCTIONS_QUERY = """
@@ -44,6 +56,7 @@ MERGE (fn:Function {name: func.name, repo_name: $repo_name})
 REMOVE fn:ExternalFunction
 SET fn.file = coalesce(fn.file, func.file_path),
     fn.file_path = func.file_path,
+    fn.raw_code = func.raw_code,
     fn.embedding = func.embedding,
     fn.external = false,
     fn.is_external = false
@@ -127,16 +140,48 @@ def _extract_etl_records(
             seen_files.add(file_path)
             files.append({"path": file_path})
 
-        defined_functions = _string_list(
+        function_records: list[dict[str, str]] = []
+        seen_function_names: set[str] = set()
+        parsed_functions = parsed_file.get("functions")
+        if isinstance(parsed_functions, list):
+            for parsed_function in parsed_functions:
+                if not isinstance(parsed_function, dict):
+                    continue
+                function_name = parsed_function.get("name")
+                raw_code = parsed_function.get("raw_code")
+                if (
+                    not isinstance(function_name, str)
+                    or not function_name
+                    or function_name in seen_function_names
+                ):
+                    continue
+                seen_function_names.add(function_name)
+                function_records.append(
+                    {
+                        "name": function_name,
+                        "raw_code": raw_code if isinstance(raw_code, str) else "",
+                    }
+                )
+        for function_name in _string_list(
             parsed_file.get("defined_functions")
-        )
+        ):
+            if function_name in seen_function_names:
+                continue
+            seen_function_names.add(function_name)
+            function_records.append({"name": function_name, "raw_code": ""})
+
         outgoing_calls = _string_list(parsed_file.get("outgoing_calls"))
-        for function_name in defined_functions:
+        for function_record in function_records:
+            function_name = function_record["name"]
             function_key = (file_path, function_name)
             if function_key not in seen_functions:
                 seen_functions.add(function_key)
                 functions.append(
-                    {"name": function_name, "file_path": file_path}
+                    {
+                        "name": function_name,
+                        "file_path": file_path,
+                        "raw_code": function_record["raw_code"],
+                    }
                 )
 
             for target_name in outgoing_calls:
@@ -164,11 +209,33 @@ def _function_embedding_text(function: dict[str, str]) -> str:
     )
 
 
+def _resolve_total_repo_tokens(
+    parsed_data_list: list[dict[str, Any]],
+    total_repo_tokens: int | None,
+) -> int | None:
+    """Resolve an explicit full-repository total or parsed-file totals."""
+
+    if total_repo_tokens is not None:
+        if total_repo_tokens < 0:
+            raise ValueError("total_repo_tokens must not be negative")
+        return total_repo_tokens
+
+    parsed_token_counts = [
+        value
+        for parsed_file in parsed_data_list
+        if isinstance((value := parsed_file.get("source_tokens")), int)
+        and not isinstance(value, bool)
+        and value >= 0
+    ]
+    return sum(parsed_token_counts) if parsed_token_counts else None
+
+
 async def save_parsed_ast_to_neo4j_with_progress(
     parsed_data_list: list[dict[str, Any]],
     repo_name: str,
     replace_existing: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    total_repo_tokens: int | None = None,
 ) -> AsyncIterator[DatabaseWriteProgress]:
     """Persist one repository through bounded file, function, and call passes."""
 
@@ -179,11 +246,16 @@ async def save_parsed_ast_to_neo4j_with_progress(
         raise ValueError("batch_size must be greater than zero")
 
     files, functions, calls = _extract_etl_records(parsed_data_list)
+    resolved_total_tokens = _resolve_total_repo_tokens(
+        parsed_data_list,
+        total_repo_tokens,
+    )
 
     async with get_neo4j_driver().session() as session:
         async def run_transaction(
             query: str,
             batch: list[dict[str, Any]] | None = None,
+            extra_parameters: dict[str, Any] | None = None,
         ) -> None:
             async def execute(transaction: Any) -> None:
                 parameters: dict[str, Any] = {
@@ -191,6 +263,8 @@ async def save_parsed_ast_to_neo4j_with_progress(
                 }
                 if batch is not None:
                     parameters["batch"] = batch
+                if extra_parameters is not None:
+                    parameters.update(extra_parameters)
                 result = await transaction.run(query, **parameters)
                 await result.consume()
 
@@ -198,6 +272,15 @@ async def save_parsed_ast_to_neo4j_with_progress(
 
         if replace_existing:
             await run_transaction(DELETE_REPOSITORY_QUERY)
+
+        if resolved_total_tokens is not None:
+            await run_transaction(
+                MERGE_REPOSITORY_TOKENS_QUERY,
+                extra_parameters={
+                    "total_tokens": resolved_total_tokens,
+                    "tokenizer_model": DEFAULT_TOKEN_MODEL,
+                },
+            )
 
         yield DatabaseWriteProgress("Pass 1: Creating Files...", 86)
         for batch in chunk_data(files, batch_size):
@@ -240,6 +323,7 @@ async def save_parsed_ast_to_neo4j(
     parsed_data_list: list[dict[str, Any]],
     repo_name: str,
     replace_existing: bool = False,
+    total_repo_tokens: int | None = None,
 ) -> None:
     """Persist parsed AST data while discarding optional progress updates."""
 
@@ -247,6 +331,7 @@ async def save_parsed_ast_to_neo4j(
         parsed_data_list,
         repo_name,
         replace_existing=replace_existing,
+        total_repo_tokens=total_repo_tokens,
     ):
         pass
 

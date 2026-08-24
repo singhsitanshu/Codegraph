@@ -28,6 +28,7 @@ import {
   ingestRepository,
   requestChat,
 } from "./api.js";
+import CodePanel from "./components/CodePanel.tsx";
 import GraphLegend from "./components/GraphLegend.tsx";
 import { getCommunityColor } from "./utils/colors.js";
 import {
@@ -135,7 +136,7 @@ const GraphNode = memo(function GraphNode({ data }) {
 
   return (
     <div
-      className={`relative flex h-full w-full items-center gap-2.5 rounded-xl border px-3 py-2 transition-[border-color,box-shadow] duration-150 ${borderClass} ${surfaceClass}`}
+      className={`relative flex h-full w-full cursor-pointer items-center gap-2.5 rounded-xl border px-3 py-2 transition-[border-color,box-shadow] duration-150 ${borderClass} ${surfaceClass}`}
       style={
         communityColor
           ? {
@@ -530,6 +531,7 @@ function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [focusedNodeId, setFocusedNodeId] = useState(null);
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [initialCenter, setInitialCenter] = useState(null);
   const [flowReady, setFlowReady] = useState(false);
   const [graphStatus, setGraphStatus] = useState("idle");
@@ -740,6 +742,13 @@ function App() {
     setActiveClusters(new Set());
   }, []);
 
+  const closeCodePanel = useCallback(() => setSelectedNodeId(null), []);
+  const openFunctionCode = useCallback((_event, node) => {
+    if (node.data?.nodeType === "Function") {
+      setSelectedNodeId(node.id);
+    }
+  }, []);
+
   const loadGraph = useCallback(async (repoName) => {
     if (!repoName) {
       setNodes([]);
@@ -788,6 +797,10 @@ function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    setSelectedNodeId(null);
+  }, [activeRepo]);
 
   useEffect(() => {
     const handleUnload = () => {
@@ -1330,6 +1343,7 @@ function App() {
                 }}
                 onNodeMouseEnter={(_, node) => setFocusedNodeId(node.id)}
                 onNodeMouseLeave={() => setFocusedNodeId(null)}
+                onNodeClick={openFunctionCode}
                 defaultViewport={{ x: 0, y: 0, zoom: INITIAL_ZOOM }}
                 minZoom={0.15}
                 maxZoom={1.8}
@@ -1364,6 +1378,11 @@ function App() {
           </div>
         </section>
       </div>
+      <CodePanel
+        nodeId={selectedNodeId}
+        repoName={activeRepo}
+        onClose={closeCodePanel}
+      />
     </main>
   );
 }

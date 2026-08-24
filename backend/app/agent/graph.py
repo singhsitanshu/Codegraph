@@ -1,6 +1,7 @@
 """LangGraph ReAct agent for code-graph questions."""
 
 import json
+import logging
 from functools import lru_cache
 from typing import Any
 
@@ -9,8 +10,12 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
 from app.config import settings
-from app.db import get_neo4j_driver
+from app.db import fetch_repository_total_tokens, get_neo4j_driver
 from app.services.embedding_service import generate_embedding
+from app.utils.tokens import count_tokens
+
+
+logger = logging.getLogger(__name__)
 
 
 CALLERS_QUERY = """
@@ -361,8 +366,26 @@ def _message_text(content: object) -> str:
     return ""
 
 
-async def ask_code_agent(user_message: str, repo_name: str) -> str:
-    """Ask the code-graph agent a repository-scoped code question."""
+def _tool_context_text(messages: list[Any]) -> str:
+    """Join the graph tool outputs that were actually supplied to the LLM."""
+
+    context_parts: list[str] = []
+    for message in messages:
+        if getattr(message, "type", None) != "tool":
+            continue
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            context_parts.append(content)
+        elif content is not None:
+            context_parts.append(json.dumps(content, default=str))
+    return "\n".join(context_parts)
+
+
+async def _run_code_agent(
+    user_message: str,
+    repo_name: str,
+) -> tuple[str, list[Any]]:
+    """Run the repository-scoped agent and return its answer and trace."""
 
     normalized_repo_name = repo_name.strip()
     if not normalized_repo_name:
@@ -389,4 +412,56 @@ async def ask_code_agent(user_message: str, repo_name: str) -> str:
     response = _message_text(messages[-1].content)
     if not response:
         raise RuntimeError("The code agent returned an empty response")
+    return response, messages
+
+
+async def ask_code_agent(user_message: str, repo_name: str) -> str:
+    """Ask the code-graph agent a repository-scoped code question."""
+
+    response, _ = await _run_code_agent(user_message, repo_name)
     return response
+
+
+async def ask_code_agent_with_metrics(
+    user_message: str,
+    repo_name: str,
+) -> dict[str, Any]:
+    """Answer a question and report Graph-RAG context token efficiency."""
+
+    normalized_repo_name = repo_name.strip()
+    response, messages = await _run_code_agent(
+        user_message,
+        normalized_repo_name,
+    )
+    graph_context = _tool_context_text(messages)
+    context_tokens = count_tokens(graph_context)
+    total_repo_tokens = await fetch_repository_total_tokens(
+        normalized_repo_name
+    )
+
+    if total_repo_tokens > 0:
+        tokens_saved = total_repo_tokens - context_tokens
+        efficiency_percentage = round(
+            tokens_saved / total_repo_tokens * 100,
+            2,
+        )
+    else:
+        tokens_saved = 0
+        efficiency_percentage = 0.0
+
+    metrics: dict[str, int | float] = {
+        "full_repo_tokens": total_repo_tokens,
+        "context_tokens": context_tokens,
+        "tokens_saved": tokens_saved,
+        "efficiency_percentage": efficiency_percentage,
+    }
+    logger.info(
+        "Graph-RAG efficiency for %s: full_repo_tokens=%d, "
+        "context_tokens=%d, tokens_saved=%d, efficiency_percentage=%.2f",
+        normalized_repo_name,
+        total_repo_tokens,
+        context_tokens,
+        tokens_saved,
+        efficiency_percentage,
+    )
+    return {"answer": response, "metrics": metrics}

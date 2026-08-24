@@ -107,6 +107,31 @@ export async function fetchRepositoryGraph(repoName, fetchImpl = fetch) {
   return response.json();
 }
 
+export async function fetchNodeCode(
+  nodeId,
+  repoName,
+  { signal, fetchImpl = fetch } = {},
+) {
+  const normalizedNodeId = nodeId?.trim();
+  const normalizedRepoName = repoName?.trim();
+  if (!normalizedNodeId || !normalizedRepoName) {
+    throw new Error("A function and repository are required to load source code");
+  }
+
+  const query = new URLSearchParams({ repo_name: normalizedRepoName });
+  const response = await fetchImpl(
+    `${API_BASE}/api/node/${encodeURIComponent(normalizedNodeId)}/code?${query}`,
+    {
+      headers: { Accept: "application/json" },
+      signal,
+    },
+  );
+  if (!response.ok) {
+    throw new Error(await responseError(response, "Source code request failed"));
+  }
+  return response.json();
+}
+
 export async function deleteRepository(repoName, fetchImpl = fetch) {
   const normalizedRepoName = repoName?.trim();
   if (!normalizedRepoName) {

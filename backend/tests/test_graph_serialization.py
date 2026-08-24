@@ -48,3 +48,16 @@ def test_function_serialization_exposes_stored_community_metadata() -> None:
         "Coordinates customer payment workflows."
     )
     assert serialized["data"]["community_name"] == "Payment Processing"
+
+
+def test_function_serialization_omits_raw_code_from_graph_payload() -> None:
+    node = FakeNode(
+        name="process_payment",
+        file_path="services/payment.py",
+        raw_code="def process_payment():\n    return True",
+    )
+
+    serialized = _serialize_node(node)
+
+    assert "raw_code" not in serialized
+    assert "raw_code" not in serialized["data"]

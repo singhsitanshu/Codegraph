@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   cleanupRepositoryOnUnload,
   deleteRepository,
+  fetchNodeCode,
   fetchRepositoryGraph,
   ingestRepository,
   repositoryUrlFromInput,
@@ -103,6 +104,43 @@ test("an unscoped graph stays blank without making a request", async () => {
   });
 
   assert.deepEqual(graph, { nodes: [], edges: [] });
+  assert.equal(called, false);
+});
+
+test("node source lookup encodes its graph ID and repository scope", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse({
+      code: "def send():\n    return True",
+      file_path: "src/session.py",
+      name: "send",
+    });
+  };
+
+  const source = await fetchNodeCode("4:abc:12", "psf/requests", {
+    fetchImpl,
+  });
+
+  assert.equal(source.name, "send");
+  assert.equal(
+    calls[0].url,
+    "http://localhost:8000/api/node/4%3Aabc%3A12/code?repo_name=psf%2Frequests",
+  );
+  assert.equal(calls[0].options.headers.Accept, "application/json");
+});
+
+test("node source lookup requires active graph context", async () => {
+  let called = false;
+
+  await assert.rejects(
+    fetchNodeCode("function-id", "", {
+      fetchImpl: async () => {
+        called = true;
+      },
+    }),
+    /function and repository are required/,
+  );
   assert.equal(called, false);
 });
 
