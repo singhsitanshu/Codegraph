@@ -58,12 +58,12 @@ ORDER BY fn.name
 """
 
 SEMANTIC_CODE_SEARCH_QUERY = """
-CALL db.index.vector.queryNodes(
-    'function_embeddings',
-    $top_k,
-    $query_vector
-)
-YIELD node, score
+MATCH (node:Function)
+  SEARCH node IN (
+    VECTOR INDEX function_embeddings
+    FOR $query_vector
+    LIMIT $top_k
+  ) SCORE AS score
 WHERE node.repo_name = $repo_name
 RETURN node.name AS function_name,
        node.file_path AS file_path,

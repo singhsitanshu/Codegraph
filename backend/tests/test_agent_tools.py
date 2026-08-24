@@ -228,6 +228,10 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
         repo_name="owner/repository",
         top_k=5,
     )
+    assert "SEARCH node IN" in SEMANTIC_CODE_SEARCH_QUERY
+    assert "VECTOR INDEX function_embeddings" in SEMANTIC_CODE_SEARCH_QUERY
+    assert "SCORE AS score" in SEMANTIC_CODE_SEARCH_QUERY
+    assert "db.index.vector.queryNodes" not in SEMANTIC_CODE_SEARCH_QUERY
 
 
 def test_analyze_architectural_subsystems_returns_scoped_communities() -> None:
