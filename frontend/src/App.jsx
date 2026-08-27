@@ -11,6 +11,7 @@ import {
 import {
   Background,
   BackgroundVariant,
+  ControlButton,
   Controls,
   Handle,
   MarkerType,
@@ -19,6 +20,7 @@ import {
   ReactFlow,
   useEdgesState,
   useNodesState,
+  useReactFlow,
 } from "@xyflow/react";
 
 import {
@@ -66,6 +68,16 @@ function Icon({ name, className = "size-4" }) {
         <path d="m8.4 6.2 7.1.6M7.4 8.1l3.3 7.5m5.7-6.5-3.1 6.6" />
       </>
     ),
+    expand: (
+      <>
+        <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
+      </>
+    ),
+    collapse: (
+      <>
+        <path d="M3 8h5V3M21 8h-5V3M3 16h5v5M21 16h-5v5" />
+      </>
+    ),
     refresh: <path d="M20 6v5h-5M4 18v-5h5m9.2-3A7 7 0 0 0 6.1 6.5L4 11m16 2-2.1 4.5A7 7 0 0 1 5.8 14" />,
     stop: <rect x="6" y="6" width="12" height="12" rx="2" />,
   };
@@ -82,6 +94,49 @@ function Icon({ name, className = "size-4" }) {
     >
       {paths[name]}
     </svg>
+  );
+}
+
+function GraphControls({ isGraphMaximized, onToggleGraphMaximized }) {
+  const { fitView } = useReactFlow();
+  const previousMaximizedRef = useRef(isGraphMaximized);
+
+  useEffect(() => {
+    if (previousMaximizedRef.current === isGraphMaximized) {
+      return undefined;
+    }
+    previousMaximizedRef.current = isGraphMaximized;
+
+    const resizeTimer = window.setTimeout(() => {
+      fitView({ duration: 300 });
+    }, 320);
+
+    return () => window.clearTimeout(resizeTimer);
+  }, [fitView, isGraphMaximized]);
+
+  return (
+    <Controls
+      showFitView={false}
+      showInteractive={false}
+      showZoom
+      position="bottom-right"
+    >
+      <ControlButton
+        onClick={onToggleGraphMaximized}
+        title={
+          isGraphMaximized ? "Restore split layout" : "Expand graph layout"
+        }
+        aria-label={
+          isGraphMaximized ? "Restore split layout" : "Expand graph layout"
+        }
+        aria-pressed={isGraphMaximized}
+      >
+        <Icon
+          name={isGraphMaximized ? "collapse" : "expand"}
+          className="size-4"
+        />
+      </ControlButton>
+    </Controls>
   );
 }
 
@@ -550,6 +605,7 @@ function App() {
   const [showClusters, setShowClusters] = useState(false);
   const [activeClusters, setActiveClusters] = useState(() => new Set());
   const [modulesOpen, setModulesOpen] = useState(false);
+  const [isGraphMaximized, setIsGraphMaximized] = useState(false);
   const abortRef = useRef(null);
   const messagesEndRef = useRef(null);
   const flowInstanceRef = useRef(null);
@@ -1007,8 +1063,20 @@ function App() {
 
   return (
     <main className="h-dvh overflow-hidden bg-[#f5f6f1] text-[#20332d]">
-      <div className="grid h-full grid-cols-1 lg:grid-cols-2">
-        <section className="flex min-h-0 flex-col border-b border-[#d9e0da] bg-[#f8f9f5] lg:border-r lg:border-b-0">
+      <div
+        className={`grid h-full grid-cols-1 transition-[grid-template-columns] duration-300 ease-in-out ${
+          isGraphMaximized
+            ? "lg:grid-cols-[0fr_minmax(0,1fr)]"
+            : "lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
+        }`}
+      >
+        <section
+          className={`flex min-h-0 min-w-0 flex-col border-b border-[#d9e0da] bg-[#f8f9f5] transition-opacity duration-200 lg:border-r lg:border-b-0 ${
+            isGraphMaximized
+              ? "lg:pointer-events-none lg:invisible lg:overflow-hidden lg:opacity-0"
+              : "lg:visible lg:opacity-100"
+          }`}
+        >
           <header className="flex h-[76px] shrink-0 items-center justify-between border-b border-[#dfe5df] px-6 md:px-8">
             <div className="flex items-center gap-3">
               <div className="grid size-9 place-items-center rounded-xl bg-[#174f3d] text-[#e4ff9b] shadow-[0_7px_18px_rgba(23,79,61,0.2)]">
@@ -1184,7 +1252,7 @@ function App() {
           </div>
         </section>
 
-        <section className="relative hidden min-h-0 overflow-hidden bg-[#eef1eb] lg:block">
+        <section className="relative hidden min-h-0 min-w-0 overflow-hidden bg-[#eef1eb] lg:block">
           <div className="absolute inset-x-0 top-0 z-10 flex h-[76px] items-center justify-between border-b border-[#d9e0da]/90 bg-[#f3f5f0]/90 px-7 backdrop-blur">
             <div>
               <div className="flex items-center gap-2">
@@ -1351,7 +1419,12 @@ function App() {
                 proOptions={{ hideAttribution: true }}
               >
                 <Background color="#cbd4cd" gap={24} size={1} variant={BackgroundVariant.Dots} />
-                <Controls showInteractive={false} position="bottom-right" />
+                <GraphControls
+                  isGraphMaximized={isGraphMaximized}
+                  onToggleGraphMaximized={() =>
+                    setIsGraphMaximized((current) => !current)
+                  }
+                />
                 <MiniMap
                   pannable
                   zoomable
