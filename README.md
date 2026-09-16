@@ -172,7 +172,7 @@ The Vite/React interface provides two coordinated workspaces:
 - deterministic community colors, a module legend with LLM-generated descriptions, and multi-community filtering; and
 - an on-demand source drawer with line numbers and syntax highlighting for every supported language.
 
-The graph API deliberately removes `raw_code` from its bulk node payload. Source is fetched only when a user selects a function, using both the Neo4j element ID and active repository scope.
+The graph API deliberately removes `raw_code` and `embedding` from its bulk node payload. Source is fetched only when a user selects a function, using both the Neo4j element ID and active repository scope.
 
 ## Quick start
 
@@ -370,7 +370,7 @@ Webhook updates are incremental merges. They do not remove deleted paths, recalc
 | Bounded writes | Files, functions, and calls are committed in batches of 100. | A full replacement spans multiple transactions and can be partially applied. |
 | Parser failures | Individual failed files are omitted while progress and token counting continue. | A completed ingestion can therefore represent fewer files than GitHub contained. |
 | GDS cleanup | Temporary projections are dropped in a `finally` block, including algorithm/projection-consumption failures. | GDS or labeling failure fails the overall ingestion after graph records may already exist. |
-| Source minimization | Bulk graph serialization strips `raw_code`; source requires a separate scoped lookup. | The unauthenticated source endpoint still exposes stored code to any caller that can reach it. |
+| Source minimization | Bulk graph serialization strips `raw_code` and `embedding`; source requires a separate scoped lookup. | The unauthenticated source endpoint still exposes stored code to any caller that can reach it. |
 | Webhook authenticity | HMAC SHA-256 signatures use `hmac.compare_digest`. | There is no replay cache, delivery-ID deduplication, queue, retry store, or webhook audit table. |
 
 ## Testing

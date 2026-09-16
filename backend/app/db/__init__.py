@@ -96,6 +96,7 @@ def _serialize_node(
     labels = sorted(node.labels)
     properties = _json_value(dict(node))
     properties.pop("raw_code", None)
+    properties.pop("embedding", None)
     label = (
         properties.get("qualified_name")
         or properties.get("name")
