@@ -186,6 +186,8 @@ The graph API deliberately removes `raw_code` from its bulk node payload. Source
 - an Anthropic API key for chat
 - optionally, a GitHub token for private repositories and higher GitHub API limits
 
+The API can start and `/health` can respond without model-provider keys, but ingestion requires OpenAI and chat requires Anthropic. Keep provider keys, the GitHub access token, and Neo4j credentials only in the backend environment; future Postman requests to Codegraph must not contain them. The GitHub webhook secret also belongs in `backend/.env`, though a local webhook-signing test may need a private copy to calculate its request signature.
+
 ### 1. Clone the repository
 
 ```bash
@@ -199,7 +201,16 @@ cd Codegraph
 docker compose up -d neo4j
 ```
 
-The Compose service exposes Neo4j Browser on port `7474`, Bolt on `7687`, stores data in the `neo4j_data` volume, and requests the Graph Data Science plugin. The checked-in development credentials are `neo4j` / `gladline`; change them before using the service outside an isolated local machine.
+The Compose service uses the tested Neo4j `2026.07.1` image, exposes Neo4j Browser on port `7474` and Bolt on `7687`, stores data in the `neo4j_data` volume, and installs the Graph Data Science (GDS) plugin. The checked-in development credentials are `neo4j` / `gladline`; change them before using the service outside an isolated local machine. Docker Desktop (or another Docker daemon) must be running first.
+
+Confirm that Bolt accepts queries and GDS is loaded before starting the API:
+
+```bash
+docker compose exec -T neo4j cypher-shell -u neo4j -p gladline 'RETURN 1 AS ready'
+docker compose exec -T neo4j cypher-shell -u neo4j -p gladline 'RETURN gds.version() AS gds_version'
+```
+
+If the container has not finished starting, retry the checks after a few seconds. Codegraph needs GDS for Leiden community detection during ingestion; a responding Browser port alone is not enough. The development plugin install may need network access when the container first starts. Do not use the checked-in credentials for a public deployment.
 
 ### 3. Configure and install the backend
 
@@ -208,15 +219,15 @@ The active backend reads `backend/.env`, not the root `.env` used by older proto
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r backend/requirements.txt
+python -m pip install -r backend/requirements.txt
 cp backend/.env.example backend/.env
 ```
 
-Edit `backend/.env` so the Neo4j password matches Compose and add the two model-provider keys:
+`backend/requirements.txt` is the active backend's dependency list; the root `requirements.txt` belongs to earlier prototype code and is not sufficient for the current tests. Use the virtual environment's `python -m pip` and `python -m pytest` so installation and test collection use the same interpreter. The copied example already matches the local Compose credentials and leaves the optional GitHub token blank. Add model-provider keys to `backend/.env` for ingestion and chat:
 
 ```dotenv
 GITHUB_WEBHOOK_SECRET=replace-with-a-long-random-secret
-# GITHUB_TOKEN=github-token-with-read-access
+GITHUB_TOKEN=
 
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
@@ -368,10 +379,11 @@ Webhook updates are incremental merges. They do not remove deleted paths, recalc
 
 ```bash
 cd backend
-pytest -q
+python -m pytest --collect-only -q
+python -m pytest -q
 ```
 
-The backend suite combines mocked unit/API tests with live-Neo4j integration cases. If Neo4j is unavailable, database integration tests skip themselves; start the Compose service and use matching credentials to exercise them.
+Run these with the virtual environment activated. The backend suite combines mocked unit/API tests with live-Neo4j integration cases. If Neo4j is unavailable, four database integration tests explicitly skip themselves; start the Compose service and use matching credentials to exercise them. A missing Python import during collection means the active interpreter has not installed all of `backend/requirements.txt`—it is not an expected test skip.
 
 Key validated behaviors include:
 
@@ -384,7 +396,7 @@ Key validated behaviors include:
 - graph serialization without source bodies; and
 - database index initialization and application lifecycle cleanup.
 
-In the latest local validation for this README, the backend completed **73 tests**, with **4 live-database tests skipped** because Neo4j was not running.
+On 2026-09-16, a fresh Python 3.13 environment installed the declared backend dependencies, collected **77 tests**, and passed all **77** with local Neo4j and GDS running. Without database access, **73 passed and 4 explicitly skipped**.
 
 ### Frontend
 
@@ -396,7 +408,7 @@ pnpm build
 
 The Node test suite covers repository input normalization, chunked NDJSON parsing, error propagation, graph/chat scoping, source lookup, explicit and unload cleanup, deterministic community colors, and cluster selection. The production Vite build is also part of the recommended validation pass.
 
-The latest local validation completed **13 frontend tests** and a production build. Vite reported that the generated JavaScript chunk exceeds its default 500 kB warning threshold; code splitting is not yet configured.
+On 2026-09-16, the locked frontend installation completed, all **13 frontend tests** passed, and the production build succeeded. Vite reported that the generated JavaScript chunk exceeds its default 500 kB warning threshold; code splitting is not yet configured.
 
 The root-level `tests/` directory exercises the older webhook prototype. Run active-backend tests from `backend/` to avoid importing the legacy root `app` package by mistake.
 
@@ -410,7 +422,7 @@ The active settings class loads `backend/.env`, is case-insensitive, ignores unk
 | `GITHUB_TOKEN` | Private repositories / higher GitHub limits | unset | Sent as a bearer token to GitHub API and raw-content requests. |
 | `NEO4J_URI` | All graph operations | `bolt://localhost:7687` | Matches local Compose networking from the host. |
 | `NEO4J_USER` | All graph operations | `neo4j` | Compose uses the same username. |
-| `NEO4J_PASSWORD` | All graph operations | `password` | Set to `gladline` for the checked-in Compose configuration. |
+| `NEO4J_PASSWORD` | All graph operations | `password` | The copied `backend/.env.example` sets `gladline` to match the checked-in local Compose configuration. |
 | `ANTHROPIC_API_KEY` | Chat | empty | The active model is currently hard-coded to `claude-sonnet-5`. |
 | `OPENAI_API_KEY` | Ingestion and semantic search | empty | Used by `text-embedding-3-small` and `gpt-4o-mini`. |
 
@@ -471,7 +483,7 @@ The `backend/` and `frontend/` directories form the current full application. Ro
 - **External-service dependency:** normal ingestion requires GitHub, OpenAI, Neo4j GDS, and compatible model/index APIs; chat additionally requires Anthropic.
 - **Local deployment focus:** only Neo4j is containerized; there is no CI workflow, application Dockerfile, TLS termination, deployment manifest, metrics endpoint, tracing, or structured event store.
 - **No application auth or multi-tenancy:** repository scoping prevents accidental query mixing but does not establish an authorization boundary.
-- **Unpinned infrastructure image:** Compose uses `neo4j:latest`, so future image/plugin compatibility is not guaranteed.
+- **Development plugin resolution:** Compose pins Neo4j to a tested image version, but `NEO4J_PLUGINS` installs GDS at container startup. Verify `gds.version()` after startup; this is a local development setup, not a fully locked production image.
 - **Frontend bundle size:** the current production JavaScript chunk is above Vite's default warning threshold.
 
 ## Design tradeoffs

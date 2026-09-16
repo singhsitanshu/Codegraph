@@ -11,9 +11,10 @@ uvicorn app.main:app --reload
 
 Repository nodes are scoped by the canonical `owner/repository` value returned
 by the ingestion endpoint. After a complete parse succeeds, calling the
-endpoint replaces only that repository's scoped `File` and `Function` nodes in
-one Neo4j transaction. This removes files/functions deleted upstream without
-touching other repositories. Webhook writes remain incremental.
+endpoint replaces that repository's scoped graph through multiple bounded
+Neo4j transactions. This removes files/functions deleted upstream without
+touching other repositories, but a failure partway through can leave a partial
+replacement. Webhook writes remain incremental.
 
 ```bash
 curl -X POST http://localhost:8000/api/ingest-repo \

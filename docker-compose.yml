@@ -1,6 +1,6 @@
 services:
   neo4j:
-    image: neo4j:latest
+    image: neo4j:2026.07.1
     container_name: codebase_graph_db
     ports:
       - "7474:7474"  # Web UI
