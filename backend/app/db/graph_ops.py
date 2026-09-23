@@ -147,6 +147,11 @@ def _extract_etl_records(
             for parsed_function in parsed_functions:
                 if not isinstance(parsed_function, dict):
                     continue
+                # Declaration-only TypeScript overloads are retained by the
+                # parser for identity, but the legacy graph stores one body
+                # per simple name until CG-002B migrates persistence.
+                if parsed_function.get("has_body") is False:
+                    continue
                 function_name = parsed_function.get("name")
                 raw_code = parsed_function.get("raw_code")
                 if (

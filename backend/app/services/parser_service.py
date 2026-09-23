@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,10 @@ import tree_sitter_python
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
+from app.utils.entity_identity import (
+    generate_function_entity_id,
+    normalize_repository_path,
+)
 from app.utils.tokens import count_tokens
 
 
@@ -77,6 +82,9 @@ JAVASCRIPT_CLASS_DEFINITIONS_QUERY = """
 """
 
 TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY = """
+(function_signature
+  name: (identifier) @name) @definition
+
 (function_declaration
   name: (identifier) @name) @definition
 
@@ -84,6 +92,9 @@ TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY = """
   name: (identifier) @name) @definition
 
 (method_definition
+  name: (property_identifier) @name) @definition
+
+(method_signature
   name: (property_identifier) @name) @definition
 
 (variable_declarator
@@ -367,14 +378,100 @@ class CodeParser:
         ]
 
     @staticmethod
+    def _text(node: Node, source_code: bytes) -> str:
+        return source_code[node.start_byte : node.end_byte].decode(
+            "utf-8", errors="replace"
+        )
+
+    @classmethod
+    def _lexical_scope(cls, definition: Node, source_code: bytes) -> list[str]:
+        """Collect named enclosing classes/functions, outermost first."""
+
+        scope: list[str] = []
+        parent = definition.parent
+        scope_types = {
+            "class_definition",
+            "class_declaration",
+            "abstract_class_declaration",
+            "interface_declaration",
+            "record_declaration",
+            "internal_module",
+            "function_definition",
+            "function_declaration",
+            "generator_function_declaration",
+            "method_definition",
+            "method_declaration",
+            "constructor_declaration",
+            "function_signature",
+            "method_signature",
+            "variable_declarator",
+        }
+        while parent is not None:
+            if parent.type in scope_types:
+                name = parent.child_by_field_name("name")
+                if name is not None:
+                    scope.append(cls._text(name, source_code))
+            parent = parent.parent
+        scope.reverse()
+        return scope
+
+    @classmethod
+    def _definition_body(cls, definition: Node) -> Node | None:
+        if definition.type == "variable_declarator":
+            value = definition.child_by_field_name("value")
+            return value.child_by_field_name("body") if value is not None else None
+        return definition.child_by_field_name("body")
+
+    @classmethod
+    def _signature(cls, definition: Node, source_code: bytes) -> str | None:
+        owner = definition
+        if definition.type == "variable_declarator":
+            owner = definition.child_by_field_name("value")
+            if owner is None:
+                return None
+        parameters = owner.child_by_field_name("parameters")
+        if parameters is None:
+            return None
+        return re.sub(r"\s+", " ", cls._text(parameters, source_code)).strip()
+
+    @classmethod
+    def _qualified_name(cls, definition: Node, name: str, source_code: bytes) -> str:
+        scope = cls._lexical_scope(definition, source_code)
+        if definition.type == "method_declaration":
+            receiver = definition.child_by_field_name("receiver")
+            if receiver is not None:
+                receiver_types = [
+                    child
+                    for child in receiver.children
+                    if child.type == "type_identifier"
+                ]
+                if not receiver_types:
+                    stack = list(receiver.named_children)
+                    while stack:
+                        child = stack.pop()
+                        if child.type == "type_identifier":
+                            receiver_types.append(child)
+                        stack.extend(child.named_children)
+                if receiver_types:
+                    scope.append(cls._text(receiver_types[0], source_code))
+        return ".".join([*scope, name])
+
+    @staticmethod
+    def _line_end(node: Node) -> int:
+        return node.end_point.row + (1 if node.end_point.column else 0)
+
+    @classmethod
     def _capture_function_records(
+        cls,
         query: Query,
         root_node: Node,
         source_code: bytes,
-    ) -> list[dict[str, str]]:
-        """Pair each function name with its exact Tree-sitter source span."""
+        file_path: str,
+        language: str,
+    ) -> list[tuple[Node, dict[str, Any]]]:
+        """Pair each named definition with source and deterministic metadata."""
 
-        records: list[tuple[int, dict[str, str]]] = []
+        records: list[tuple[Node, dict[str, Any]]] = []
         for _, captures in QueryCursor(query).matches(root_node):
             name_nodes = captures.get("name", [])
             definition_nodes = captures.get("definition", [])
@@ -382,20 +479,124 @@ class CodeParser:
                 continue
             name_node = name_nodes[0]
             definition_node = definition_nodes[0]
-            name = source_code[
-                name_node.start_byte : name_node.end_byte
-            ].decode("utf-8", errors="replace")
-            raw_code = source_code[
-                definition_node.start_byte : definition_node.end_byte
-            ].decode("utf-8", errors="replace")
+            name = cls._text(name_node, source_code)
+            raw_code = cls._text(definition_node, source_code)
+            signature = cls._signature(definition_node, source_code)
+            body = cls._definition_body(definition_node)
             records.append(
                 (
-                    definition_node.start_byte,
-                    {"name": name, "raw_code": raw_code},
+                    definition_node,
+                    {
+                        "name": name,
+                        "qualified_name": cls._qualified_name(
+                            definition_node, name, source_code
+                        ),
+                        "file_path": file_path,
+                        "language": language,
+                        "signature": signature,
+                        "has_body": body is not None,
+                        "start_line": definition_node.start_point.row + 1,
+                        "end_line": cls._line_end(definition_node),
+                        "start_column": definition_node.start_point.column,
+                        "end_column": definition_node.end_point.column,
+                        "raw_code": raw_code,
+                        "calls": [],
+                    },
                 )
             )
-        records.sort(key=lambda item: item[0])
-        return [record for _, record in records]
+        records.sort(key=lambda item: (item[0].start_byte, item[0].end_byte))
+        occurrences: dict[tuple[str, str | None], int] = {}
+        for _, record in records:
+            key = (record["qualified_name"], record["signature"])
+            occurrences[key] = occurrences.get(key, 0) + 1
+            signature_part = record["signature"] or "unknown"
+            record["definition_discriminator"] = (
+                f"signature:{signature_part};occurrence:{occurrences[key]}"
+            )
+        return records
+
+    @classmethod
+    def _capture_call_sites(
+        cls,
+        query: Query,
+        root_node: Node,
+        source_code: bytes,
+        definitions: list[tuple[Node, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Attribute syntax to the innermost captured lexical function body."""
+
+        unattributed: list[dict[str, Any]] = []
+        captures = QueryCursor(query).captures(root_node).get("call", [])
+        for name_node in sorted(captures, key=lambda node: node.start_byte):
+            call_node = name_node
+            while call_node.parent is not None and call_node.type not in {
+                "call",
+                "call_expression",
+                "method_invocation",
+            }:
+                call_node = call_node.parent
+            if call_node.type not in {
+                "call",
+                "call_expression",
+                "method_invocation",
+            }:
+                continue
+            target = call_node.child_by_field_name("function")
+            if target is None:
+                target = call_node.child_by_field_name("name") or name_node
+                receiver = call_node.child_by_field_name("object")
+                syntax = (
+                    f"{cls._text(receiver, source_code)}."
+                    f"{cls._text(target, source_code)}"
+                    if receiver is not None
+                    else cls._text(target, source_code)
+                )
+            else:
+                syntax = cls._text(target, source_code)
+            call = {
+                "name": cls._text(name_node, source_code),
+                "syntax": syntax,
+                "start_line": call_node.start_point.row + 1,
+                "end_line": cls._line_end(call_node),
+                "start_column": call_node.start_point.column,
+                "end_column": call_node.end_point.column,
+                "resolution": "unresolved",
+            }
+            candidates: list[tuple[int, Node, dict[str, Any]]] = []
+            for definition, record in definitions:
+                body = cls._definition_body(definition)
+                if body is None or not (
+                    body.start_byte <= call_node.start_byte
+                    and call_node.end_byte <= body.end_byte
+                ):
+                    continue
+                candidates.append((body.end_byte - body.start_byte, definition, record))
+            if candidates:
+                _, definition, owner = min(candidates, key=lambda item: item[0])
+                current = call_node.parent
+                anonymous_boundary = False
+                while current is not None and current != definition:
+                    if current.type in {
+                        "lambda",
+                        "lambda_expression",
+                        "arrow_function",
+                        "function_expression",
+                        "function",
+                        "generator_function",
+                        "func_literal",
+                    }:
+                        if not (
+                            definition.type == "variable_declarator"
+                            and current == definition.child_by_field_name("value")
+                        ):
+                            anonymous_boundary = True
+                            break
+                    current = current.parent
+                if not anonymous_boundary:
+                    owner["calls"].append(call)
+                    continue
+            unattributed.append(call)
+        return unattributed
 
     def _parse_source(
         self,
@@ -413,11 +614,18 @@ class CodeParser:
         if root_node.has_error:
             logger.warning("Tree-sitter found syntax errors while parsing %s", file_path)
 
-        functions = self._capture_function_records(
+        language = SUPPORTED_EXTENSIONS[extension]
+        definitions = self._capture_function_records(
             queries.function_definitions,
             root_node,
             source_code,
+            file_path,
+            language,
         )
+        unattributed_calls = self._capture_call_sites(
+            queries.function_calls, root_node, source_code, definitions
+        )
+        functions = [record for _, record in definitions]
 
         return {
             "file_path": file_path,
@@ -427,8 +635,11 @@ class CodeParser:
                 root_node,
                 source_code,
             ),
-            "defined_functions": [function["name"] for function in functions],
+            "defined_functions": [
+                function["name"] for function in functions if function["has_body"]
+            ],
             "functions": functions,
+            "unattributed_calls": unattributed_calls,
             "outgoing_calls": self._capture_text(
                 queries.function_calls,
                 "call",
@@ -441,6 +652,9 @@ class CodeParser:
         self,
         file_path: str,
         source_code: bytes,
+        *,
+        repository: str | None = None,
+        repository_relative_path: str | None = None,
     ) -> dict[str, Any]:
         """Extract classes, functions, and outgoing calls from one source file.
 
@@ -452,15 +666,21 @@ class CodeParser:
             file_path: Logical or filesystem path used to select the grammar and
                 identify the resulting file record.
             source_code: UTF-8 encoded source bytes in a supported language.
+            repository: Optional repository scope. When supplied, function
+                entity IDs are generated from the repository and relative path.
+            repository_relative_path: Stable path to use when ``file_path`` is
+                a temporary absolute path. Required in that case if repository
+                identity is requested.
 
         Returns:
             A dictionary containing ``file_path``, ``defined_classes``,
-            ``defined_functions``, structured ``functions`` with raw code, and
-            ``outgoing_calls``.
+            ``defined_functions``, structured ``functions`` with raw code and
+            lexical metadata, ``outgoing_calls``, and ``unattributed_calls``.
 
         Raises:
             TypeError: If ``source_code`` is not bytes.
             ValueError: If ``file_path`` has an unsupported extension.
+                Also raised if a requested identity has an invalid relative path.
         """
 
         if not isinstance(source_code, bytes):
@@ -468,12 +688,50 @@ class CodeParser:
 
         extension = self._normalize_extension(Path(file_path).suffix)
         async with self._parse_locks[extension]:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self._parse_source,
                 file_path,
                 extension,
                 source_code,
             )
+        if repository is not None:
+            attach_function_entity_ids(
+                result,
+                repository=repository,
+                file_path=repository_relative_path or file_path,
+            )
+        return result
+
+
+def attach_function_entity_ids(
+    parsed_file: dict[str, Any],
+    *,
+    repository: str,
+    file_path: str,
+) -> dict[str, Any]:
+    """Attach repository identity after a file has a repository-relative path.
+
+    Kept separate so full ingest can parse temporary absolute paths and attach
+    keys only after converting them to stable repository-relative paths.
+    """
+
+    normalized_path = normalize_repository_path(file_path)
+    normalized_repository = repository.strip()
+    if not normalized_repository:
+        raise ValueError("repository must not be blank")
+    parsed_file["file_path"] = normalized_path
+    parsed_file["repository"] = normalized_repository
+    for function in parsed_file.get("functions", []):
+        function["file_path"] = normalized_path
+        function["repository"] = normalized_repository
+        function["entity_id"] = generate_function_entity_id(
+            repository=normalized_repository,
+            file_path=normalized_path,
+            language=function["language"],
+            qualified_name=function["qualified_name"],
+            discriminator=function["definition_discriminator"],
+        )
+    return parsed_file
 
 
 async def parse_changed_files_with_progress(

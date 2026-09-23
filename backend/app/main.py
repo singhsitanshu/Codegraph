@@ -32,6 +32,7 @@ from app.services.github_service import (
 )
 from app.services.parser_service import (
     SUPPORTED_EXTENSIONS,
+    attach_function_entity_ids,
     parse_changed_files_with_progress,
 )
 
@@ -169,6 +170,7 @@ def _discover_repository_source_files(extracted_root: str) -> list[str]:
 def _use_repository_relative_paths(
     parsed_data: list[dict[str, Any]],
     extracted_root: str,
+    repository: str | None = None,
 ) -> None:
     """Replace random temporary paths with stable repository-relative paths."""
 
@@ -176,9 +178,14 @@ def _use_repository_relative_paths(
     for parsed_file in parsed_data:
         file_path = parsed_file.get("file_path")
         if isinstance(file_path, str):
-            parsed_file["file_path"] = (
+            relative_path = (
                 Path(file_path).resolve().relative_to(repository_root).as_posix()
             )
+            parsed_file["file_path"] = relative_path
+            if repository is not None:
+                attach_function_entity_ids(
+                    parsed_file, repository=repository, file_path=relative_path
+                )
 
 
 app = FastAPI(
@@ -426,7 +433,9 @@ async def _stream_repository_ingestion(
             for parsed_file in parsed_data_by_index
             if parsed_file is not None
         ]
-        _use_repository_relative_paths(parsed_data, extracted_root)
+        _use_repository_relative_paths(
+            parsed_data, extracted_root, repository=canonical_repo_name
+        )
         logger.info(
             "Full repository token baseline for %s: %d",
             canonical_repo_name,
