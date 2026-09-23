@@ -139,15 +139,9 @@ def test_code_parser_extracts_exact_function_source() -> None:
 
     result = asyncio.run(CodeParser().parse_file("module.py", source))
 
-    assert result["functions"] == [
-        {
-            "name": "first",
-            "raw_code": "def first(value):\n    return value + 1",
-        },
-        {
-            "name": "second",
-            "raw_code": "def second():\n    return first(2)",
-        },
+    assert [(function["name"], function["raw_code"]) for function in result["functions"]] == [
+        ("first", "def first(value):\n    return value + 1"),
+        ("second", "def second():\n    return first(2)"),
     ]
 
 

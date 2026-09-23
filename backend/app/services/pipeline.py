@@ -8,7 +8,7 @@ import httpx
 
 from app.db.graph_ops import save_parsed_ast_to_neo4j
 from app.services.github_service import fetch_raw_file_content
-from app.services.parser_service import CodeParser
+from app.services.parser_service import CodeParser, attach_function_entity_ids
 
 
 logger = logging.getLogger(__name__)
@@ -186,9 +186,14 @@ async def process_github_event(payload: dict[str, Any], event_type: str) -> None
                 return None
 
             try:
-                return await code_parser.parse_file(
+                parsed_file = await code_parser.parse_file(
                     file_path,
                     source_code.encode("utf-8"),
+                )
+                return attach_function_entity_ids(
+                    parsed_file,
+                    repository=f"{owner}/{repo}",
+                    file_path=file_path,
                 )
             except Exception as exc:
                 logger.warning(
