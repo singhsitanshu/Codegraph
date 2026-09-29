@@ -64,3 +64,19 @@ def test_function_serialization_omits_source_and_embedding_from_graph_payload() 
     assert "raw_code" not in serialized["data"]
     assert "embedding" not in serialized
     assert "embedding" not in serialized["data"]
+
+
+def test_function_serialization_exposes_stable_id_alongside_element_id() -> None:
+    node = FakeNode(
+        name="validate",
+        qualified_name="PaymentService.validate",
+        file_path="src/payments.py",
+        entity_id="fn:v1:stable",
+    )
+
+    serialized = _serialize_node(node)
+
+    assert serialized["id"] == "func_123"
+    assert serialized["data"]["entity_id"] == "fn:v1:stable"
+    assert serialized["data"]["qualified_name"] == "PaymentService.validate"
+    assert serialized["label"] == "PaymentService.validate"

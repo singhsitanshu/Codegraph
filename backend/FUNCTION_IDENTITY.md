@@ -1,6 +1,6 @@
-# Function identity parser contract (CG-002)
+# Function identity contract (CG-002A and CG-002B)
 
-This contract prepares CG-002B. The Neo4j writer, graph API, and agent still use simple function names; **these parser IDs are not persisted or available to graph navigation yet**.
+The parser emits deterministic function IDs and the Neo4j writer persists them. The graph API includes `entity_id` in each Function node's `data`, while its `id` remains the Neo4j `elementId` for current React Flow compatibility. Assistant tools still accept names and report ambiguity; stable reference navigation remains CG-003 work.
 
 ## Parsed output
 
@@ -36,9 +36,9 @@ This contract prepares CG-002B. The Neo4j writer, graph API, and agent still use
 }
 ```
 
-Lines are one-based and inclusive; columns are zero-based Tree-sitter byte columns. `signature` is the whitespace-normalized parameter syntax when exposed by the grammar. `has_body=false` identifies a declaration-only TypeScript overload signature; its `raw_code` is that declaration. Such signatures appear in `functions`, but remain excluded from legacy `defined_functions` and Neo4j ingestion to preserve the current graph's body choice. `unattributed_calls` on the file has the same call-site shape for calls outside a captured function body or inside an anonymous boundary that cannot be assigned confidently. The legacy `outgoing_calls` remains a file-wide list of simple call names.
+Lines are one-based and inclusive; columns are zero-based Tree-sitter byte columns. `signature` is the whitespace-normalized parameter syntax when exposed by the grammar. `has_body=false` identifies a declaration-only TypeScript overload signature; its `raw_code` is that declaration. Such signatures appear in `functions` and are persisted as distinct Function nodes, but are not treated as executable call targets. They remain excluded from legacy `defined_functions`. `unattributed_calls` on the file has the same call-site shape for calls outside a captured function body or inside an anonymous boundary that cannot be assigned confidently. The legacy `outgoing_calls` remains a file-wide list of simple call names and is not used for graph CALLS edges.
 
-The repository is required to generate `entity_id`. When supplied, it is also stored on the parsed file and each function. For backward compatibility, `parse_file` without `repository` still returns the additional lexical metadata but omits `entity_id`; callers with temporary absolute paths can later call `attach_function_entity_ids(parsed_file, repository=..., file_path=<relative path>)`. Full GitHub ingest uses this after path relativization; the webhook pipeline attaches IDs using its repository-relative event path. Neither path causes those IDs to be written to Neo4j yet.
+The repository is required to generate `entity_id`. When supplied, it is also stored on the parsed file and each function. For backward compatibility, `parse_file` without `repository` still returns the additional lexical metadata but omits `entity_id`; callers with temporary absolute paths can later call `attach_function_entity_ids(parsed_file, repository=..., file_path=<relative path>)`. Full GitHub ingest and local helpers do this after path relativization; the webhook pipeline attaches IDs using repository-relative event paths. The database writer validates the canonical ID and rejects missing or mismatched values.
 
 ## Canonical key
 
@@ -66,11 +66,6 @@ The key does not use source code body text, Python `hash()`, Neo4j `elementId`, 
 
 Calls are attributed to the innermost captured definition **only when the call expression is inside its Tree-sitter body**. Syntax such as `self.check`, `api.call`, and receiver-qualified method calls is retained as evidence, while `resolution` remains `unresolved`. A call inside a nested captured function belongs to that nested function. A call in a default argument, at file scope, or inside an uncaptured anonymous function/lambda is put in `unattributed_calls`. This does not resolve dynamic dispatch, imports, overload targets, cross-file calls, or the true callee node.
 
-## CG-002B handoff
+## Database contract and CG-003 handoff
 
-- Change Function MERGE and lookup from `(repo_name, name)` to the persisted canonical `entity_id`, with a uniqueness constraint and a migration/rebuild plan. Preserve `name` for display and `qualified_name`, path, language, discriminator, and source range for inspection.
-- Update `DEFINES` and `CALLS` construction to use caller IDs and resolved target IDs. The new `functions[].calls` are lexical call-site evidence; they do **not** identify a callee. Keep an unresolved-call representation until resolution is proven. Stop copying each file-wide `outgoing_calls` name onto every function.
-- Decide how declaration-only TypeScript overload signatures map to graph entities and implementation bodies. The current compatibility path deliberately skips them in Neo4j.
-- Update both full and incremental ingest, agent queries, source lookup, graph serialization, indexes, and tests together. Avoid exposing `entity_id` as a durable graph reference until these writes and reads use it consistently.
-- Update local ingestion helpers (`backend/ingest_local_repo.py`, `backend/seeding.py`) to attach IDs after relativizing their absolute paths before CG-002B starts persisting `entity_id`.
-- Any persistent reference should include repository and a graph snapshot/revision so deleted or re-ingested definitions can be detected. The parser ID alone cannot establish that a function currently exists in Neo4j.
+See [GRAPH_IDENTITY_MIGRATION.md](GRAPH_IDENTITY_MIGRATION.md) for persistence, call resolution, rebuild, and test details. A persistent assistant reference should include repository, `entity_id`, and a graph snapshot/revision so deleted or re-ingested definitions can be detected. The parser ID alone cannot establish that a function currently exists in Neo4j.

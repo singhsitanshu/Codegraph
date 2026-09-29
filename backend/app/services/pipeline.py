@@ -1,63 +1,66 @@
 import asyncio
 import logging
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from app.db.graph_ops import save_parsed_ast_to_neo4j
 from app.services.github_service import fetch_raw_file_content
-from app.services.parser_service import CodeParser, attach_function_entity_ids
+from app.services.parser_service import (
+    SUPPORTED_EXTENSIONS,
+    CodeParser,
+    attach_function_entity_ids,
+)
+from app.utils.entity_identity import normalize_repository_path
 
 
 logger = logging.getLogger(__name__)
 
 
-def _unique_paths(paths: Iterable[object]) -> list[str]:
-    """Return non-empty string paths in first-seen order."""
+def _extract_push_changes(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Require a complete, bounded commit list before changing a graph."""
 
-    return list(dict.fromkeys(path for path in paths if isinstance(path, str) and path))
-
-
-def _extract_push_files(payload: dict[str, Any]) -> list[str]:
-    commits = payload.get("commits", [])
-    if not isinstance(commits, list):
-        return []
-
-    paths: list[object] = []
+    commits = payload.get("commits")
+    reported_size = payload.get("size")
+    before = payload.get("before")
+    after = payload.get("after")
+    if (
+        not isinstance(commits, list)
+        or not commits
+        or len(commits) >= 20
+        or not isinstance(reported_size, int)
+        or isinstance(reported_size, bool)
+        or reported_size != len(commits)
+        or payload.get("forced") is True
+        or payload.get("created") is True
+        or payload.get("deleted") is True
+        or not isinstance(before, str)
+        or not before
+        or set(before) == {"0"}
+        or not isinstance(after, str)
+        or not after
+        or set(after) == {"0"}
+    ):
+        raise ValueError("push event does not contain a complete supported change set")
+    updated: set[str] = set()
+    deleted: set[str] = set()
     for commit in commits:
-        if not isinstance(commit, dict):
-            continue
-        for field in ("modified", "added"):
-            values = commit.get(field, [])
-            if isinstance(values, list):
-                paths.extend(values)
-    return _unique_paths(paths)
-
-
-def _extract_pull_request_files(payload: dict[str, Any]) -> list[str]:
-    """Extract filenames when a provider or test fixture embeds them in the PR."""
-
-    pull_request = payload.get("pull_request", {})
-    if not isinstance(pull_request, dict):
-        return []
-
-    paths: list[object] = []
-    for field in ("modified", "added", "modified_files", "added_files"):
-        values = pull_request.get(field, [])
-        if isinstance(values, list):
-            paths.extend(values)
-
-    files = pull_request.get("files", [])
-    if isinstance(files, list):
-        for file_entry in files:
-            if isinstance(file_entry, str):
-                paths.append(file_entry)
-            elif isinstance(file_entry, dict):
-                paths.append(file_entry.get("filename"))
-
-    return _unique_paths(paths)
+        if not isinstance(commit, dict) or any(
+            not isinstance(commit.get(field), list)
+            for field in ("added", "modified", "removed")
+        ):
+            raise ValueError("push commit is missing file change lists")
+        for field in ("added", "modified"):
+            for raw_path in commit[field]:
+                path = normalize_repository_path(raw_path)
+                if Path(path).suffix.lower() in SUPPORTED_EXTENSIONS:
+                    updated.add(path)
+                    deleted.discard(path)
+        for raw_path in commit["removed"]:
+            path = normalize_repository_path(raw_path)
+            if Path(path).suffix.lower() in SUPPORTED_EXTENSIONS:
+                deleted.add(path)
+                updated.discard(path)
+    return sorted(updated), sorted(deleted)
 
 
 def _extract_repository(payload: dict[str, Any]) -> tuple[str, str] | None:
@@ -93,18 +96,6 @@ def _extract_commit_sha(payload: dict[str, Any], event_type: str) -> str | None:
         after = payload.get("after")
         if isinstance(after, str) and after:
             return after
-        head_commit = payload.get("head_commit")
-        if isinstance(head_commit, dict):
-            commit_id = head_commit.get("id")
-            return commit_id if isinstance(commit_id, str) and commit_id else None
-
-    if event_type == "pull_request":
-        pull_request = payload.get("pull_request")
-        if isinstance(pull_request, dict):
-            head = pull_request.get("head")
-            if isinstance(head, dict):
-                sha = head.get("sha")
-                return sha if isinstance(sha, str) and sha else None
     return None
 
 
@@ -115,25 +106,25 @@ async def process_github_event(payload: dict[str, Any], event_type: str) -> None
     logger.info("Starting GitHub event processing: event_type=%s", normalized_event)
 
     try:
-        if normalized_event == "push":
-            modified_files = _extract_push_files(payload)
-        elif normalized_event == "pull_request":
-            modified_files = _extract_pull_request_files(payload)
-            if not modified_files:
-                logger.info(
-                    "The pull_request webhook did not embed filenames; a later "
-                    "pipeline stage should retrieve them from GitHub's files API"
-                )
-        else:
-            modified_files = []
+        if normalized_event != "push":
             logger.info(
-                "No file extractor configured for event_type=%s", normalized_event
+                "Skipping %s event: only complete push change sets support "
+                "safe incremental ingestion",
+                normalized_event,
             )
+            return
+        try:
+            modified_files, deleted_files = _extract_push_changes(payload)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Skipping incomplete push change set: %s", exc)
+            return
+        if not modified_files and not deleted_files:
+            logger.info("No supported source files changed in push event")
+            return
 
         logger.info(
-            "Extracted %d changed file(s): %s",
-            len(modified_files),
-            modified_files,
+            "Extracted %d updated and %d deleted source file(s)",
+            len(modified_files), len(deleted_files),
         )
 
         repository = _extract_repository(payload)
@@ -149,67 +140,23 @@ async def process_github_event(payload: dict[str, Any], event_type: str) -> None
         owner, repo = repository
         code_parser = CodeParser()
 
-        async def fetch_and_parse(
-            file_path: str,
-        ) -> dict[str, str | list[str]] | None:
-            try:
-                code_parser.get_parser(Path(file_path).suffix)
-            except ValueError as exc:
-                logger.warning(
-                    "Skipping unsupported source file %s: %s", file_path, exc
-                )
-                return None
-
-            try:
-                source_code = await fetch_raw_file_content(
-                    owner,
-                    repo,
-                    file_path,
-                    commit_sha,
-                )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == httpx.codes.NOT_FOUND:
-                    logger.info(
-                        "Skipping missing or deleted GitHub file at %s: %s",
-                        commit_sha,
-                        file_path,
-                    )
-                else:
-                    logger.warning(
-                        "GitHub returned %d while fetching %s",
-                        exc.response.status_code,
-                        file_path,
-                    )
-                return None
-            except httpx.RequestError as exc:
-                logger.warning("Unable to fetch GitHub file %s: %s", file_path, exc)
-                return None
-
-            try:
-                parsed_file = await code_parser.parse_file(
-                    file_path,
-                    source_code.encode("utf-8"),
-                )
-                return attach_function_entity_ids(
-                    parsed_file,
-                    repository=f"{owner}/{repo}",
-                    file_path=file_path,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Tree-sitter failed to parse GitHub file %s: %s",
-                    file_path,
-                    exc,
-                    exc_info=True,
-                )
-                return None
+        async def fetch_and_parse(file_path: str) -> dict[str, Any]:
+            source_code = await fetch_raw_file_content(
+                owner, repo, file_path, commit_sha
+            )
+            parsed_file = await code_parser.parse_file(
+                file_path, source_code.encode("utf-8")
+            )
+            return attach_function_entity_ids(
+                parsed_file,
+                repository=f"{owner}/{repo}",
+                file_path=file_path,
+            )
 
         parsed_results = await asyncio.gather(
             *(fetch_and_parse(file_path) for file_path in modified_files)
         )
-        parsed_relationships = [
-            result for result in parsed_results if result is not None
-        ]
+        parsed_relationships = list(parsed_results)
         logger.info(
             "Tree-sitter stage complete: parsed %d of %d changed file(s)",
             len(parsed_relationships),
@@ -219,6 +166,7 @@ async def process_github_event(payload: dict[str, Any], event_type: str) -> None
         await save_parsed_ast_to_neo4j(
             parsed_relationships,
             repo_name=f"{owner}/{repo}",
+            deleted_file_paths=deleted_files,
         )
         logger.info(
             "Neo4j stage complete: persisted %d parsed file(s)",

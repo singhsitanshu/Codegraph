@@ -1,291 +1,182 @@
-"""Unit coverage for repository-scoped, micro-batched Neo4j writes."""
+"""Regression coverage for identity-based graph persistence."""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.db import (
-    GRAPH_QUERY,
-    NODE_CODE_QUERY,
-    REPOSITORY_TOKEN_QUERY,
-    fetch_repository_total_tokens,
-)
+import pytest
+
+from app.db import GRAPH_QUERY, NODE_CODE_QUERY
 from app.db.graph_ops import (
-    DELETE_REPOSITORY_QUERY,
-    MERGE_CALLS_QUERY,
-    MERGE_FILES_QUERY,
-    MERGE_FUNCTIONS_QUERY,
-    MERGE_REPOSITORY_TOKENS_QUERY,
-    TAG_EXTERNAL_FUNCTIONS_QUERY,
-    chunk_data,
+    CHECK_REPOSITORY_STATE_QUERY, DELETE_FILE_CALLS_QUERY,
+    DELETE_FILE_FUNCTIONS_QUERY, DELETE_FILES_QUERY, DELETE_REPOSITORY_QUERY,
+    MARK_REPOSITORY_BUILDING_QUERY, MARK_REPOSITORY_READY_QUERY,
+    MERGE_CALLS_QUERY, MERGE_FILES_QUERY, MERGE_FUNCTIONS_QUERY,
+    MERGE_REPOSITORY_TOKENS_QUERY, MERGE_UNRESOLVED_CALLS_QUERY,
+    _extract_etl_records, chunk_data,
     save_parsed_ast_to_neo4j,
 )
+from app.services.parser_service import CodeParser
+
+REPO = "owner/repository"
 
 
-def _mock_driver():
-    transaction = MagicMock()
-    transaction.run = AsyncMock()
-    transaction.run.return_value.consume = AsyncMock()
+def parse(path, source):
+    return asyncio.run(CodeParser().parse_file(path, source, repository=REPO))
+
+
+def mock_driver(state=None):
+    tx = MagicMock()
+    result = MagicMock()
+    result.consume = AsyncMock()
+    result.single = AsyncMock(return_value=state)
+    tx.run = AsyncMock(return_value=result)
     session = MagicMock()
-
     async def execute_write(callback):
-        await callback(transaction)
-
+        await callback(tx)
     session.execute_write = AsyncMock(side_effect=execute_write)
-    session_context = MagicMock()
-    session_context.__aenter__ = AsyncMock(return_value=session)
-    session_context.__aexit__ = AsyncMock(return_value=None)
+    session.run = AsyncMock(return_value=result)
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=session)
+    context.__aexit__ = AsyncMock(return_value=None)
     driver = MagicMock()
-    driver.session.return_value = session_context
-    return driver, session, transaction
+    driver.session.return_value = context
+    return driver, session, tx
 
 
-async def _fake_embeddings(texts: list[str]) -> list[list[float]]:
+async def fake_embeddings(texts):
     return [[0.1, 0.2, 0.3] for _ in texts]
 
 
-def test_graph_read_starts_from_repository_scoped_files() -> None:
-    assert "MATCH (file:File {repo_name: $repo_name})" in GRAPH_QUERY
-    assert "Function {repo_name: $repo_name}" in GRAPH_QUERY
-    assert "(m {repo_name: $repo_name})" in GRAPH_QUERY
-    assert "IN_COMMUNITY" in GRAPH_QUERY
-    assert "n_community.name AS n_community_name" in GRAPH_QUERY
-    assert "\nMATCH (n)\n" not in GRAPH_QUERY
+def persist(parsed, *, replace=True, deleted=None, state=None):
+    driver, session, tx = mock_driver(state)
+    with (
+        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
+        patch("app.db.graph_ops.generate_embeddings", side_effect=fake_embeddings),
+        patch("app.db.graph_ops.run_leiden_clustering", new=AsyncMock()),
+        patch("app.db.graph_ops.label_and_store_communities", new=AsyncMock()),
+    ):
+        asyncio.run(save_parsed_ast_to_neo4j(
+            parsed, REPO, replace_existing=replace, deleted_file_paths=deleted,
+        ))
+    return session, tx
 
 
-def test_function_write_includes_raw_code() -> None:
-    assert "fn.raw_code = func.raw_code" in MERGE_FUNCTIONS_QUERY
+def batch_for(tx, query):
+    return [call.kwargs["batch"] for call in tx.run.await_args_list if call.args[0] == query]
 
 
-def test_node_code_read_uses_graph_id_and_repository_scope() -> None:
+def test_read_and_write_queries_preserve_identity_and_compatibility():
+    assert "graph_state: 'ready'" in GRAPH_QUERY
+    assert "HAS_UNRESOLVED_CALL" in GRAPH_QUERY
     assert "elementId(function) = $node_id" in NODE_CODE_QUERY
     assert "repo_name: $repo_name" in NODE_CODE_QUERY
-    assert "function.raw_code AS code" in NODE_CODE_QUERY
+    assert "graph_state: 'ready'" in NODE_CODE_QUERY
+    assert "entity_id: func.entity_id" in MERGE_FUNCTIONS_QUERY
+    assert "fn.raw_code = func.raw_code" in MERGE_FUNCTIONS_QUERY
+    assert "MERGE (f)-[:DEFINES]->(fn)" in MERGE_FUNCTIONS_QUERY
+    assert "entity_id: call.caller_id" in MERGE_CALLS_QUERY
+    assert "entity_id: call.target_id" in MERGE_CALLS_QUERY
+    assert "UnresolvedCall:ExternalFunction" in MERGE_UNRESOLVED_CALLS_QUERY
 
 
-def test_chunk_data_uses_bounded_slices() -> None:
-    chunks = list(chunk_data(list(range(205))))
-
-    assert [len(chunk) for chunk in chunks] == [100, 100, 5]
-    assert [item for chunk in chunks for item in chunk] == list(range(205))
-
-
-def test_three_pass_write_receives_repository_scope() -> None:
-    driver, session, transaction = _mock_driver()
-    parsed_data = [
-        {
-            "file_path": "src/example.py",
-            "defined_functions": ["example"],
-            "functions": [
-                {
-                    "name": "example",
-                    "raw_code": "def example():\n    external_call()",
-                }
-            ],
-            "outgoing_calls": ["external_call"],
-        }
+def test_same_names_scopes_overloads_and_repeats_remain_distinct():
+    parsed = [
+        parse("src/a.py", b"def validate(): pass\n"),
+        parse("src/b.py", b"def validate(): pass\n"),
+        parse("src/c.py", b"class A:\n def validate(self): pass\nclass B:\n def validate(self): pass\n"),
+        parse("src/d.py", b"def f(x): pass\ndef f(x): pass\n"),
+        parse("src/V.java", b"class V { void f(String x) {} void f(int x) {} }"),
+        parse("src/v.ts", b"class V { f(x: string): void; f(x: number): void; f(x: any): void {} }"),
     ]
-
-    with (
-        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
-        patch(
-            "app.db.graph_ops.generate_embeddings",
-            side_effect=_fake_embeddings,
-        ) as embed_batch,
-        patch(
-            "app.db.graph_ops.run_leiden_clustering",
-            new=AsyncMock(),
-        ) as cluster_graph,
-        patch(
-            "app.db.graph_ops.label_and_store_communities",
-            new=AsyncMock(),
-        ) as label_communities,
-    ):
-        asyncio.run(
-            save_parsed_ast_to_neo4j(
-                parsed_data,
-                repo_name="owner/repository-a",
-                replace_existing=True,
-            )
-        )
-
-    assert session.execute_write.await_count == 5
-    assert transaction.run.await_count == 5
-    expected_queries = [
-        DELETE_REPOSITORY_QUERY,
-        MERGE_FILES_QUERY,
-        MERGE_FUNCTIONS_QUERY,
-        MERGE_CALLS_QUERY,
-        TAG_EXTERNAL_FUNCTIONS_QUERY,
-    ]
-    assert [
-        call.args[0] for call in transaction.run.await_args_list
-    ] == expected_queries
-    assert transaction.run.await_args_list[1].kwargs["batch"] == [
-        {"path": "src/example.py"}
-    ]
-    assert transaction.run.await_args_list[2].kwargs["batch"] == [
-        {
-            "name": "example",
-            "file_path": "src/example.py",
-            "raw_code": "def example():\n    external_call()",
-            "embedding": [0.1, 0.2, 0.3],
-        }
-    ]
-    assert transaction.run.await_args_list[3].kwargs["batch"] == [
-        {
-            "caller_name": "example",
-            "target_name": "external_call",
-            "file_path": "src/example.py",
-        }
-    ]
-    for call in transaction.run.await_args_list:
-        assert call.kwargs["repo_name"] == "owner/repository-a"
-        assert "$repo_name" in call.args[0]
-    embed_batch.assert_awaited_once_with(
-        ["Function: example\nFile: src/example.py"]
-    )
-    cluster_graph.assert_awaited_once_with("owner/repository-a")
-    label_communities.assert_awaited_once_with("owner/repository-a")
+    files, funcs, _, _ = _extract_etl_records(parsed, REPO)
+    assert len(files) == 6
+    assert len(funcs) == sum(len(p["functions"]) for p in parsed)
+    assert len({f["entity_id"] for f in funcs}) == len(funcs)
+    assert len([f for f in funcs if f["file_path"] == "src/v.ts"]) == 3
+    assert len([f for f in funcs if f["file_path"] == "src/V.java"]) == 2
+    _, tx = persist(parsed)
+    written = [f for batch in batch_for(tx, MERGE_FUNCTIONS_QUERY) for f in batch]
+    assert {f["entity_id"] for f in written} == {f["entity_id"] for f in funcs}
+    assert {f["file_path"] for f in written} == {f["file_path"] for f in funcs}
 
 
-def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
-    driver, session, transaction = _mock_driver()
-    parsed_data = [
-        {
-            "file_path": f"src/file_{index}.py",
-            "defined_functions": [f"function_{index}"],
-            "outgoing_calls": [],
-        }
-        for index in range(205)
-    ]
-
-    with (
-        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
-        patch(
-            "app.db.graph_ops.generate_embeddings",
-            side_effect=_fake_embeddings,
-        ) as embed_batch,
-        patch(
-            "app.db.graph_ops.run_leiden_clustering",
-            new=AsyncMock(),
-        ) as cluster_graph,
-        patch(
-            "app.db.graph_ops.label_and_store_communities",
-            new=AsyncMock(),
-        ) as label_communities,
-    ):
-        asyncio.run(
-            save_parsed_ast_to_neo4j(
-                parsed_data,
-                repo_name="owner/large-repository",
-            )
-        )
-
-    # Three file chunks, three function chunks, no call chunks, and one tag pass.
-    assert session.execute_write.await_count == 7
-    batch_calls = [
-        call
-        for call in transaction.run.await_args_list
-        if "batch" in call.kwargs
-    ]
-    assert [len(call.kwargs["batch"]) for call in batch_calls] == [
-        100,
-        100,
-        5,
-        100,
-        100,
-        5,
-    ]
-    assert all(len(call.kwargs["batch"]) <= 100 for call in batch_calls)
-    assert [
-        len(call.args[0]) for call in embed_batch.await_args_list
-    ] == [100, 100, 5]
-    cluster_graph.assert_awaited_once_with("owner/large-repository")
-    label_communities.assert_awaited_once_with("owner/large-repository")
-
-
-def test_external_postprocessing_remains_repository_scoped() -> None:
-    assert "SET fn:ExternalFunction" in TAG_EXTERNAL_FUNCTIONS_QUERY
-    assert "fn.is_external = true" in TAG_EXTERNAL_FUNCTIONS_QUERY
-    assert "$repo_name" in TAG_EXTERNAL_FUNCTIONS_QUERY
-
-
-def test_repository_replacement_includes_community_nodes() -> None:
-    assert "node:Community" in DELETE_REPOSITORY_QUERY
-    assert "node:Repository" in DELETE_REPOSITORY_QUERY
-
-
-def test_full_ingestion_stores_repository_token_baseline() -> None:
-    driver, _, transaction = _mock_driver()
-    parsed_data = [
-        {
-            "file_path": "src/example.py",
-            "defined_functions": ["example"],
-            "outgoing_calls": [],
-            "source_tokens": 37,
-        },
-        {
-            "file_path": "src/helper.py",
-            "defined_functions": ["helper"],
-            "outgoing_calls": [],
-            "source_tokens": 13,
-        },
-    ]
-
-    with (
-        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
-        patch(
-            "app.db.graph_ops.generate_embeddings",
-            side_effect=_fake_embeddings,
-        ),
-        patch(
-            "app.db.graph_ops.run_leiden_clustering",
-            new=AsyncMock(),
-        ),
-        patch(
-            "app.db.graph_ops.label_and_store_communities",
-            new=AsyncMock(),
-        ),
-    ):
-        asyncio.run(
-            save_parsed_ast_to_neo4j(
-                parsed_data,
-                repo_name="owner/repository",
-                replace_existing=True,
-            )
-        )
-
-    metadata_call = next(
-        call
-        for call in transaction.run.await_args_list
-        if call.args[0] == MERGE_REPOSITORY_TOKENS_QUERY
-    )
-    assert metadata_call.kwargs == {
-        "repo_name": "owner/repository",
-        "total_tokens": 50,
-        "tokenizer_model": "gpt-4o",
+def test_call_attribution_and_unresolved_sites():
+    parsed = parse("src/work.py", b"def helper(): pass\ndef first():\n helper()\ndef second():\n external()\noutside()\n")
+    _, funcs, linked, unresolved = _extract_etl_records([parsed], REPO)
+    ids = {f["name"]: f["entity_id"] for f in funcs}
+    assert len(linked) == 1
+    assert (linked[0]["caller_id"], linked[0]["target_id"]) == (ids["first"], ids["helper"])
+    assert linked[0]["resolution_status"] == "inferred"
+    assert {(c["name"], c["caller_id"]) for c in unresolved} == {
+        ("external", ids["second"]), ("outside", None)
     }
-    assert "MERGE (repository)-[:CONTAINS]->(f)" in MERGE_FILES_QUERY
+    session, tx = persist([parsed])
+    assert len(batch_for(tx, MERGE_CALLS_QUERY)[0]) == 1
+    assert len(batch_for(tx, MERGE_UNRESOLVED_CALLS_QUERY)[0]) == 2
+    assert session.run.await_args_list[-1].args[0] == MARK_REPOSITORY_READY_QUERY
 
 
-def test_repository_token_baseline_read_is_scoped() -> None:
-    result = MagicMock()
-    result.single = AsyncMock(return_value={"total_tokens": 12_345})
-    session = MagicMock()
-    session.run = AsyncMock(return_value=result)
-    session_context = MagicMock()
-    session_context.__aenter__ = AsyncMock(return_value=session)
-    session_context.__aexit__ = AsyncMock(return_value=None)
-    driver = MagicMock()
-    driver.session.return_value = session_context
+def test_ambiguous_and_dynamic_targets_create_no_calls_edge():
+    parsed = parse("src/work.py", b"def validate(): pass\ndef validate(): pass\ndef caller():\n validate()\n obj.validate()\n")
+    _, _, linked, unresolved = _extract_etl_records([parsed], REPO)
+    assert linked == []
+    assert len(unresolved) == 2
+    assert all(c["resolution_status"] == "ambiguous" for c in unresolved)
+    assert len({c["call_id"] for c in unresolved}) == 2
 
-    with patch("app.db.get_neo4j_driver", return_value=driver):
-        total = asyncio.run(
-            fetch_repository_total_tokens("owner/repository")
-        )
 
-    assert total == 12_345
-    session.run.assert_awaited_once_with(
-        REPOSITORY_TOKEN_QUERY,
-        repo_name="owner/repository",
-    )
+def test_cross_file_name_without_binding_stays_unresolved():
+    parsed = [parse("src/a.py", b"def caller():\n validate()\n"), parse("src/b.py", b"def validate(): pass\n")]
+    _, _, linked, unresolved = _extract_etl_records(parsed, REPO)
+    assert linked == []
+    assert unresolved[0]["provenance"] == "insufficient_binding_evidence"
+
+
+def test_full_write_marks_building_then_ready_and_scopes_all_writes():
+    parsed = parse("src/work.py", b"def f(): pass\n")
+    session, tx = persist([parsed])
+    queries = [c.args[0] for c in tx.run.await_args_list]
+    assert queries[:2] == [DELETE_REPOSITORY_QUERY, MARK_REPOSITORY_BUILDING_QUERY]
+    assert queries[-2:] == [MERGE_FILES_QUERY, MERGE_FUNCTIONS_QUERY]
+    assert session.run.await_args_list[-1].args[0] == MARK_REPOSITORY_READY_QUERY
+    assert all(c.kwargs["repo_name"] == REPO for c in tx.run.await_args_list)
+
+
+def test_incremental_deletes_all_affected_file_entities_before_rewrite():
+    parsed = parse("src/new.py", b"def f(): pass\n")
+    session, tx = persist([parsed], replace=False, deleted=["src/old.py"], state={"graph_state": "ready", "legacy_count": 0})
+    assert session.run.await_args_list[0].args[0] == CHECK_REPOSITORY_STATE_QUERY
+    assert [c.args[0] for c in tx.run.await_args_list[:4]] == [
+        MARK_REPOSITORY_BUILDING_QUERY, DELETE_FILE_FUNCTIONS_QUERY,
+        DELETE_FILE_CALLS_QUERY, DELETE_FILES_QUERY,
+    ]
+    assert all(c.kwargs["paths"] == ["src/new.py", "src/old.py"] for c in tx.run.await_args_list[1:4])
+    assert session.run.await_args_list[-1].args[0] == MARK_REPOSITORY_READY_QUERY
+
+
+def test_incremental_does_not_replace_full_repository_token_baseline():
+    parsed = parse("src/new.py", b"def f(): pass\n")
+    parsed["source_tokens"] = 7
+    _, tx = persist([parsed], replace=False, state={"graph_state": "ready", "legacy_count": 0})
+    assert MERGE_REPOSITORY_TOKENS_QUERY not in [c.args[0] for c in tx.run.await_args_list]
+
+
+@pytest.mark.parametrize("state", [None, {"graph_state": None, "legacy_count": 1}, {"graph_state": "building", "legacy_count": 0}])
+def test_incremental_requires_identity_based_ready_graph(state):
+    driver, session, tx = mock_driver(state)
+    with patch("app.db.graph_ops.get_neo4j_driver", return_value=driver):
+        with pytest.raises(ValueError, match="rebuild"):
+            asyncio.run(save_parsed_ast_to_neo4j([parse("src/f.py", b"def f(): pass\n")], REPO))
+    tx.run.assert_not_awaited()
+    session.run.assert_awaited_once()
+
+
+def test_bad_parser_identity_is_rejected():
+    parsed = parse("src/f.py", b"def f(): pass\n")
+    parsed["functions"][0]["entity_id"] = "wrong"
+    with pytest.raises(ValueError, match="canonical"):
+        _extract_etl_records([parsed], REPO)
+
+
+def test_chunk_data_is_bounded():
+    assert [len(c) for c in chunk_data(list(range(205)))] == [100, 100, 5]

@@ -10,11 +10,13 @@ from app.config import settings
 
 
 GRAPH_QUERY = """
+MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
 MATCH (file:File {repo_name: $repo_name})
 OPTIONAL MATCH (file)-[:DEFINES]->(function:Function {repo_name: $repo_name})
 WITH collect(DISTINCT file) + collect(DISTINCT function) AS repository_nodes
 UNWIND repository_nodes AS n
-OPTIONAL MATCH (n)-[r:DEFINES|CALLS]->(m {repo_name: $repo_name})
+OPTIONAL MATCH (n)-[r:DEFINES|CALLS|HAS_UNRESOLVED_CALL]->
+    (m {repo_name: $repo_name})
 OPTIONAL MATCH (n:Function)-[:IN_COMMUNITY]->(
     n_community:Community {repo_name: $repo_name}
 )
@@ -32,6 +34,7 @@ LIMIT 200
 """
 
 NODE_CODE_QUERY = """
+MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
 MATCH (function:Function {repo_name: $repo_name})
 WHERE elementId(function) = $node_id
 RETURN function.raw_code AS code,
