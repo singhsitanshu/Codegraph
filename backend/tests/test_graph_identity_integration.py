@@ -11,7 +11,11 @@ import pytest
 from neo4j import AsyncGraphDatabase, GraphDatabase
 
 from app.db import fetch_graph_data, fetch_node_code
-from app.db.graph_ops import save_parsed_ast_to_neo4j
+from app.db.graph_ops import (
+    MERGE_UNATTRIBUTED_CALLS_QUERY,
+    MERGE_UNRESOLVED_CALLS_QUERY,
+    save_parsed_ast_to_neo4j,
+)
 from app.services.parser_service import CodeParser
 
 REPO = "integration/identity"
@@ -51,6 +55,8 @@ def disposable_neo4j():
             with driver.session() as session:
                 session.run("CREATE CONSTRAINT function_repo_entity_id IF NOT EXISTS FOR (fn:Function) REQUIRE (fn.repo_name, fn.entity_id) IS UNIQUE").consume()
                 session.run("CREATE CONSTRAINT unresolved_call_repo_id IF NOT EXISTS FOR (call:UnresolvedCall) REQUIRE (call.repo_name, call.call_id) IS UNIQUE").consume()
+                session.run("CREATE INDEX file_repo_path IF NOT EXISTS FOR (f:File) ON (f.repo_name, f.path)").consume()
+                session.run("CALL db.awaitIndexes(60)").consume()
             yield uri, driver
         finally:
             driver.close()
@@ -62,6 +68,25 @@ async def _fake_embeddings(texts):
     return [[0.1, 0.2, 0.3] for _ in texts]
 
 
+@pytest.mark.parametrize("query", [MERGE_UNRESOLVED_CALLS_QUERY, MERGE_UNATTRIBUTED_CALLS_QUERY])
+def test_unresolved_call_plans_avoid_database_wide_scans(disposable_neo4j, query):
+    _, driver = disposable_neo4j
+    with driver.session() as session:
+        plan = session.run(
+            "EXPLAIN " + query, repo_name=REPO,
+            batch=[{"caller_id": "fn:test", "file_path": "src/test.py", "call_id": "call:test"}],
+        ).consume().plan
+
+    def operators(node):
+        yield node["operatorType"]
+        for child in node.get("children", []):
+            yield from operators(child)
+
+    types = list(operators(plan))
+    assert "AllNodesScan" not in types
+    assert any("IndexSeek" in operator for operator in types)
+
+
 def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
     uri, sync_driver = disposable_neo4j
 
@@ -70,7 +95,7 @@ def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
         parser = CodeParser()
         async def parse(path, code):
             return await parser.parse_file(path, code, repository=REPO)
-        auth = await parse("src/auth.py", b"def validate():\n return 'auth'\ndef caller():\n validate()\n remote()\n")
+        auth = await parse("src/auth.py", b"def validate():\n return 'auth'\ndef caller():\n validate()\n remote()\noutside()\n")
         payments = await parse("src/payments.py", b"def validate():\n return 'payments'\n")
         try:
             with (
@@ -87,9 +112,12 @@ def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
                 assert len({n["data"]["entity_id"] for n in validates}) == 2
                 codes = [await fetch_node_code(n["id"], REPO) for n in validates]
                 assert {c["file_path"] for c in codes} == {"src/auth.py", "src/payments.py"}
-                assert {c["code"].strip().splitlines()[-1] for c in codes} == {"return 'auth'", "return 'payments'"}
+                assert {c["file_path"]: c["code"] for c in codes} == {
+                    "src/auth.py": "def validate():\n return 'auth'",
+                    "src/payments.py": "def validate():\n return 'payments'",
+                }
                 assert len([e for e in graph["edges"] if e["label"] == "CALLS"]) == 1
-                assert len([e for e in graph["edges"] if e["label"] == "HAS_UNRESOLVED_CALL"]) == 1
+                assert len([e for e in graph["edges"] if e["label"] == "HAS_UNRESOLVED_CALL"]) == 2
 
                 await save_parsed_ast_to_neo4j([auth, payments], REPO, replace_existing=True)
                 with sync_driver.session() as session:
@@ -98,7 +126,7 @@ def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
                     defines = session.run("MATCH (file:File {repo_name: $repo})-[:DEFINES]->(f:Function) RETURN file.path AS path, f.file_path AS stored", repo=REPO).data()
                     assert len(defines) == 3 and all(row["path"] == row["stored"] for row in defines)
                     assert session.run("MATCH (:Function {repo_name: $repo})-[r:CALLS]->(:Function) RETURN count(r) AS n", repo=REPO).single()["n"] == 1
-                    assert session.run("MATCH (u:UnresolvedCall {repo_name: $repo}) RETURN count(u) AS n", repo=REPO).single()["n"] == 1
+                    assert session.run("MATCH (u:UnresolvedCall {repo_name: $repo}) RETURN count(u) AS n", repo=REPO).single()["n"] == 2
 
                 changed = await parse("src/auth.py", b"def validate():\n return 'auth-v2'\ndef added(): pass\n")
                 await save_parsed_ast_to_neo4j([changed], REPO, deleted_file_paths=["src/payments.py"])

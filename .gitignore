@@ -2,6 +2,8 @@
 .venv/
 __pycache__/
 .pytest_cache/
+backend/.cache/
+backend/benchmarks/results/*.log
 *.py[cod]
 frontend/node_modules/
 frontend/dist/

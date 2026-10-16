@@ -1,14 +1,23 @@
 """Neo4j persistence operations for parsed source-code relationships."""
 
+import asyncio
+import logging
+from collections import deque
 from collections.abc import AsyncIterator, Iterator
+from contextlib import aclosing
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, TypeVar
 
 from app.db import get_neo4j_driver
-from app.db.call_resolution import call_site_id, resolve_call
+from app.db.call_resolution import CallResolutionIndex, call_site_id, resolve_call
 from app.db.gds_ops import run_leiden_clustering
 from app.services.community_summarizer import label_and_store_communities
-from app.services.embedding_service import generate_embeddings
+from app.services.embedding_service import (
+    EMBEDDING_REQUEST_BATCH_SIZE,
+    MAX_CONCURRENT_EMBEDDING_REQUESTS,
+    generate_embeddings,
+)
 from app.utils.entity_identity import (
     generate_function_entity_id,
     normalize_repository_path,
@@ -17,6 +26,7 @@ from app.utils.tokens import DEFAULT_TOKEN_MODEL
 
 
 DEFAULT_BATCH_SIZE = 100
+logger = logging.getLogger(__name__)
 BatchItem = TypeVar("BatchItem")
 
 DELETE_REPOSITORY_QUERY = """
@@ -130,8 +140,7 @@ SET relationship.resolution_status = call.resolution_status,
     relationship.end_column = call.end_column
 """
 
-MERGE_UNRESOLVED_CALLS_QUERY = """
-UNWIND $batch AS call
+_STORE_UNRESOLVED_CALL = """
 MERGE (unresolved:UnresolvedCall:ExternalFunction {
     repo_name: $repo_name, call_id: call.call_id
 })
@@ -148,12 +157,19 @@ SET unresolved.name = call.name,
     unresolved.external = true,
     unresolved.is_external = true,
     unresolved.nodeType = 'UnresolvedCall'
-WITH unresolved, call
-MATCH (source {repo_name: $repo_name})
-WHERE (source:Function AND source.entity_id = call.caller_id)
-   OR (source:File AND call.caller_id IS NULL AND source.path = call.file_path)
 MERGE (source)-[:HAS_UNRESOLVED_CALL]->(unresolved)
 """
+
+# Separate labeled lookups let Neo4j seek the existing composite indexes.
+MERGE_UNRESOLVED_CALLS_QUERY = """
+UNWIND $batch AS call
+MATCH (source:Function {repo_name: $repo_name, entity_id: call.caller_id})
+""" + _STORE_UNRESOLVED_CALL
+
+MERGE_UNATTRIBUTED_CALLS_QUERY = """
+UNWIND $batch AS call
+MATCH (source:File {repo_name: $repo_name, path: call.file_path})
+""" + _STORE_UNRESOLVED_CALL
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +250,7 @@ def _extract_etl_records(
             call_sites.append((None, file_path, call))
 
     all_functions = list(functions.values())
+    resolution_index = CallResolutionIndex(all_functions)
     resolved: dict[str, dict[str, Any]] = {}
     unresolved: dict[str, dict[str, Any]] = {}
     for caller, file_path, call in call_sites:
@@ -241,7 +258,7 @@ def _extract_etl_records(
             raise ValueError("call site is missing its syntactic name")
         caller_id = caller["entity_id"] if caller is not None else None
         call_id = call_site_id(file_path, caller_id, call)
-        target_id, status, provenance = resolve_call(caller, call, all_functions)
+        target_id, status, provenance = resolve_call(caller, call, resolution_index)
         record = {
             "call_id": call_id,
             "caller_id": caller_id,
@@ -271,6 +288,39 @@ def _function_embedding_text(function: dict[str, Any]) -> str:
         f"Function: {function['qualified_name']}\n"
         f"File: {function['file_path']}"
     )
+
+
+async def _embedded_function_batches(
+    functions: list[dict[str, Any]],
+) -> AsyncIterator[list[dict[str, Any]]]:
+    """Embed each distinct input once, with bounded request prefetch."""
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for function in functions:
+        groups.setdefault(_function_embedding_text(function), []).append(function)
+    inputs = iter(chunk_data(list(groups), EMBEDDING_REQUEST_BATCH_SIZE))
+    pending: deque[tuple[list[str], asyncio.Task]] = deque()
+    try:
+        for _ in range(MAX_CONCURRENT_EMBEDDING_REQUESTS):
+            batch = next(inputs, None)
+            if batch is not None:
+                pending.append((batch, asyncio.create_task(generate_embeddings(batch))))
+        while pending:
+            batch, task = pending.popleft()
+            vectors = await task
+            yield [
+                {**function, "embedding": vector}
+                for text, vector in zip(batch, vectors, strict=True)
+                for function in groups[text]
+            ]
+            following = next(inputs, None)
+            if following is not None:
+                pending.append((following, asyncio.create_task(generate_embeddings(following))))
+    finally:
+        for _, task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
 
 
 def _resolve_total_repo_tokens(
@@ -310,8 +360,14 @@ async def save_parsed_ast_to_neo4j_with_progress(
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
 
+    stage_started = perf_counter()
     files, functions, calls, unresolved_calls = _extract_etl_records(
         parsed_data_list, normalized_repo_name
+    )
+    logger.info(
+        "Ingestion %s: prepared %d functions and %d call sites in %.2fs",
+        normalized_repo_name, len(functions), len(calls) + len(unresolved_calls),
+        perf_counter() - stage_started,
     )
     deleted_paths = {
         normalize_repository_path(path)
@@ -392,32 +448,69 @@ async def save_parsed_ast_to_neo4j_with_progress(
             "Pass 2: Embedding and Creating Functions...",
             90,
         )
-        for batch in chunk_data(functions, batch_size):
-            embeddings = await generate_embeddings(
-                [_function_embedding_text(function) for function in batch]
-            )
-            embedded_batch = [
-                {**function, "embedding": embedding}
-                for function, embedding in zip(batch, embeddings, strict=True)
-            ]
-            await run_transaction(MERGE_FUNCTIONS_QUERY, embedded_batch)
+        stage_started = perf_counter()
+        function_count = 0
+        async with aclosing(_embedded_function_batches(functions)) as embedded_batches:
+            async for embedded_group in embedded_batches:
+                for embedded_batch in chunk_data(embedded_group, batch_size):
+                    await run_transaction(MERGE_FUNCTIONS_QUERY, embedded_batch)
+                    function_count += len(embedded_batch)
+                    yield DatabaseWriteProgress(
+                        f"Pass 2: Embedding and Creating Functions ({function_count}/{len(functions)})...",
+                        90 + 3 * function_count // len(functions),
+                    )
+        logger.info(
+            "Ingestion %s: embedded and stored functions in %.2fs",
+            normalized_repo_name, perf_counter() - stage_started,
+        )
 
         yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
-        for batch in chunk_data(calls, batch_size):
-            await run_transaction(MERGE_CALLS_QUERY, batch)
-        for batch in chunk_data(unresolved_calls, batch_size):
-            await run_transaction(MERGE_UNRESOLVED_CALLS_QUERY, batch)
+        stage_started = perf_counter()
+        function_calls = [
+            call for call in unresolved_calls if call["caller_id"] is not None
+        ]
+        file_calls = [
+            call for call in unresolved_calls if call["caller_id"] is None
+        ]
+        call_count = 0
+        total_calls = len(calls) + len(unresolved_calls)
+        for query, records in (
+            (MERGE_CALLS_QUERY, calls),
+            (MERGE_UNRESOLVED_CALLS_QUERY, function_calls),
+            (MERGE_UNATTRIBUTED_CALLS_QUERY, file_calls),
+        ):
+            for batch in chunk_data(records, batch_size):
+                await run_transaction(query, batch)
+                call_count += len(batch)
+                yield DatabaseWriteProgress(
+                    f"Pass 3: Mapping Dependencies ({call_count}/{total_calls})...",
+                    94 + 2 * call_count // total_calls,
+                )
+        logger.info(
+            "Ingestion %s: stored dependencies in %.2fs",
+            normalized_repo_name, perf_counter() - stage_started,
+        )
 
     yield DatabaseWriteProgress(
         "Detecting architectural communities...",
         97,
     )
+    stage_started = perf_counter()
     await run_leiden_clustering(normalized_repo_name)
+    logger.info(
+        "Ingestion %s: clustered graph in %.2fs",
+        normalized_repo_name, perf_counter() - stage_started,
+    )
     yield DatabaseWriteProgress(
         "Labeling architectural communities...",
         98,
     )
+    stage_started = perf_counter()
     await label_and_store_communities(normalized_repo_name)
+    logger.info(
+        "Ingestion %s: labeled communities in %.2fs",
+        normalized_repo_name, perf_counter() - stage_started,
+    )
     async with get_neo4j_driver().session() as session:
         result = await session.run(
             MARK_REPOSITORY_READY_QUERY,

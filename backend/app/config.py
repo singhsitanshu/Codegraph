@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     NEO4J_PASSWORD: str = "password"
     ANTHROPIC_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    EMBEDDING_CACHE_PATH: str = str(BACKEND_DIR / ".cache" / "embeddings.sqlite3")
 
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env",

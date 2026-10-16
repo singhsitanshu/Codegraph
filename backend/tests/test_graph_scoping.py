@@ -12,6 +12,7 @@ from app.db.graph_ops import (
     MARK_REPOSITORY_BUILDING_QUERY, MARK_REPOSITORY_READY_QUERY,
     MERGE_CALLS_QUERY, MERGE_FILES_QUERY, MERGE_FUNCTIONS_QUERY,
     MERGE_REPOSITORY_TOKENS_QUERY, MERGE_UNRESOLVED_CALLS_QUERY,
+    MERGE_UNATTRIBUTED_CALLS_QUERY,
     _extract_etl_records, chunk_data,
     save_parsed_ast_to_neo4j,
 )
@@ -112,7 +113,10 @@ def test_call_attribution_and_unresolved_sites():
     }
     session, tx = persist([parsed])
     assert len(batch_for(tx, MERGE_CALLS_QUERY)[0]) == 1
-    assert len(batch_for(tx, MERGE_UNRESOLVED_CALLS_QUERY)[0]) == 2
+    assert len(batch_for(tx, MERGE_UNRESOLVED_CALLS_QUERY)[0]) == 1
+    assert len(batch_for(tx, MERGE_UNATTRIBUTED_CALLS_QUERY)[0]) == 1
+    assert batch_for(tx, MERGE_UNRESOLVED_CALLS_QUERY)[0][0]["caller_id"] == ids["second"]
+    assert batch_for(tx, MERGE_UNATTRIBUTED_CALLS_QUERY)[0][0]["caller_id"] is None
     assert session.run.await_args_list[-1].args[0] == MARK_REPOSITORY_READY_QUERY
 
 
