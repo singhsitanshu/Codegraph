@@ -105,9 +105,10 @@ def test_typescript_overload_signatures_and_implementation_are_distinct() -> Non
     assert result["defined_functions"] == ["validate"]
     assert functions[0]["calls"] == functions[1]["calls"] == []
     assert [call["name"] for call in functions[2]["calls"]] == ["check"]
-    _, legacy_functions, _ = _extract_etl_records([result])
-    assert len(legacy_functions) == 1
-    assert "check(value)" in legacy_functions[0]["raw_code"]
+    _, persisted_functions, _ = _extract_etl_records([result], REPOSITORY)
+    assert len(persisted_functions) == 1
+    assert persisted_functions[0]["entity_id"] == functions[2]["entity_id"]
+    assert "check(value)" in persisted_functions[0]["raw_code"]
 
 
 def test_typescript_interface_methods_use_interface_scope() -> None:

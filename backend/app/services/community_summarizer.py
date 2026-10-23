@@ -25,7 +25,7 @@ FETCH_COMMUNITIES_QUERY = """
 MATCH (f:Function {repo_name: $repo_name})
 WHERE f.leiden_community IS NOT NULL
 WITH f.leiden_community AS comm_id,
-     collect(f.name)[..15] AS func_names,
+     collect(coalesce(f.qualified_name, f.name))[..15] AS func_names,
      collect(DISTINCT f.file_path)[..5] AS file_paths
 RETURN comm_id, func_names, file_paths
 ORDER BY comm_id

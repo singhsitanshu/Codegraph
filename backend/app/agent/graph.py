@@ -18,14 +18,19 @@ from app.utils.tokens import count_tokens
 logger = logging.getLogger(__name__)
 
 
+# Function names are not unique, so name lookups may match several
+# definitions; each result row identifies the definition it came from.
 CALLERS_QUERY = """
-MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->
-      (target:Function {name: $func_name, repo_name: $repo_name})
-OPTIONAL MATCH (file:File {repo_name: $repo_name})-[:DEFINES]->(caller)
-RETURN DISTINCT caller.name AS caller,
-       collect(DISTINCT file.path) AS file_paths,
+MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->(target)
+WHERE target.repo_name = $repo_name
+  AND (target:Function OR target:ExternalFunction)
+  AND (target.name = $func_name OR target.qualified_name = $func_name)
+RETURN coalesce(caller.qualified_name, caller.name) AS caller,
+       collect(DISTINCT caller.file_path) AS file_paths,
+       coalesce(target.qualified_name, target.name) AS target,
+       target.file_path AS target_file,
        coalesce(target.is_external, false) AS target_is_external
-ORDER BY caller
+ORDER BY caller, target_file
 LIMIT 100
 """
 
@@ -38,17 +43,19 @@ ORDER BY f.path
 FUNCTIONS_IN_FILE_QUERY = """
 MATCH (f:File {path: $file_path, repo_name: $repo_name})-[:DEFINES]->
       (fn:Function)
-RETURN fn.name AS function_name
-ORDER BY fn.name
+RETURN coalesce(fn.qualified_name, fn.name) AS function_name
+ORDER BY fn.start_line, function_name
 """
 
 OUTGOING_DEPENDENCIES_QUERY = """
-MATCH (caller:Function {name: $func_name, repo_name: $repo_name})-[:CALLS]->
-      (target:Function {repo_name: $repo_name})
-RETURN target.name AS target_name,
-       target.file AS target_file,
-       target.is_external AS is_external
-ORDER BY target.name, target.file
+MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->(target)
+WHERE caller.name = $func_name OR caller.qualified_name = $func_name
+RETURN coalesce(caller.qualified_name, caller.name) AS caller_name,
+       caller.file_path AS caller_file,
+       coalesce(target.qualified_name, target.name) AS target_name,
+       target.file_path AS target_file,
+       coalesce(target.is_external, false) AS is_external
+ORDER BY caller_file, caller_name, target_name, target_file
 """
 
 EXTERNAL_DEPENDENCIES_QUERY = """
@@ -65,7 +72,7 @@ MATCH (node:Function)
     LIMIT $top_k
   ) SCORE AS score
 WHERE node.repo_name = $repo_name
-RETURN node.name AS function_name,
+RETURN coalesce(node.qualified_name, node.name) AS function_name,
        node.file_path AS file_path,
        score
 ORDER BY score DESC
@@ -211,11 +218,14 @@ async def query_outgoing_dependencies(
         )
         records = await result.data()
 
-    dependencies: list[str] = []
+    dependencies_by_caller: dict[tuple[object, object], list[str]] = {}
     for record in records:
         target_name = record.get("target_name")
         if not isinstance(target_name, str):
             continue
+        dependencies = dependencies_by_caller.setdefault(
+            (record.get("caller_name"), record.get("caller_file")), []
+        )
         if record.get("is_external") is True:
             dependencies.append(f"- {target_name} (External/Built-in)")
             continue
@@ -223,14 +233,24 @@ async def query_outgoing_dependencies(
         location = target_file if isinstance(target_file, str) else "unknown file"
         dependencies.append(f"- {target_name} ({location})")
 
-    if not dependencies:
+    if not dependencies_by_caller:
         return f"No outgoing dependencies found for {normalized_function_name}."
-    return "\n".join(
-        [
-            f"Outgoing dependencies for {normalized_function_name}:",
-            *dependencies,
-        ]
-    )
+    if len(dependencies_by_caller) == 1:
+        return "\n".join(
+            [
+                f"Outgoing dependencies for {normalized_function_name}:",
+                *next(iter(dependencies_by_caller.values())),
+            ]
+        )
+    # Several definitions share this name; keep their dependencies apart.
+    lines = [
+        f"Outgoing dependencies for {len(dependencies_by_caller)} definitions "
+        f"named {normalized_function_name}:"
+    ]
+    for (caller_name, caller_file), dependencies in dependencies_by_caller.items():
+        lines.append(f"{caller_name} ({caller_file or 'unknown file'}):")
+        lines.extend(f"  {dependency}" for dependency in dependencies)
+    return "\n".join(lines)
 
 
 @tool

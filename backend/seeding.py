@@ -6,7 +6,7 @@ import sys
 # Ensure backend root is on sys.path
 sys.path.append(os.path.abspath("."))
 
-from app.services.parser_service import parse_changed_files
+from app.services.parser_service import attach_function_entity_ids, parse_changed_files
 from app.db.graph_ops import save_parsed_ast_to_neo4j
 
 # UPDATE THIS: Use an absolute path to your cloned requests directory
@@ -55,7 +55,15 @@ async def main():
     if not parsed_data:
         print("❌ [CHECK 3 FAILED] parse_changed_files returned an empty list []!")
         return
-    
+
+    # Function identities are scoped to repository-relative paths.
+    for parsed_file in parsed_data:
+        attach_function_entity_ids(
+            parsed_file,
+            repository=REQUESTS_REPO_NAME,
+            file_path=os.path.relpath(parsed_file["file_path"], REQUESTS_REPO_PATH),
+        )
+
     # Inspect first record
     sample_record = parsed_data[0]
     print("✅ [CHECK 3 PASSED] Sample parsed record:")

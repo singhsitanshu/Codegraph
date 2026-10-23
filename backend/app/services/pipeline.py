@@ -36,6 +36,28 @@ def _extract_push_files(payload: dict[str, Any]) -> list[str]:
     return _unique_paths(paths)
 
 
+def _extract_push_removed_files(payload: dict[str, Any]) -> list[str]:
+    """Return paths whose last change in a push removed them."""
+
+    commits = payload.get("commits", [])
+    if not isinstance(commits, list):
+        return []
+
+    removed: dict[str, bool] = {}
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        for field in ("added", "modified", "removed"):
+            values = commit.get(field, [])
+            if not isinstance(values, list):
+                continue
+            for path in values:
+                if isinstance(path, str) and path:
+                    removed.pop(path, None)
+                    removed[path] = field == "removed"
+    return [path for path, is_removed in removed.items() if is_removed]
+
+
 def _extract_pull_request_files(payload: dict[str, Any]) -> list[str]:
     """Extract filenames when a provider or test fixture embeds them in the PR."""
 
@@ -115,8 +137,10 @@ async def process_github_event(payload: dict[str, Any], event_type: str) -> None
     logger.info("Starting GitHub event processing: event_type=%s", normalized_event)
 
     try:
+        removed_files: list[str] = []
         if normalized_event == "push":
             modified_files = _extract_push_files(payload)
+            removed_files = _extract_push_removed_files(payload)
         elif normalized_event == "pull_request":
             modified_files = _extract_pull_request_files(payload)
             if not modified_files:
@@ -219,6 +243,7 @@ async def process_github_event(payload: dict[str, Any], event_type: str) -> None
         await save_parsed_ast_to_neo4j(
             parsed_relationships,
             repo_name=f"{owner}/{repo}",
+            deleted_file_paths=removed_files,
         )
         logger.info(
             "Neo4j stage complete: persisted %d parsed file(s)",
