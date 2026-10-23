@@ -13,6 +13,8 @@ from app.services.community_summarizer import (
     DELETE_COMMUNITIES_QUERY,
     FETCH_COMMUNITIES_QUERY,
     STORE_COMMUNITIES_QUERY,
+    UNGROUP_SMALL_COMMUNITIES_QUERY,
+    UNGROUPED_COMMUNITY_ID,
     CommunityLabel,
     _generate_community_labels,
     label_and_store_communities,
@@ -46,8 +48,8 @@ def _driver_for_records(records):
 
 def test_label_and_store_communities_replaces_repository_labels_atomically():
     records = [
-        dict(comm_id=2, func_names=["get", "post"], file_paths=["api.py"], function_count=2),
-        dict(comm_id=7, func_names=["extract_cookies", "store"], file_paths=["cookies.py"], function_count=2),
+        dict(comm_id=2, func_names=["get", "post", "put"], file_paths=["api.py"], function_count=3),
+        dict(comm_id=7, func_names=["extract_cookies", "store", "load"], file_paths=["cookies.py"], function_count=3),
     ]
     driver, session, transaction = _driver_for_records(records)
     labels = [
@@ -105,23 +107,39 @@ def test_label_and_store_communities_rejects_blank_repository():
         asyncio.run(label_and_store_communities("  "))
 
 
-def test_single_function_communities_do_not_require_model_requests():
-    records = [dict(comm_id=i, function_count=1, func_names=[f"Service.f{i}"], file_paths=["src/service.py"]) for i in range(30)]
-    driver, _, _ = _driver_for_records(records)
+def test_small_communities_are_grouped_without_model_requests():
+    records = [
+        dict(comm_id=1, function_count=5, func_names=["a"], file_paths=["a.py"]),
+        dict(comm_id=4, function_count=2, func_names=["b", "c"], file_paths=["b.py"]),
+        dict(comm_id=9, function_count=1, func_names=["d"], file_paths=["d.py"]),
+    ]
+    driver, _, transaction = _driver_for_records(records)
+    labels = [dict(id=1, name="Core", description="Core logic.")]
     with (
         patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
-        patch("app.services.community_summarizer._generate_community_labels", new=AsyncMock()) as generate,
+        patch("app.services.community_summarizer._generate_community_labels", new=AsyncMock(return_value=labels)) as generate,
     ):
-        labels = asyncio.run(label_and_store_communities("owner/repo"))
-    generate.assert_not_awaited()
-    assert len(labels) == 30
-    assert labels[0]["name"] == "Service.f0"
-    assert "src/service.py" in labels[0]["description"]
+        communities = asyncio.run(label_and_store_communities("owner/repo"))
+    generate.assert_awaited_once_with([records[0]])
+    assert [(community["id"], community["name"]) for community in communities] == [
+        (1, "Core"),
+        (UNGROUPED_COMMUNITY_ID, "Ungrouped"),
+    ]
+    assert transaction.run.await_args_list == [
+        call(DELETE_COMMUNITIES_QUERY, repo_name="owner/repo"),
+        call(
+            UNGROUP_SMALL_COMMUNITIES_QUERY,
+            repo_name="owner/repo",
+            community_ids=[4, 9],
+            ungrouped_id=UNGROUPED_COMMUNITY_ID,
+        ),
+        call(STORE_COMMUNITIES_QUERY, repo_name="owner/repo", communities=communities),
+    ]
 
 
 def test_community_requests_are_batched_bounded_and_keep_order():
     count = COMMUNITY_LABEL_BATCH_SIZE * MAX_CONCURRENT_COMMUNITY_LABELS + 3
-    records = [dict(comm_id=i, function_count=2, func_names=[str(i)], file_paths=["a.py"]) for i in range(count)]
+    records = [dict(comm_id=i, function_count=3, func_names=[str(i)], file_paths=["a.py"]) for i in range(count)]
     driver, _, _ = _driver_for_records(records)
     active = peak = 0
 
@@ -146,7 +164,7 @@ def test_community_requests_are_batched_bounded_and_keep_order():
 
 def test_label_failure_cancels_other_requests_without_replacing_stored_labels():
     count = COMMUNITY_LABEL_BATCH_SIZE * MAX_CONCURRENT_COMMUNITY_LABELS
-    records = [dict(comm_id=i, function_count=2, func_names=[str(i)], file_paths=["a.py"]) for i in range(count)]
+    records = [dict(comm_id=i, function_count=3, func_names=[str(i)], file_paths=["a.py"]) for i in range(count)]
     driver, session, _ = _driver_for_records(records)
     active = 0
 

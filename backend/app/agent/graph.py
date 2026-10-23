@@ -18,62 +18,50 @@ from app.utils.tokens import count_tokens
 logger = logging.getLogger(__name__)
 
 
+# Function names are not unique, so name lookups may match several
+# definitions; each result row identifies the definition it came from.
 CALLERS_QUERY = """
-MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
-MATCH (target:Function {name: $func_name, repo_name: $repo_name})
-OPTIONAL MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->(target)
-OPTIONAL MATCH (file:File {repo_name: $repo_name})-[:DEFINES]->(caller)
-RETURN target.entity_id AS target_entity_id,
-       target.qualified_name AS target_qualified_name,
+MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->(target)
+WHERE target.repo_name = $repo_name
+  AND (target:Function OR target:ExternalFunction)
+  AND (target.name = $func_name OR target.qualified_name = $func_name)
+RETURN coalesce(caller.qualified_name, caller.name) AS caller,
+       collect(DISTINCT caller.file_path) AS file_paths,
+       coalesce(target.qualified_name, target.name) AS target,
        target.file_path AS target_file,
-       caller.name AS caller,
-       caller.entity_id AS caller_entity_id,
-       caller.qualified_name AS caller_qualified_name,
-       collect(DISTINCT file.path) AS file_paths,
        coalesce(target.is_external, false) AS target_is_external
-ORDER BY target.file_path, target.qualified_name, caller
+ORDER BY caller, target_file
+LIMIT 100
 """
 
 CODEBASE_STRUCTURE_QUERY = """
-MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
 MATCH (f:File {repo_name: $repo_name})
 RETURN f.path AS file_path
 ORDER BY f.path
 """
 
 FUNCTIONS_IN_FILE_QUERY = """
-MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
 MATCH (f:File {path: $file_path, repo_name: $repo_name})-[:DEFINES]->
       (fn:Function)
-RETURN fn.name AS function_name,
-       fn.qualified_name AS qualified_name,
-       fn.entity_id AS entity_id,
-       fn.start_line AS start_line
-ORDER BY fn.start_line, fn.name
+RETURN coalesce(fn.qualified_name, fn.name) AS function_name
+ORDER BY fn.start_line, function_name
 """
 
 OUTGOING_DEPENDENCIES_QUERY = """
-MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
-MATCH (caller:Function {name: $func_name, repo_name: $repo_name})
-OPTIONAL MATCH (caller)-[call:CALLS]->(target:Function {repo_name: $repo_name})
-RETURN caller.entity_id AS caller_entity_id,
-       caller.qualified_name AS caller_qualified_name,
+MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->(target)
+WHERE caller.name = $func_name OR caller.qualified_name = $func_name
+RETURN coalesce(caller.qualified_name, caller.name) AS caller_name,
        caller.file_path AS caller_file,
-       target.name AS target_name,
-       target.qualified_name AS target_qualified_name,
+       coalesce(target.qualified_name, target.name) AS target_name,
        target.file_path AS target_file,
-       call.resolution_status AS resolution_status
-ORDER BY caller.file_path, caller.qualified_name, target.name
+       coalesce(target.is_external, false) AS is_external
+ORDER BY caller_file, caller_name, target_name, target_file
 """
 
 EXTERNAL_DEPENDENCIES_QUERY = """
-MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
-MATCH (call:UnresolvedCall {repo_name: $repo_name})
-RETURN call.name AS function_name,
-       call.syntax AS syntax,
-       call.file_path AS file_path,
-       call.resolution_status AS resolution_status
-ORDER BY call.file_path, call.start_line, call.start_column
+MATCH (fn:ExternalFunction {repo_name: $repo_name})
+RETURN fn.name AS function_name
+ORDER BY fn.name
 """
 
 SEMANTIC_CODE_SEARCH_QUERY = """
@@ -84,20 +72,13 @@ MATCH (node:Function)
     LIMIT $top_k
   ) SCORE AS score
 WHERE node.repo_name = $repo_name
-  AND EXISTS {
-    MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
-  }
-RETURN node.name AS function_name,
-       node.qualified_name AS qualified_name,
-       node.entity_id AS entity_id,
+RETURN coalesce(node.qualified_name, node.name) AS function_name,
        node.file_path AS file_path,
-       node.start_line AS start_line,
        score
 ORDER BY score DESC
 """
 
 ARCHITECTURAL_SUBSYSTEMS_QUERY = """
-MATCH (repository:Repository {repo_name: $repo_name, graph_state: 'ready'})
 MATCH (c:Community {repo_name: $repo_name})
 OPTIONAL MATCH (f:Function {repo_name: $repo_name})-[:IN_COMMUNITY]->(c)
 RETURN c.community_id AS id,
@@ -150,42 +131,14 @@ async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
         )
         records = await result.data()
 
-    targets = {
-        record.get("target_entity_id")
-        for record in records
-        if isinstance(record.get("target_entity_id"), str)
-    }
-    if len(targets) > 1:
-        return json.dumps(
-            {
-                "repo_name": normalized_repo_name,
-                "function_name": normalized_name,
-                "status": "ambiguous",
-                "candidates": list(
-                    {
-                        record["target_entity_id"]: {
-                            "entity_id": record["target_entity_id"],
-                            "qualified_name": record.get("target_qualified_name"),
-                            "file_path": record.get("target_file"),
-                        }
-                        for record in records
-                        if record.get("target_entity_id") in targets
-                    }.values()
-                ),
-                "callers": [],
-            },
-            default=str,
-        )
     return json.dumps(
         {
             "repo_name": normalized_repo_name,
             "function_name": normalized_name,
-            "status": "found" if targets else "not_found",
-            "target_entity_id": next(iter(targets), None),
             "target_is_external": any(
                 record.get("target_is_external") is True for record in records
             ),
-            "callers": [record for record in records if record.get("caller")],
+            "callers": records,
         },
         default=str,
     )
@@ -230,20 +183,17 @@ async def list_functions_in_file(repo_name: str, file_path: str) -> str:
         )
         records = await result.data()
 
-    functions = [
-        record for record in records
+    function_names = [
+        record["function_name"]
+        for record in records
         if isinstance(record.get("function_name"), str)
     ]
-    if not functions:
+    if not function_names:
         return f"No functions found in {normalized_file_path}."
     return "\n".join(
         [
             f"Functions in {normalized_file_path}:",
-            *(
-                f"- {record.get('qualified_name') or record['function_name']} "
-                f"(line {record.get('start_line') or '?'})"
-                for record in functions
-            ),
+            *(f"- {function_name}" for function_name in function_names),
         ]
     )
 
@@ -268,47 +218,39 @@ async def query_outgoing_dependencies(
         )
         records = await result.data()
 
-    callers = {
-        record.get("caller_entity_id")
-        for record in records
-        if isinstance(record.get("caller_entity_id"), str)
-    }
-    if len(callers) > 1:
-        candidates = {
-            (
-                record.get("caller_qualified_name") or normalized_function_name,
-                record.get("caller_file") or "unknown file",
-                record["caller_entity_id"],
-            )
-            for record in records
-            if record.get("caller_entity_id") in callers
-        }
-        return (
-            f"Ambiguous function name {normalized_function_name}; "
-            "this name-only tool cannot select one definition. Candidates: "
-            + ", ".join(
-                f"{name} ({path}; {entity_id})"
-                for name, path, entity_id in sorted(candidates)
-            )
-        )
-    dependencies: list[str] = []
+    dependencies_by_caller: dict[tuple[object, object], list[str]] = {}
     for record in records:
         target_name = record.get("target_name")
         if not isinstance(target_name, str):
             continue
+        dependencies = dependencies_by_caller.setdefault(
+            (record.get("caller_name"), record.get("caller_file")), []
+        )
+        if record.get("is_external") is True:
+            dependencies.append(f"- {target_name} (External/Built-in)")
+            continue
         target_file = record.get("target_file")
         location = target_file if isinstance(target_file, str) else "unknown file"
-        provenance = record.get("resolution_status") or "unknown"
-        dependencies.append(f"- {target_name} ({location}; {provenance} call)")
+        dependencies.append(f"- {target_name} ({location})")
 
-    if not dependencies:
+    if not dependencies_by_caller:
         return f"No outgoing dependencies found for {normalized_function_name}."
-    return "\n".join(
-        [
-            f"Outgoing dependencies for {normalized_function_name}:",
-            *dependencies,
-        ]
-    )
+    if len(dependencies_by_caller) == 1:
+        return "\n".join(
+            [
+                f"Outgoing dependencies for {normalized_function_name}:",
+                *next(iter(dependencies_by_caller.values())),
+            ]
+        )
+    # Several definitions share this name; keep their dependencies apart.
+    lines = [
+        f"Outgoing dependencies for {len(dependencies_by_caller)} definitions "
+        f"named {normalized_function_name}:"
+    ]
+    for (caller_name, caller_file), dependencies in dependencies_by_caller.items():
+        lines.append(f"{caller_name} ({caller_file or 'unknown file'}):")
+        lines.extend(f"  {dependency}" for dependency in dependencies)
+    return "\n".join(lines)
 
 
 @tool
@@ -326,21 +268,17 @@ async def list_external_dependencies(repo_name: str) -> str:
         )
         records = await result.data()
 
-    call_records = [
-        record for record in records
+    function_names = [
+        record["function_name"]
+        for record in records
         if isinstance(record.get("function_name"), str)
     ]
-    if not call_records:
-        return "No unresolved or external calls found."
+    if not function_names:
+        return "No external dependencies found."
     return "\n".join(
         [
-            "Unresolved or external calls (target not confirmed):",
-            *(
-                f"- {record.get('syntax') or record['function_name']} "
-                f"({record.get('file_path') or 'unknown file'}; "
-                f"{record.get('resolution_status') or 'unresolved'})"
-                for record in call_records
-            ),
+            "External dependencies:",
+            *(f"- {function_name}" for function_name in function_names),
         ]
     )
 
@@ -382,10 +320,8 @@ async def semantic_code_search(
             if isinstance(score, (int, float))
             else "unknown"
         )
-        qualified_name = record.get("qualified_name") or function_name
-        line = record.get("start_line") or "?"
         matches.append(
-            f"- {qualified_name} ({location}:{line}) — similarity {score_text}"
+            f"- {function_name} ({location}) — similarity {score_text}"
         )
 
     if not matches:

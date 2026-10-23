@@ -4,9 +4,8 @@ import asyncio
 from contextlib import aclosing
 from unittest.mock import patch
 
-from app.db.call_resolution import CallResolutionIndex, resolve_call
 from app.services.parser_service import CodeParser
-from app.db.graph_ops import _embedded_function_batches
+from app.db.graph_ops import _embedded_function_batches, _resolve_calls
 
 
 def test_call_resolution_does_not_rescan_definitions():
@@ -20,30 +19,20 @@ def test_call_resolution_does_not_rescan_definitions():
 
     definitions = [CountingDefinition(
         name="validate", qualified_name="validate", file_path=f"src/{i}.py",
-        entity_id=f"fn:{i}", has_body=True,
+        entity_id=f"fn:{i}",
     ) for i in range(1000)]
-    index = CallResolutionIndex(definitions)
-    reads_after_build = CountingDefinition.name_reads
-    for i in range(3000):
-        caller = {"qualified_name": "caller", "file_path": f"src/{i % 1000}.py"}
-        assert resolve_call(caller, {"name": "validate", "syntax": "validate"}, index) == (
-            f"fn:{i % 1000}", "inferred", "same_file_top_level"
-        )
-    assert CountingDefinition.name_reads == reads_after_build
-
-
-def test_index_keeps_nested_ambiguity_and_declaration_rules():
-    definitions = [
-        dict(name="f", qualified_name="outer.f", file_path="a.py", entity_id="nested", has_body=True),
-        dict(name="f", qualified_name="f", file_path="a.py", entity_id="top", has_body=True),
-        dict(name="f", qualified_name="outer.f", file_path="a.py", entity_id="declaration", has_body=False),
+    callers = [
+        dict(entity_id=f"caller:{i}", qualified_name="caller", file_path=f"src/{i % 1000}.py")
+        for i in range(3000)
     ]
-    caller = dict(qualified_name="outer", file_path="a.py")
-    call = dict(name="f", syntax="f")
-    assert resolve_call(caller, call, CallResolutionIndex(definitions)) == ("nested", "inferred", "lexical_nested")
-    definitions.append({**definitions[0], "entity_id": "duplicate"})
-    assert resolve_call(caller, call, CallResolutionIndex(definitions)) == (None, "ambiguous", "multiple_lexical_definitions")
-    assert resolve_call(None, call, CallResolutionIndex(definitions)) == (None, "ambiguous", "multiple_matching_names")
+    calls, external, ambiguous = _resolve_calls(
+        callers, {caller["entity_id"]: ["validate"] for caller in callers}, definitions
+    )
+    # Each definition is indexed once, however many calls are resolved.
+    assert CountingDefinition.name_reads == len(definitions)
+    assert len(calls) == 3000 and not external and not ambiguous
+    assert all(call["target_id"] == f"fn:{i % 1000}" for i, call in enumerate(calls))
+    assert {call["resolution"] for call in calls} == {"lexical_scope"}
 
 
 def test_parser_does_not_check_every_function_body_for_each_call():

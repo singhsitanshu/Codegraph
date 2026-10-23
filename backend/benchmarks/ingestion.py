@@ -101,8 +101,6 @@ async def benchmark(args):
                 repo=args.repo,
             )
             stats["persisted"] = dict(await result.single())
-            result = await session.run("MATCH (r:Repository {repo_name:$repo}) RETURN r.graph_state AS state", repo=args.repo)
-            stats["graph_state"] = (await result.single())["state"]
             result = await session.run(
                 "MATCH (f:Function {repo_name:$repo}) WHERE NOT (f)-[:IN_COMMUNITY]->(:Community) "
                 "RETURN count(f) AS missing_communities", repo=args.repo,
@@ -122,7 +120,6 @@ async def benchmark(args):
         assert persisted["functions"] > 0
         assert persisted["functions"] == persisted["unique_functions"] == persisted["embedded_functions"] == persisted["defines_links"]
         assert persisted["invalid_defines"] == persisted["invalid_vectors"] == stats["missing_communities"] == 0
-        assert stats["graph_state"] == "ready"
         if args.require_under is not None and stats["total_seconds"] >= args.require_under:
             raise RuntimeError(f"Ingestion exceeded {args.require_under} seconds")
     finally:

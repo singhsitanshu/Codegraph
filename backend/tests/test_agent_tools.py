@@ -44,15 +44,6 @@ def test_code_agent_system_prompt_requires_structured_markdown() -> None:
     assert "function count" in rendered_prompt
 
 
-def test_agent_reads_only_completed_repository_graphs() -> None:
-    for query in (
-        CALLERS_QUERY, CODEBASE_STRUCTURE_QUERY, FUNCTIONS_IN_FILE_QUERY,
-        OUTGOING_DEPENDENCIES_QUERY, EXTERNAL_DEPENDENCIES_QUERY,
-        SEMANTIC_CODE_SEARCH_QUERY, ARCHITECTURAL_SUBSYSTEMS_QUERY,
-    ):
-        assert "graph_state: 'ready'" in query
-
-
 def _invoke_tool(tool, arguments, records):
     result = MagicMock()
     result.data = AsyncMock(return_value=records)
@@ -94,15 +85,15 @@ def test_list_functions_in_file_formats_function_names() -> None:
             "file_path": " src/client.py ",
         },
         [
-            {"function_name": "build_request", "qualified_name": "Client.build_request", "start_line": 8},
-            {"function_name": "send_request", "qualified_name": "Client.send_request", "start_line": 20},
+            {"function_name": "build_request"},
+            {"function_name": "send_request"},
         ],
     )
 
     assert output == (
         "Functions in src/client.py:\n"
-        "- Client.build_request (line 8)\n"
-        "- Client.send_request (line 20)"
+        "- build_request\n"
+        "- send_request"
     )
     run_query.assert_awaited_once_with(
         FUNCTIONS_IN_FILE_QUERY,
@@ -122,22 +113,20 @@ def test_query_outgoing_dependencies_formats_targets_and_locations() -> None:
             {
                 "target_name": "prepare",
                 "target_file": "src/client.py",
-                "caller_entity_id": "fn:v1:caller",
-                "resolution_status": "inferred",
+                "is_external": False,
             },
             {
-                "target_name": "serialize",
-                "target_file": "src/serializer.py",
-                "caller_entity_id": "fn:v1:caller",
-                "resolution_status": "inferred",
+                "target_name": "http_call",
+                "target_file": None,
+                "is_external": True,
             },
         ],
     )
 
     assert output == (
         "Outgoing dependencies for send:\n"
-        "- prepare (src/client.py; inferred call)\n"
-        "- serialize (src/serializer.py; inferred call)"
+        "- prepare (src/client.py)\n"
+        "- http_call (External/Built-in)"
     )
     run_query.assert_awaited_once_with(
         OUTGOING_DEPENDENCIES_QUERY,
@@ -146,7 +135,38 @@ def test_query_outgoing_dependencies_formats_targets_and_locations() -> None:
     )
 
 
-def test_blast_radius_returns_single_target_identity() -> None:
+def test_query_outgoing_dependencies_separates_same_named_definitions() -> None:
+    output, _ = _invoke_tool(
+        query_outgoing_dependencies,
+        {"repo_name": "owner/repository", "function_name": "run"},
+        [
+            {
+                "caller_name": "Alpha.run",
+                "caller_file": "src/a.py",
+                "target_name": "prepare",
+                "target_file": "src/a.py",
+                "is_external": False,
+            },
+            {
+                "caller_name": "Beta.run",
+                "caller_file": "src/b.py",
+                "target_name": "print",
+                "target_file": None,
+                "is_external": True,
+            },
+        ],
+    )
+
+    assert output == (
+        "Outgoing dependencies for 2 definitions named run:\n"
+        "Alpha.run (src/a.py):\n"
+        "  - prepare (src/a.py)\n"
+        "Beta.run (src/b.py):\n"
+        "  - print (External/Built-in)"
+    )
+
+
+def test_blast_radius_surfaces_external_target_status() -> None:
     output, run_query = _invoke_tool(
         query_graph_blast_radius,
         {
@@ -157,17 +177,14 @@ def test_blast_radius_returns_single_target_identity() -> None:
             {
                 "caller": "validate",
                 "file_paths": ["src/validation.py"],
-                "target_entity_id": "fn:v1:target",
-                "target_is_external": False,
+                "target_is_external": True,
             }
         ],
     )
 
     payload = json.loads(output)
-    assert payload["status"] == "found"
-    assert payload["target_entity_id"] == "fn:v1:target"
-    assert payload["target_is_external"] is False
-    assert payload["callers"][0]["caller"] == "validate"
+    assert payload["target_is_external"] is True
+    assert payload["callers"][0]["target_is_external"] is True
     run_query.assert_awaited_once_with(
         CALLERS_QUERY,
         repo_name="owner/repository",
@@ -175,50 +192,20 @@ def test_blast_radius_returns_single_target_identity() -> None:
     )
 
 
-def test_blast_radius_reports_ambiguous_name_without_mixing_callers() -> None:
-    output, _ = _invoke_tool(
-        query_graph_blast_radius,
-        {"repo_name": "owner/repository", "function_name": "validate"},
-        [
-            {"target_entity_id": "fn:v1:a", "target_qualified_name": "A.validate", "target_file": "src/a.py", "caller": "from_a"},
-            {"target_entity_id": "fn:v1:b", "target_qualified_name": "B.validate", "target_file": "src/b.py", "caller": "from_b"},
-        ],
-    )
-    payload = json.loads(output)
-    assert payload["status"] == "ambiguous"
-    assert payload["callers"] == []
-    assert {c["entity_id"] for c in payload["candidates"]} == {"fn:v1:a", "fn:v1:b"}
-
-
-def test_outgoing_dependencies_reports_ambiguous_caller() -> None:
-    output, _ = _invoke_tool(
-        query_outgoing_dependencies,
-        {"repo_name": "owner/repository", "function_name": "validate"},
-        [
-            {"caller_entity_id": "fn:v1:a", "caller_qualified_name": "A.validate", "caller_file": "src/a.py", "target_name": "charge_card"},
-            {"caller_entity_id": "fn:v1:b", "caller_qualified_name": "B.validate", "caller_file": "src/b.py", "target_name": "send_email"},
-        ],
-    )
-    assert output.startswith("Ambiguous function name validate")
-    assert "A.validate (src/a.py; fn:v1:a)" in output
-    assert "B.validate (src/b.py; fn:v1:b)" in output
-    assert "charge_card" not in output and "send_email" not in output
-
-
 def test_list_external_dependencies_formats_repository_boundary() -> None:
     output, run_query = _invoke_tool(
         list_external_dependencies,
         {"repo_name": "owner/repository"},
         [
-            {"function_name": "Exception", "syntax": "Exception", "file_path": "src/a.py", "resolution_status": "unresolved"},
-            {"function_name": "requests_get", "syntax": "requests.get", "file_path": "src/b.py", "resolution_status": "ambiguous"},
+            {"function_name": "Exception"},
+            {"function_name": "requests_get"},
         ],
     )
 
     assert output == (
-        "Unresolved or external calls (target not confirmed):\n"
-        "- Exception (src/a.py; unresolved)\n"
-        "- requests.get (src/b.py; ambiguous)"
+        "External dependencies:\n"
+        "- Exception\n"
+        "- requests_get"
     )
     run_query.assert_awaited_once_with(
         EXTERNAL_DEPENDENCIES_QUERY,
@@ -233,9 +220,7 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
         return_value=[
             {
                 "function_name": "process_payment",
-                "qualified_name": "Payments.process_payment",
                 "file_path": "src/payments.py",
-                "start_line": 12,
                 "score": 0.91234,
             }
         ]
@@ -265,7 +250,7 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
 
     assert output == (
         'Semantic code matches for "take a customer payment":\n'
-        "- Payments.process_payment (src/payments.py:12) — similarity 0.9123"
+        "- process_payment (src/payments.py) — similarity 0.9123"
     )
     embed_query.assert_awaited_once_with("take a customer payment")
     session.run.assert_awaited_once_with(

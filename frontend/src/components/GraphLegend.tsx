@@ -110,9 +110,16 @@ export default function GraphLegend({
                           : "none",
                       }}
                     />
-                    <span className="min-w-0 leading-4">{community.name}</span>
+                    {/* Long unspaced names (e.g. qualified function names)
+                        must break instead of running under the count. */}
+                    <span
+                      className="min-w-0 leading-4 [overflow-wrap:anywhere]"
+                      title={community.name}
+                    >
+                      {community.name}
+                    </span>
                   </span>
-                  <span className="shrink-0 text-[#8a9892]">
+                  <span className="shrink-0 whitespace-nowrap text-[#8a9892]">
                     {community.count} {community.count === 1 ? "node" : "nodes"}
                   </span>
                 </button>

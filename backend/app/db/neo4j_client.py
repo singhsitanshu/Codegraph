@@ -18,18 +18,19 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 DATABASE_INDEX_QUERIES = (
-    "CREATE CONSTRAINT function_repo_entity_id IF NOT EXISTS "
-    "FOR (fn:Function) REQUIRE (fn.repo_name, fn.entity_id) IS UNIQUE",
-    "CREATE CONSTRAINT unresolved_call_repo_id IF NOT EXISTS "
-    "FOR (call:UnresolvedCall) REQUIRE (call.repo_name, call.call_id) IS UNIQUE",
+    # CG-002A entity IDs hash the repository name, so they are globally unique.
+    "CREATE CONSTRAINT function_entity_id IF NOT EXISTS "
+    "FOR (fn:Function) REQUIRE fn.entity_id IS UNIQUE",
     "CREATE INDEX repository_repo_name IF NOT EXISTS "
     "FOR (r:Repository) ON (r.repo_name)",
     "CREATE INDEX file_repo_path IF NOT EXISTS "
     "FOR (f:File) ON (f.repo_name, f.path)",
     "CREATE INDEX func_repo_name IF NOT EXISTS "
     "FOR (fn:Function) ON (fn.repo_name, fn.name)",
-    "CREATE INDEX unresolved_call_repo_name IF NOT EXISTS "
-    "FOR (call:UnresolvedCall) ON (call.repo_name, call.name)",
+    "CREATE INDEX func_repo_file IF NOT EXISTS "
+    "FOR (fn:Function) ON (fn.repo_name, fn.file_path)",
+    "CREATE INDEX ext_func_repo_name IF NOT EXISTS "
+    "FOR (ext:ExternalFunction) ON (ext.repo_name, ext.name)",
     "CREATE INDEX community_repo_id IF NOT EXISTS "
     "FOR (c:Community) ON (c.repo_name, c.community_id)",
     "CREATE INDEX func_repo_community IF NOT EXISTS "

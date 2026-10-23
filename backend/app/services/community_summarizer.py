@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 COMMUNITY_LABEL_MODEL = "gpt-4o-mini"
 MAX_CONCURRENT_COMMUNITY_LABELS = 4
 COMMUNITY_LABEL_BATCH_SIZE = 8
+MIN_LABELED_COMMUNITY_SIZE = 3
+UNGROUPED_COMMUNITY_ID = -1
+UNGROUPED_COMMUNITY_NAME = "Ungrouped"
+UNGROUPED_COMMUNITY_DESCRIPTION = (
+    f"Functions whose detected community had fewer than "
+    f"{MIN_LABELED_COMMUNITY_SIZE} members; they do not form a subsystem."
+)
 COMMUNITY_LABEL_SYSTEM_PROMPT = (
     "You are a senior software architect analyzing code clusters. Given a "
     "list of function names and file paths from a code repository module, "
@@ -33,6 +40,12 @@ WITH f.leiden_community AS comm_id,
      collect(DISTINCT f.file_path)[..5] AS file_paths
 RETURN comm_id, function_count, func_names, file_paths
 ORDER BY comm_id
+"""
+
+UNGROUP_SMALL_COMMUNITIES_QUERY = """
+MATCH (f:Function {repo_name: $repo_name})
+WHERE f.leiden_community IN $community_ids
+SET f.leiden_community = $ungrouped_id
 """
 
 DELETE_COMMUNITIES_QUERY = """
@@ -83,6 +96,13 @@ def _string_list(value: object) -> list[str]:
     return [item for item in value if isinstance(item, str) and item]
 
 
+def _community_size(record: dict[str, Any]) -> int:
+    size = record.get("function_count")
+    if isinstance(size, int) and not isinstance(size, bool):
+        return size
+    return len(_string_list(record.get("func_names")))
+
+
 async def _generate_community_labels(
     records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -130,24 +150,6 @@ async def _generate_community_labels(
     return labels
 
 
-def _singleton_label(record: dict[str, Any]) -> dict[str, Any]:
-    function_names = _string_list(record.get("func_names"))
-    file_paths = _string_list(record.get("file_paths"))
-    name = function_names[0]
-    label = CommunityLabel(
-        name=name[:120],
-        description=(
-            f"{name} in {', '.join(file_paths) or 'an unknown file'}. "
-            "No other functions belong to this community."
-        )[:500],
-    )
-    return {
-        "id": record["comm_id"],
-        "name": label.name,
-        "description": label.description,
-    }
-
-
 async def label_and_store_communities(
     repo_name: str,
 ) -> list[dict[str, Any]]:
@@ -166,17 +168,20 @@ async def label_and_store_communities(
         records = await result.data()
 
     records = [record for record in records if isinstance(record.get("comm_id"), int)]
-    singleton_records = [
-        record for record in records
-        if record.get("function_count") == 1 and _string_list(record.get("func_names"))
+    # Tiny clusters carry no architectural signal and would each cost model
+    # tokens, so they are pooled into one unlabeled community.
+    small_community_ids = [
+        record["comm_id"]
+        for record in records
+        if _community_size(record) < MIN_LABELED_COMMUNITY_SIZE
     ]
-    singletons = {record["comm_id"]: _singleton_label(record) for record in singleton_records}
-    model_records = [record for record in records if record["comm_id"] not in singletons]
+    small_ids = set(small_community_ids)
+    model_records = [record for record in records if record["comm_id"] not in small_ids]
     batches = [
         model_records[offset:offset + COMMUNITY_LABEL_BATCH_SIZE]
         for offset in range(0, len(model_records), COMMUNITY_LABEL_BATCH_SIZE)
     ]
-    labels_by_id = dict(singletons)
+    labels_by_id: dict[int, dict[str, Any]] = {}
     for offset in range(0, len(batches), MAX_CONCURRENT_COMMUNITY_LABELS):
         tasks = [
             asyncio.create_task(_generate_community_labels(batch))
@@ -191,7 +196,15 @@ async def label_and_store_communities(
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    communities = [labels_by_id[record["comm_id"]] for record in records]
+    communities = [labels_by_id[record["comm_id"]] for record in model_records]
+    if small_community_ids:
+        communities.append(
+            {
+                "id": UNGROUPED_COMMUNITY_ID,
+                "name": UNGROUPED_COMMUNITY_NAME,
+                "description": UNGROUPED_COMMUNITY_DESCRIPTION,
+            }
+        )
 
     async with driver.session() as session:
 
@@ -201,6 +214,14 @@ async def label_and_store_communities(
                 repo_name=normalized_repo_name,
             )
             await deleted.consume()
+            if small_community_ids:
+                ungrouped = await transaction.run(
+                    UNGROUP_SMALL_COMMUNITIES_QUERY,
+                    repo_name=normalized_repo_name,
+                    community_ids=small_community_ids,
+                    ungrouped_id=UNGROUPED_COMMUNITY_ID,
+                )
+                await ungrouped.consume()
             if communities:
                 stored = await transaction.run(
                     STORE_COMMUNITIES_QUERY,
@@ -212,9 +233,13 @@ async def label_and_store_communities(
         await session.execute_write(replace_communities)
 
     logger.info(
-        "Stored %d architectural community label(s) for %s with %s",
-        len(communities),
+        "Stored %d architectural community label(s) for %s with %s; "
+        "%d community(ies) under %d functions grouped as %s",
+        len(model_records),
         normalized_repo_name,
         COMMUNITY_LABEL_MODEL,
+        len(small_community_ids),
+        MIN_LABELED_COMMUNITY_SIZE,
+        UNGROUPED_COMMUNITY_NAME,
     )
     return communities
