@@ -20,14 +20,19 @@ body {
   min-height: 100vh;
 }
 
-button,
-input,
-textarea {
-  font: inherit;
-}
+/* Element defaults live in the base layer: unlayered rules outrank Tailwind
+   utilities, so `font: inherit` here used to discard every button's
+   text-size, weight, and tracking classes. */
+@layer base {
+  button,
+  input,
+  textarea {
+    font: inherit;
+  }
 
-button {
-  cursor: pointer;
+  button {
+    cursor: pointer;
+  }
 }
 
 .chat-markdown > :first-child {

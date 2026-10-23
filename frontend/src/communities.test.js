@@ -45,3 +45,24 @@ test("community legend uses stored labels, descriptions, and counts", () => {
   assert.equal(legend.communities[1].name, "Cluster #4");
   assert.equal(legend.unassignedCount, 1);
 });
+
+test("community legend lists the largest modules first", () => {
+  const nodes = [
+    ...Array.from({ length: 1 }, () => ({ data: { community: 1 } })),
+    ...Array.from({ length: 3 }, () => ({ data: { community: 7 } })),
+    ...Array.from({ length: 2 }, () => ({ data: { community: 3 } })),
+    ...Array.from({ length: 2 }, () => ({ data: { community: 2 } })),
+  ];
+
+  const legend = buildCommunityLegend(nodes);
+
+  assert.deepEqual(
+    legend.communities.map((community) => [community.id, community.count]),
+    [
+      [7, 3],
+      [2, 2],
+      [3, 2],
+      [1, 1],
+    ],
+  );
+});

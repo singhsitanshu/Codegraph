@@ -38,8 +38,10 @@ export function buildCommunityLegend(nodes) {
   });
 
   return {
+    // Largest modules first; ties keep a stable order by community ID.
     communities: [...communities.values()].sort(
-      (left, right) => Number(left.id) - Number(right.id),
+      (left, right) =>
+        right.count - left.count || Number(left.id) - Number(right.id),
     ),
     unassignedCount,
   };
