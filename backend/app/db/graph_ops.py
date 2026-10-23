@@ -5,15 +5,23 @@ their simple names, so same-named definitions in different files, classes, or
 lexical scopes remain separate graph nodes.
 """
 
+import asyncio
 import logging
+from collections import deque
 from collections.abc import AsyncIterator, Iterable, Iterator
+from contextlib import aclosing
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, TypeVar
 
 from app.db import get_neo4j_driver
 from app.db.gds_ops import run_leiden_clustering
 from app.services.community_summarizer import label_and_store_communities
-from app.services.embedding_service import generate_embeddings
+from app.services.embedding_service import (
+    EMBEDDING_REQUEST_BATCH_SIZE,
+    MAX_CONCURRENT_EMBEDDING_REQUESTS,
+    generate_embeddings,
+)
 from app.utils.entity_identity import (
     generate_function_entity_id,
     normalize_repository_path,
@@ -390,6 +398,39 @@ def _function_embedding_text(function: dict[str, Any]) -> str:
     )
 
 
+async def _embedded_function_batches(
+    functions: list[dict[str, Any]],
+) -> AsyncIterator[list[dict[str, Any]]]:
+    """Embed each distinct input once, with bounded request prefetch."""
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for function in functions:
+        groups.setdefault(_function_embedding_text(function), []).append(function)
+    inputs = iter(chunk_data(list(groups), EMBEDDING_REQUEST_BATCH_SIZE))
+    pending: deque[tuple[list[str], asyncio.Task]] = deque()
+    try:
+        for _ in range(MAX_CONCURRENT_EMBEDDING_REQUESTS):
+            batch = next(inputs, None)
+            if batch is not None:
+                pending.append((batch, asyncio.create_task(generate_embeddings(batch))))
+        while pending:
+            batch, task = pending.popleft()
+            vectors = await task
+            yield [
+                {**function, "embedding": vector}
+                for text, vector in zip(batch, vectors, strict=True)
+                for function in groups[text]
+            ]
+            following = next(inputs, None)
+            if following is not None:
+                pending.append((following, asyncio.create_task(generate_embeddings(following))))
+    finally:
+        for _, task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
+
+
 def _resolve_total_repo_tokens(
     parsed_data_list: list[dict[str, Any]],
     total_repo_tokens: int | None,
@@ -434,6 +475,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
 
+    stage_started = perf_counter()
     files, functions, function_calls = _extract_etl_records(
         parsed_data_list,
         normalized_repo_name,
@@ -447,9 +489,11 @@ async def save_parsed_ast_to_neo4j_with_progress(
         - set(changed_paths)
     )
     affected_paths = sorted({*changed_paths, *deleted_paths})
-    resolved_total_tokens = _resolve_total_repo_tokens(
-        parsed_data_list,
-        total_repo_tokens,
+    # A changed-file subset is not a new repository-wide token baseline.
+    resolved_total_tokens = (
+        _resolve_total_repo_tokens(parsed_data_list, total_repo_tokens)
+        if replace_existing or total_repo_tokens is not None
+        else None
     )
 
     async with get_neo4j_driver().session() as session:
@@ -494,6 +538,11 @@ async def save_parsed_ast_to_neo4j_with_progress(
             function_calls,
             [*existing_definitions, *functions],
         )
+        logger.info(
+            "Ingestion %s: prepared %d functions and %d call edges in %.2fs",
+            normalized_repo_name, len(functions), len(calls) + len(external_calls),
+            perf_counter() - stage_started,
+        )
 
         if resolved_total_tokens is not None:
             await run_transaction(
@@ -532,27 +581,52 @@ async def save_parsed_ast_to_neo4j_with_progress(
             "Pass 2: Embedding and Creating Functions...",
             90,
         )
-        for batch in chunk_data(functions, batch_size):
-            embeddings = await generate_embeddings(
-                [_function_embedding_text(function) for function in batch]
-            )
-            embedded_batch = [
-                {
-                    **function,
-                    "ambiguous_calls": ambiguous_calls.get(
-                        function["entity_id"], []
-                    ),
-                    "embedding": embedding,
-                }
-                for function, embedding in zip(batch, embeddings, strict=True)
-            ]
-            await run_transaction(MERGE_FUNCTIONS_QUERY, embedded_batch)
+        stage_started = perf_counter()
+        function_count = 0
+        async with aclosing(_embedded_function_batches(functions)) as embedded_batches:
+            async for embedded_group in embedded_batches:
+                for embedded_batch in chunk_data(embedded_group, batch_size):
+                    await run_transaction(
+                        MERGE_FUNCTIONS_QUERY,
+                        [
+                            {
+                                **function,
+                                "ambiguous_calls": ambiguous_calls.get(
+                                    function["entity_id"], []
+                                ),
+                            }
+                            for function in embedded_batch
+                        ],
+                    )
+                    function_count += len(embedded_batch)
+                    yield DatabaseWriteProgress(
+                        f"Pass 2: Embedding and Creating Functions ({function_count}/{len(functions)})...",
+                        90 + 3 * function_count // len(functions),
+                    )
+        logger.info(
+            "Ingestion %s: embedded and stored functions in %.2fs",
+            normalized_repo_name, perf_counter() - stage_started,
+        )
 
         yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
-        for batch in chunk_data(calls, batch_size):
-            await run_transaction(MERGE_CALLS_QUERY, batch)
-        for batch in chunk_data(external_calls, batch_size):
-            await run_transaction(MERGE_EXTERNAL_CALLS_QUERY, batch)
+        stage_started = perf_counter()
+        call_count = 0
+        total_calls = len(calls) + len(external_calls)
+        for query, records in (
+            (MERGE_CALLS_QUERY, calls),
+            (MERGE_EXTERNAL_CALLS_QUERY, external_calls),
+        ):
+            for batch in chunk_data(records, batch_size):
+                await run_transaction(query, batch)
+                call_count += len(batch)
+                yield DatabaseWriteProgress(
+                    f"Pass 3: Mapping Dependencies ({call_count}/{total_calls})...",
+                    94 + 2 * call_count // total_calls,
+                )
+        logger.info(
+            "Ingestion %s: stored dependencies in %.2fs",
+            normalized_repo_name, perf_counter() - stage_started,
+        )
 
         if not replace_existing and affected_paths:
             await run_transaction(DELETE_ORPHAN_EXTERNAL_FUNCTIONS_QUERY)
@@ -561,12 +635,22 @@ async def save_parsed_ast_to_neo4j_with_progress(
         "Detecting architectural communities...",
         97,
     )
+    stage_started = perf_counter()
     await run_leiden_clustering(normalized_repo_name)
+    logger.info(
+        "Ingestion %s: clustered graph in %.2fs",
+        normalized_repo_name, perf_counter() - stage_started,
+    )
     yield DatabaseWriteProgress(
         "Labeling architectural communities...",
         98,
     )
+    stage_started = perf_counter()
     await label_and_store_communities(normalized_repo_name)
+    logger.info(
+        "Ingestion %s: labeled communities in %.2fs",
+        normalized_repo_name, perf_counter() - stage_started,
+    )
     yield DatabaseWriteProgress("Completing transaction...", 99)
 
 

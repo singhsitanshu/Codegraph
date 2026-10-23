@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from app.db import close_neo4j_driver
@@ -65,15 +66,21 @@ async def ingest_repository() -> None:
         raise RuntimeError("No Python files were discovered; ingestion aborted")
 
     parsed_data = await parse_changed_files(files_to_parse)
+    if len(parsed_data) != len(files_to_parse):
+        raise RuntimeError(
+            "Full ingestion aborted because a discovered source file could not be parsed"
+        )
+    repository_root = Path(TARGET_REPO_PATH).resolve()
+    for parsed_file in parsed_data:
+        relative_path = Path(parsed_file["file_path"]).resolve().relative_to(
+            repository_root
+        ).as_posix()
+        attach_function_entity_ids(
+            parsed_file, repository=TARGET_REPO_NAME, file_path=relative_path
+        )
     print(f"Successfully parsed {len(parsed_data)} Python files")
     if not parsed_data:
         raise RuntimeError("Tree-sitter produced no parsed data; ingestion aborted")
-    for parsed_file in parsed_data:
-        attach_function_entity_ids(
-            parsed_file,
-            repository=TARGET_REPO_NAME,
-            file_path=os.path.relpath(parsed_file["file_path"], TARGET_REPO_PATH),
-        )
 
     await save_parsed_ast_to_neo4j(
         parsed_data,

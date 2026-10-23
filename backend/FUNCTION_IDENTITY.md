@@ -83,13 +83,14 @@ Calls are attributed to the innermost captured definition **only when the call e
   3. a unique repository-wide name (`repository_unique`).
 
   A name that matches several definitions at the first step that finds any matches gets no edge; it is listed in the caller's `ambiguous_calls`. A name with no match becomes an `ExternalFunction` call. This resolution is name-based inference, not binding analysis.
-- **Full ingest** (`replace_existing=True`) deletes the repository's nodes and rebuilds them. This is also the migration path for graphs written by the old name-keyed writer. Do not backfill `entity_id` onto legacy nodes.
-- **Incremental ingest** (the webhook) treats parsed files and `deleted_file_paths` as a change set:
-  - It reads the other files' definitions so call resolution sees the whole repository.
+- **Full ingest** (`replace_existing=True`) deletes the repository's nodes and rebuilds them. This is also the migration path for graphs written by the old name-keyed writer. Do not backfill `entity_id` onto legacy nodes. The GitHub ingest endpoint aborts before writing if any supported file fails to parse, so a partial parse never replaces a graph.
+- **Incremental ingest** (the webhook) treats parsed files and `deleted_file_paths` as a change set. The webhook accepts only complete, non-forced push events, fetches changed files at the push's `after` commit, and writes nothing if any fetch or parse fails. The writer then:
+  - leaves the repository's full-source token baseline unchanged, since a changed-file subset isn't a repository total;
+  - reads the other files' definitions so call resolution sees the whole repository.
   - It deletes Functions in the affected files whose IDs disappeared, including legacy nodes without an `entity_id`, and deletes removed File nodes.
   - It rebuilds outgoing `CALLS` from the changed files and drops orphaned `ExternalFunction` nodes.
   - Surviving IDs keep their incoming edges, for example after a body-only edit.
   - Limitation: calls in unchanged files are not re-resolved. A newly added definition does not take over an existing external or ambiguous call until the next full ingest.
 - **Clustering.** Leiden (`app/db/gds_ops.py`) works on more than the resolved Function-to-Function calls. Those alone leave most functions isolated, which gives each its own community. The projection adds two kinds of undirected links: `File-[:DEFINES]->Function`, and calls to `ExternalFunction` nodes. The final community ID is written to `Function` nodes only. Each run logs function, projection and community counts plus the singleton ratio, and warns when the ratio is above 25%. Communities with fewer than 3 functions get no LLM label; they are pooled into one `Ungrouped` community (`community_id = -1`).
 - **Reads.** The graph API still uses Neo4j `elementId` for React Flow node IDs and source lookup; `data.entity_id` carries the application identity. Agent tools match by simple or qualified name and report each matching definition separately.
-- **Open.** Durable references should also carry a graph revision so that deleted or re-ingested definitions can be detected. The parser ID alone cannot prove a function still exists in Neo4j.
+- **Open.** Durable references should also carry a graph revision so that deleted or re-ingested definitions can be detected. The parser ID alone cannot prove a function still exists in Neo4j. The stored graph has no Git revision either, so out-of-order or concurrent push events can apply an older change set. Run a full rebuild after a missed or out-of-order event.

@@ -6,9 +6,6 @@ Codegraph is built for the point where a repository is too large to understand b
 
 The resulting graph is both visual and conversational. The React dashboard exposes file/function relationships, source code, dependency neighborhoods, and LLM-labeled modules; a LangGraph ReAct agent answers questions using targeted Neo4j tools instead of placing the entire repository into every model request.
 
-> [!IMPORTANT]
-> Codegraph is an engineering prototype intended for local exploration. It has no application-level authentication, clears repository-scoped graphs when the API starts, and performs best-effort static analysis rather than compiler-accurate symbol resolution. See [Current limitations](#current-limitations) before using it with private or production code.
-
 ## Highlights
 
 - **Multi-language parsing:** Tree-sitter extraction for seven source extensions across Python, JavaScript/JSX, TypeScript/TSX, Go, and Java.
@@ -172,7 +169,7 @@ The Vite/React interface provides two coordinated workspaces:
 - deterministic community colors, a module legend with LLM-generated descriptions, and multi-community filtering; and
 - an on-demand source drawer with line numbers and syntax highlighting for every supported language.
 
-The graph API deliberately removes `raw_code` from its bulk node payload. Source is fetched only when a user selects a function, using both the Neo4j element ID and active repository scope.
+The graph API deliberately removes `raw_code` and `embedding` from its bulk node payload. Source is fetched only when a user selects a function, using both the Neo4j element ID and active repository scope.
 
 ## Quick start
 
@@ -370,7 +367,7 @@ Webhook updates are incremental merges. They do not remove deleted paths, recalc
 | Bounded writes | Files, functions, and calls are committed in batches of 100. | A full replacement spans multiple transactions and can be partially applied. |
 | Parser failures | Individual failed files are omitted while progress and token counting continue. | A completed ingestion can therefore represent fewer files than GitHub contained. |
 | GDS cleanup | Temporary projections are dropped in a `finally` block, including algorithm/projection-consumption failures. | GDS or labeling failure fails the overall ingestion after graph records may already exist. |
-| Source minimization | Bulk graph serialization strips `raw_code`; source requires a separate scoped lookup. | The unauthenticated source endpoint still exposes stored code to any caller that can reach it. |
+| Source minimization | Bulk graph serialization strips `raw_code` and `embedding`; source requires a separate scoped lookup. | The unauthenticated source endpoint still exposes stored code to any caller that can reach it. |
 | Webhook authenticity | HMAC SHA-256 signatures use `hmac.compare_digest`. | There is no replay cache, delivery-ID deduplication, queue, retry store, or webhook audit table. |
 
 ## Testing
@@ -396,8 +393,6 @@ Key validated behaviors include:
 - graph serialization without source bodies; and
 - database index initialization and application lifecycle cleanup.
 
-On 2026-09-16, a fresh Python 3.13 environment installed the declared backend dependencies, collected **77 tests**, and passed all **77** with local Neo4j and GDS running. Without database access, **73 passed and 4 explicitly skipped**.
-
 ### Frontend
 
 ```bash
@@ -407,8 +402,6 @@ pnpm build
 ```
 
 The Node test suite covers repository input normalization, chunked NDJSON parsing, error propagation, graph/chat scoping, source lookup, explicit and unload cleanup, deterministic community colors, and cluster selection. The production Vite build is also part of the recommended validation pass.
-
-On 2026-09-16, the locked frontend installation completed, all **13 frontend tests** passed, and the production build succeeded. Vite reported that the generated JavaScript chunk exceeds its default 500 kB warning threshold; code splitting is not yet configured.
 
 The root-level `tests/` directory exercises the older webhook prototype. Run active-backend tests from `backend/` to avoid importing the legacy root `app` package by mistake.
 
@@ -469,47 +462,3 @@ The `backend/` and `frontend/` directories form the current full application. Ro
 - OpenAI receives function names/file paths for embeddings and community labeling. Anthropic receives the user's question plus graph-tool outputs selected during the agent run. Review provider policies before ingesting sensitive repositories.
 - Neo4j Browser and Bolt are bound to host ports with checked-in development credentials. Treat the Compose file as local-only.
 - CORS permits the configured localhost dashboard origins; CORS is a browser policy, not an authorization boundary.
-- Secrets belong in ignored `backend/.env`. Neither `.env` nor `backend/.env` should be committed.
-
-## Current limitations
-
-- **Ephemeral application lifecycle:** API startup deletes all nodes with a non-null `repo_name`, and the dashboard sends best-effort deletion on page unload. The Docker volume persists Neo4j storage, but current application behavior does not preserve ingested repositories across sessions.
-- **Approximate call attribution:** call names are collected at file scope and attached to each function in that file; symbol ownership and dispatch are not resolved.
-- **Name collisions:** functions are identified by repository plus unqualified name, so repeated names across files may merge.
-- **Partial rebuilds are possible:** full ingestion replaces a scope across multiple transactions without rollback of the complete pipeline.
-- **Graph reads are capped:** `/api/graph` applies `LIMIT 200` before frontend force layout.
-- **No durable job system:** ingestion runs inside the request stream and webhooks use in-process background tasks. There is no queue, retry scheduler, checkpoint, cancellation persistence, or multi-process coordination.
-- **Incomplete webhook reconciliation:** standard pull-request file discovery, removed-file deletion, delivery deduplication, and full token/community reconciliation are not implemented.
-- **External-service dependency:** normal ingestion requires GitHub, OpenAI, Neo4j GDS, and compatible model/index APIs; chat additionally requires Anthropic.
-- **Local deployment focus:** only Neo4j is containerized; there is no CI workflow, application Dockerfile, TLS termination, deployment manifest, metrics endpoint, tracing, or structured event store.
-- **No application auth or multi-tenancy:** repository scoping prevents accidental query mixing but does not establish an authorization boundary.
-- **Development plugin resolution:** Compose pins Neo4j to a tested image version, but `NEO4J_PLUGINS` installs GDS at container startup. Verify `gds.version()` after startup; this is a local development setup, not a fully locked production image.
-- **Frontend bundle size:** the current production JavaScript chunk is above Vite's default warning threshold.
-
-## Design tradeoffs
-
-### Why Neo4j for both storage and retrieval?
-
-Call relationships, dependency neighborhoods, and architecture clusters are naturally graph-shaped. Keeping raw graph state, vector embeddings, and GDS results in Neo4j avoids a separate queue/vector/database stack and lets agent tools express traversal directly in Cypher. The tradeoff is operational coupling to Neo4j editions/plugins and transaction patterns, plus a less portable local setup than an embedded store.
-
-### Why Tree-sitter?
-
-Tree-sitter supports the project's language set through precompiled grammar wheels and can inspect untrusted repositories without running their code. It also preserves exact source spans for captured definitions. The tradeoff is syntax-level knowledge: without compiler/type-system integration, Codegraph cannot promise resolved symbols or precise dynamic call relationships.
-
-### Why graph tools instead of full-repository prompting?
-
-Targeted tools make repository scope explicit and allow the model to request only structure or dependency evidence relevant to a question. The stored metric makes that selection visible. The tradeoff is that answer quality depends on parser fidelity, graph completeness, tool selection, and the model's ability to ask the right graph questions.
-
-### Why bounded Neo4j batches?
-
-Micro-batches keep individual writes finite for larger repositories and are directly tested. They also make streaming progress practical. The tradeoff is the loss of all-or-nothing replacement across the entire ingestion pipeline.
-
-## Project status
-
-The current application supports the complete local workflow: ingest a GitHub repository, construct and enrich its graph, inspect it visually, open stored function source, ask graph-backed questions, process a limited set of webhook updates, and delete repository-scoped data.
-
-The repository does not contain benchmark artifacts, so Codegraph makes no throughput, latency, cost, or scale claims. The clearest next steps suggested by the implementation are qualified function identities and lexical call ownership, durable ingestion jobs with atomic version activation, complete GitHub event reconciliation, configurable model/API settings, persistent graph lifecycle controls, authentication, and deployment/observability tooling.
-
-## License
-
-No license file is currently included. Unless a license is added, the repository should not be assumed to grant open-source reuse rights.

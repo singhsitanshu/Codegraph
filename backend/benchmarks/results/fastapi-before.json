@@ -1,0 +1,69 @@
+{
+  "repo_name": "tiangolo/fastapi",
+  "embedding_requests": 54,
+  "embedding_inputs": 5322,
+  "embedding_input_tokens": 98122,
+  "label_requests": 107,
+  "final_record": {
+    "status": "Repository ingestion complete.",
+    "progress": 100,
+    "repo_name": "tiangolo/fastapi",
+    "total_repo_tokens": 782067
+  },
+  "archive_root_name": "fastapi-fastapi-bb7f314",
+  "total_seconds": 122.993,
+  "distinct_embedding_inputs": 5319,
+  "stages": [
+    {
+      "seconds": 0.0,
+      "status": "Downloading repository..."
+    },
+    {
+      "seconds": 2.234,
+      "status": "Repository downloaded and extracted."
+    },
+    {
+      "seconds": 3.221,
+      "status": "Parsing files (1/1172)..."
+    },
+    {
+      "seconds": 4.196,
+      "status": "Batching data to Neo4j..."
+    },
+    {
+      "seconds": 4.629,
+      "status": "Pass 1: Creating Files..."
+    },
+    {
+      "seconds": 5.113,
+      "status": "Pass 2: Embedding and Creating Functions..."
+    },
+    {
+      "seconds": 46.697,
+      "status": "Pass 3: Mapping Dependencies..."
+    },
+    {
+      "seconds": 49.375,
+      "status": "Detecting architectural communities..."
+    },
+    {
+      "seconds": 50.809,
+      "status": "Labeling architectural communities..."
+    },
+    {
+      "seconds": 122.79,
+      "status": "Completing transaction..."
+    },
+    {
+      "seconds": 122.798,
+      "status": "Repository ingestion complete."
+    }
+  ],
+  "persisted": {
+    "functions": 5322,
+    "unique_functions": 5322,
+    "embedded_functions": 5322
+  },
+  "graph_state": "ready",
+  "timing_scope": "download, parse, embeddings, graph writes, GDS, community labels, cleanup"
+}

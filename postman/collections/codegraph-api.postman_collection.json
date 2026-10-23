@@ -1,0 +1,783 @@
+{
+  "info": {
+    "name": "CodeGraph API",
+    "description": "The active backend/app FastAPI surface. Run 01 - Repository Workflow serially in Collection Runner for an automated ingest-to-cleanup lifecycle. Other folders contain standalone diagnostics. Backend provider and Neo4j credentials never belong in this collection.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "00 - Health",
+      "item": [
+        {
+          "name": "Process liveness",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health",
+            "description": "Reports FastAPI process liveness without changing state. It does not check Neo4j, GDS, GitHub, OpenAI, or Anthropic readiness."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Health returns HTTP 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Health returns JSON status ok', function () {",
+                  "    pm.expect(pm.response.headers.get('Content-Type') || '').to.match(/^application\\/json\\b/i);",
+                  "    pm.expect(pm.response.json().status).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "01 - Repository Workflow",
+      "description": "Automated seven-request lifecycle for one repository. Set repository_url, then run this folder serially with one iteration in Collection Runner. Ingestion calls external services and deletion permanently removes the ingested graph. Run only against an isolated local CodeGraph instance; do not run this folder in parallel.",
+      "item": [
+        {
+          "name": "Check API health",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health",
+            "description": "Checks FastAPI process liveness before the workflow; does not mutate state. This is not readiness for Neo4j/GDS, GitHub, OpenAI, or Anthropic. Clears any dynamic values left from an interrupted previous run."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "['active_repo_name', 'ingestion_total_tokens', 'function_node_id', 'function_name'].forEach(function (key) {",
+                  "    pm.collectionVariables.unset(key);",
+                  "});",
+                  "pm.test('Health returns HTTP 200 and JSON status ok', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.headers.get('Content-Type') || '').to.match(/^application\\/json\\b/i);",
+                  "    pm.expect(pm.response.json().status).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Ingest GitHub repository",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/x-ndjson" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"{{repository_url}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{base_url}}/api/ingest-repo",
+            "description": "Downloads a GitHub repository, replaces its Neo4j graph, and calls OpenAI for embeddings/community labels; this mutates state and depends on GitHub, Neo4j/GDS, and OpenAI. The response is newline-delimited JSON (NDJSON), not one JSON object. HTTP 200 alone does not prove success; the test script validates every record and captures the canonical repo_name and token baseline. Repeated or concurrent ingestion of the same scope can replace or partially rebuild data."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Ingestion streams valid, monotonic NDJSON and completes', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const lines = pm.response.text().split(/\\r?\\n/).map(function (line) { return line.trim(); }).filter(Boolean);",
+                  "    pm.expect(lines.length, 'at least one NDJSON record').to.be.greaterThan(0);",
+                  "    let previousProgress = 0;",
+                  "    const records = lines.map(function (line, index) {",
+                  "        let record;",
+                  "        try { record = JSON.parse(line); } catch (error) { throw new Error('Invalid NDJSON at line ' + (index + 1) + ': ' + error.message); }",
+                  "        pm.expect(record, 'record ' + (index + 1)).to.be.an('object');",
+                  "        pm.expect(Object.prototype.hasOwnProperty.call(record, 'error'), 'ingestion error at line ' + (index + 1) + ': ' + JSON.stringify(record)).to.be.false;",
+                  "        pm.expect(record.progress, 'progress at line ' + (index + 1)).to.be.a('number');",
+                  "        pm.expect(Number.isFinite(record.progress), 'finite progress at line ' + (index + 1)).to.be.true;",
+                  "        pm.expect(record.progress, 'progress range at line ' + (index + 1)).to.be.within(0, 100);",
+                  "        pm.expect(record.progress, 'monotonic progress at line ' + (index + 1)).to.be.at.least(previousProgress);",
+                  "        previousProgress = record.progress;",
+                  "        return record;",
+                  "    });",
+                  "    const terminal = records[records.length - 1];",
+                  "    pm.expect(terminal.progress, 'terminal ingestion progress').to.eql(100);",
+                  "    pm.expect(terminal.repo_name, 'canonical owner/repository').to.match(/^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$/);",
+                  "    pm.expect(terminal.total_repo_tokens, 'repository token baseline').to.be.a('number');",
+                  "    pm.expect(Number.isInteger(terminal.total_repo_tokens) && terminal.total_repo_tokens >= 0, 'nonnegative integer token baseline').to.be.true;",
+                  "    pm.collectionVariables.set('active_repo_name', terminal.repo_name);",
+                  "    pm.collectionVariables.set('ingestion_total_tokens', String(terminal.total_repo_tokens));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Read repository graph",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/graph?repo_name={{active_repo_name}}",
+            "description": "Reads the selected repository's Neo4j graph without mutating state. Requires Neo4j and the scope captured from ingestion. Results are a visualization window capped at 200 query records, not a full graph export. Source and embedding vectors are omitted. The test script selects an internal Function for on-demand source lookup."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Graph has safe nodes and an internal Function', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.nodes).to.be.an('array');",
+                  "    pm.expect(body.edges).to.be.an('array');",
+                  "    pm.expect(body.nodes.length, 'demo repository must produce graph nodes').to.be.greaterThan(0);",
+                  "    function checkForPrivateFields(value, path) {",
+                  "        if (!value || typeof value !== 'object') { return; }",
+                  "        Object.keys(value).forEach(function (key) {",
+                  "            pm.expect(key === 'raw_code' || key === 'embedding', 'private field at ' + path + '.' + key).to.be.false;",
+                  "            checkForPrivateFields(value[key], path + '.' + key);",
+                  "        });",
+                  "    }",
+                  "    body.nodes.forEach(function (node, index) { checkForPrivateFields(node, 'nodes[' + index + ']'); });",
+                  "    const selected = body.nodes.find(function (node) {",
+                  "        const labels = Array.isArray(node.labels) ? node.labels : (node.data && node.data.labels);",
+                  "        return Array.isArray(labels) && labels.includes('Function') && !labels.includes('ExternalFunction') &&",
+                  "            node.is_external !== true && node.external !== true &&",
+                  "            (!node.data || (node.data.is_external !== true && node.data.external !== true)) &&",
+                  "            typeof node.id === 'string' && node.id.trim() &&",
+                  "            node.data && typeof node.data.name === 'string' && node.data.name.trim();",
+                  "    });",
+                  "    pm.expect(selected, 'configured demo repository has no usable internal Function node; choose a small supported-language repository with functions').to.exist;",
+                  "    pm.collectionVariables.set('function_node_id', selected.id);",
+                  "    pm.collectionVariables.set('function_name', selected.data.name);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Read function source",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/node/{{function_node_id}}/code?repo_name={{active_repo_name}}",
+            "description": "Reads one stored function's source by Neo4j element ID and repository scope captured from the preceding graph response. This is read-only but requires Neo4j. The bulk graph omits source and embeddings; this scoped endpoint returns source on demand. Unknown or cross-repository IDs return 404. No application-level authentication currently protects it."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Selected function source is available on demand', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.be.a('string');",
+                  "    pm.expect(body.file_path).to.be.a('string');",
+                  "    pm.expect(body.file_path.trim(), 'nonempty file path').not.to.be.empty;",
+                  "    pm.expect(body.name).to.be.a('string');",
+                  "    pm.expect(body.name.trim(), 'nonempty function name').not.to.be.empty;",
+                  "    const expectedName = pm.collectionVariables.get('function_name');",
+                  "    if (expectedName) { pm.expect(body.name).to.eql(expectedName); }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Ask Graph-RAG question",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"{{chat_question}}\",\n  \"repo_name\": \"{{active_repo_name}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{base_url}}/api/chat",
+            "description": "Asks a repository-scoped LangGraph/Claude agent and returns an answer plus context-selection metrics. It does not change the graph, but depends on Neo4j and Anthropic; semantic search may also call OpenAI. The test checks metric consistency, not model-generated wording, tool calls, community names, or latency. Chat is not streamed by the active backend."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Chat returns an answer and consistent token metrics', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.response).to.be.a('string');",
+                  "    pm.expect(body.response.trim(), 'nonempty model answer').not.to.be.empty;",
+                  "    pm.expect(body.metrics).to.be.an('object');",
+                  "    const metrics = body.metrics;",
+                  "    ['full_repo_tokens', 'context_tokens', 'tokens_saved', 'efficiency_percentage'].forEach(function (key) {",
+                  "        pm.expect(metrics[key], key).to.be.a('number');",
+                  "        pm.expect(Number.isFinite(metrics[key]), 'finite ' + key).to.be.true;",
+                  "    });",
+                  "    const expectedTotal = Number(pm.collectionVariables.get('ingestion_total_tokens'));",
+                  "    pm.expect(Number.isInteger(expectedTotal) && expectedTotal >= 0, 'captured ingestion token baseline').to.be.true;",
+                  "    pm.expect(metrics.full_repo_tokens).to.eql(expectedTotal);",
+                  "    pm.expect(metrics.context_tokens).to.be.at.least(0);",
+                  "    if (metrics.full_repo_tokens > 0) {",
+                  "        pm.expect(metrics.tokens_saved).to.eql(metrics.full_repo_tokens - metrics.context_tokens);",
+                  "        const expectedEfficiency = Math.round(metrics.tokens_saved / metrics.full_repo_tokens * 10000) / 100;",
+                  "        pm.expect(Math.abs(metrics.efficiency_percentage - expectedEfficiency), 'efficiency rounding tolerance').to.be.at.most(0.01);",
+                  "    } else {",
+                  "        pm.expect(metrics.tokens_saved).to.eql(0);",
+                  "        pm.expect(metrics.efficiency_percentage).to.eql(0);",
+                  "    }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Delete repository graph (preferred)",
+          "request": {
+            "method": "DELETE",
+            "url": "{{base_url}}/api/repositories/{{active_repo_name}}",
+            "description": "Preferred normal cleanup: permanently deletes every Neo4j graph node in the selected repository scope. Requires Neo4j, mutates state, and cannot be undone without re-ingestion. Deleting an already-missing scope still returns the success envelope."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Delete returns HTTP 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Delete returns the selected scope', function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.status).to.eql('success');",
+                  "    pm.expect(body.repo_name).to.eql(pm.collectionVariables.get('active_repo_name'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify repository cleanup",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/graph?repo_name={{active_repo_name}}",
+            "description": "Checks that Neo4j has no remaining nodes or edges for the deleted repository scope. This is read-only and requires Neo4j. Only after the empty graph is confirmed does the script clear the workflow's dynamic collection variables."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Deleted repository graph is empty and workflow state is cleared', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.nodes).to.deep.eql([]);",
+                  "    pm.expect(body.edges).to.deep.eql([]);",
+                  "    ['active_repo_name', 'ingestion_total_tokens', 'function_node_id', 'function_name'].forEach(function (key) {",
+                  "        pm.collectionVariables.unset(key);",
+                  "    });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "02 - Validation and Failure Cases",
+      "description": "Focused negative API contracts. Run the first six requests individually or serially; the two repeated-delete requests must run in order and use a freshly generated test-only scope. The browser-lifecycle compatibility delete is manual-only and should be excluded from a folder run.",
+      "item": [
+        {
+          "name": "Reject insecure GitHub URL",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"http://github.com/example/repo\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{base_url}}/api/ingest-repo",
+            "description": "HTTP is not allowed for GitHub ingestion. Endpoint validation returns a 422 detail string before download, model calls, or Neo4j mutation."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Insecure GitHub URL is rejected with validation detail', function () {",
+                  "    pm.response.to.have.status(422);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reject non-GitHub HTTPS URL",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://example.com/example/repo\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{base_url}}/api/ingest-repo",
+            "description": "A valid HTTPS scheme is insufficient when the hostname is not github.com. Endpoint validation returns a 422 detail string without any external call or graph mutation."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Non-GitHub HTTPS URL is rejected', function () {",
+                  "    pm.response.to.have.status(422);",
+                  "    pm.expect(pm.response.json().detail).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reject malformed repository scope",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/graph?repo_name=owner/repository/extra",
+            "description": "The graph endpoint requires exactly owner/repository. A three-part path returns 422 before Neo4j is queried; unlike Pydantic body validation, this endpoint's existing error envelope has a string detail."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Malformed repository scope is rejected', function () {",
+                  "    pm.response.to.have.status(422);",
+                  "    pm.expect(pm.response.json().detail).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Streamed ingestion failure is not success",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/x-ndjson" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://github.com/codegraph-postman-validation-8f9349a7/repository-that-does-not-exist\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{base_url}}/api/ingest-repo",
+            "description": "Uses a syntactically valid but nonexistent GitHub repository. The endpoint begins an NDJSON stream with HTTP 200, then emits an error record when download fails. HTTP success is not ingestion success. Requires outbound GitHub access but does not call model providers or write a graph when the repository is unavailable."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200 stream contains an ingestion error, not terminal success', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.headers.get('Content-Type') || '').to.match(/^application\\/x-ndjson\\b/i);",
+                  "    const lines = pm.response.text().split(/\\r?\\n/).map(function (line) { return line.trim(); }).filter(Boolean);",
+                  "    pm.expect(lines.length, 'NDJSON records').to.be.greaterThan(0);",
+                  "    const records = lines.map(function (line, index) {",
+                  "        try { return JSON.parse(line); } catch (error) { throw new Error('Invalid NDJSON at line ' + (index + 1) + ': ' + error.message); }",
+                  "    });",
+                  "    pm.expect(records.some(function (record) { return Object.prototype.hasOwnProperty.call(record, 'error') && typeof record.error === 'string' && record.error.trim(); }), 'at least one error record').to.be.true;",
+                  "    pm.expect(records.some(function (record) { return record.progress === 100 && !Object.prototype.hasOwnProperty.call(record, 'error'); }), 'no successful terminal record').to.be.false;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reject chat without repository scope",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"Summarize this repository.\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{base_url}}/api/chat",
+            "description": "A chat request without repo_name is rejected by FastAPI validation before the agent or model providers run; it does not mutate graph state."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Missing chat scope returns a FastAPI validation error', function () {",
+                  "    pm.response.to.have.status(422);",
+                  "    const detail = pm.response.json().detail;",
+                  "    pm.expect(detail).to.be.an('array').that.is.not.empty;",
+                  "    pm.expect(detail.some(function (item) { return Array.isArray(item.loc) && item.loc.includes('repo_name'); }), 'repo_name is required').to.be.true;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown function source returns 404",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/node/not-a-real-function-node/code?repo_name=postman-validation/not-ingested",
+            "description": "Looks up an invalid function ID under a syntactically valid repository scope. Neo4j is required, but no state changes. The implemented contract is HTTP 404 with a string detail, not 422."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Unknown scoped function source returns not found', function () {",
+                  "    pm.response.to.have.status(404);",
+                  "    pm.expect(pm.response.json().detail).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Delete fresh test scope (first call)",
+          "request": {
+            "method": "DELETE",
+            "url": "{{base_url}}/api/repositories/{{negative_delete_repo_name}}",
+            "description": "Creates a unique synthetic repository scope for this run, then deletes it. This exercises the existing success envelope without touching active_repo_name. Requires Neo4j and mutates only the generated test scope. Run immediately before the second delete."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const suffix = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);",
+                  "pm.collectionVariables.set('negative_delete_repo_name', 'postman-validation/delete-' + suffix);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('First delete returns the generated scope', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.status).to.eql('success');",
+                  "    pm.expect(body.repo_name).to.eql(pm.collectionVariables.get('negative_delete_repo_name'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Delete same test scope again (idempotent)",
+          "request": {
+            "method": "DELETE",
+            "url": "{{base_url}}/api/repositories/{{negative_delete_repo_name}}",
+            "description": "Repeats the path-based deletion for exactly the generated scope from the preceding request. The current API returns the same HTTP 200 success envelope when the scope is already absent. Requires Neo4j; clears the temporary variable only after the assertion succeeds."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Repeated delete remains successful for the same scope', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.status).to.eql('success');",
+                  "    pm.expect(body.repo_name).to.eql(pm.collectionVariables.get('negative_delete_repo_name'));",
+                  "    pm.collectionVariables.unset('negative_delete_repo_name');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Browser-lifecycle cleanup (compatibility; manual only)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repo_name\": \"{{active_repo_name}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{base_url}}/api/repo",
+            "description": "Body-based DELETE used by the browser's unload keepalive request. It permanently deletes the selected Neo4j scope. Run this request individually only; prefer the path-based delete in the automated workflow for normal cleanup. No external provider is called; Neo4j is required."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Browser cleanup returns the selected scope', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.status).to.eql('success');",
+                  "    pm.expect(body.repo_name).to.eql(pm.collectionVariables.get('active_repo_name'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "03 - GitHub Webhook",
+      "description": "Six focused HMAC and body-validation cases. Set the private environment webhook_secret to match backend GITHUB_WEBHOOK_SECRET. The folder pre-request script signs exact raw UTF-8 body bytes with Web Crypto; the different-bytes case deliberately signs another string. The benign ping event does not update the graph. HTTP 202 is acceptance for background processing, not proof of completion.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const name = pm.info.requestName;",
+              "const benignBody = '{\"zen\":\"CodeGraph Postman HMAC check\"}';",
+              "const cases = ['Correctly signed benign webhook', 'Missing signature', 'Invalid signature', 'Signature from different bytes', 'Signed malformed JSON', 'Signed non-object JSON'];",
+              "if (!cases.includes(name)) { throw new Error('Unknown webhook test case: ' + name); }",
+              "let transmittedBody = benignBody;",
+              "if (name === 'Signature from different bytes') { transmittedBody = '{\"zen\":\"CodeGraph Postman HMAC check\",\"different_bytes\":true}'; }",
+              "if (name === 'Signed malformed JSON') { transmittedBody = '{\"zen\":'; }",
+              "if (name === 'Signed non-object JSON') { transmittedBody = '[]'; }",
+              "pm.collectionVariables.set('webhook_raw_body', transmittedBody);",
+              "pm.variables.set('webhook_raw_body', transmittedBody);",
+              "const rawBody = pm.variables.replaceIn(pm.request.body.raw);",
+              "if (rawBody !== transmittedBody) { throw new Error('Resolved request body differs from webhook_raw_body'); }",
+              "pm.collectionVariables.unset('webhook_signature');",
+              "if (name === 'Missing signature') {",
+              "    // This request intentionally has no signature header.",
+              "} else {",
+              "    const secret = pm.environment.get('webhook_secret');",
+              "    if (typeof secret !== 'string' || secret.length === 0) { throw new Error('Set the private environment webhook_secret to match backend GITHUB_WEBHOOK_SECRET'); }",
+              "    const signedBody = name === 'Signature from different bytes' ? benignBody : rawBody;",
+              "    function saveSignature(hex) {",
+              "        if (name === 'Invalid signature') { hex = (hex[0] === '0' ? '1' : '0') + hex.slice(1); }",
+              "        const signature = 'sha256=' + hex;",
+              "        pm.collectionVariables.set('webhook_signature', signature);",
+              "        pm.variables.set('webhook_signature', signature);",
+              "    }",
+              "    if (typeof crypto !== 'undefined' && crypto.subtle) {",
+              "        const hold = setInterval(function () {}, 10);",
+              "        (async function () {",
+              "            try {",
+              "                const encoder = new TextEncoder();",
+              "                const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);",
+              "                const digest = await crypto.subtle.sign('HMAC', key, encoder.encode(signedBody));",
+              "                saveSignature(Array.from(new Uint8Array(digest), function (byte) { return byte.toString(16).padStart(2, '0'); }).join(''));",
+              "            } catch (error) {",
+              "                pm.test('Webhook HMAC setup succeeds', function () { throw error; });",
+              "                pm.execution.skipRequest();",
+              "            } finally { clearInterval(hold); }",
+              "        })();",
+              "    } else {",
+              "        const CryptoJS = require('crypto-js'); // Older Newman sandbox compatibility.",
+              "        saveSignature(CryptoJS.HmacSHA256(signedBody, secret).toString(CryptoJS.enc.Hex));",
+              "    }",
+              "}"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "Correctly signed benign webhook",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-GitHub-Event", "value": "ping" },
+              { "key": "X-Hub-Signature-256", "value": "{{webhook_signature}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{{webhook_raw_body}}"
+            },
+            "url": "{{base_url}}/api/webhooks/github",
+            "description": "The folder pre-request script signs the exact raw JSON bytes sent here with the private webhook_secret. GitHub-style sha256=<hex> uses HMAC-SHA256 over the UTF-8 body. This benign ping event has no repository or commit data, so the background handler skips graph work. HTTP 202 confirms authentication and scheduling, not successful background completion. Never commit the secret."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Correctly signed benign webhook is accepted', function () {",
+                  "    pm.response.to.have.status(202);",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.status).to.eql('accepted');",
+                  "    pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Missing signature",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-GitHub-Event", "value": "ping" }
+            ],
+            "body": { "mode": "raw", "raw": "{{webhook_raw_body}}" },
+            "url": "{{base_url}}/api/webhooks/github",
+            "description": "Sends the same benign body with no X-Hub-Signature-256 header at all. Authentication rejects it with 401 before JSON parsing or background scheduling; no graph mutation or external provider call occurs."
+          },
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('Missing HMAC is unauthorized', function () {",
+              "    pm.response.to.have.status(401);",
+              "    pm.expect(pm.response.json().detail).to.be.a('string').and.not.empty;",
+              "});"
+            ] } }
+          ]
+        },
+        {
+          "name": "Invalid signature",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-GitHub-Event", "value": "ping" },
+              { "key": "X-Hub-Signature-256", "value": "{{webhook_signature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{{webhook_raw_body}}" },
+            "url": "{{base_url}}/api/webhooks/github",
+            "description": "Signs the benign body, then changes one hexadecimal digit before sending the header. The signature is well-formed but incorrect, so authentication returns 401 before background work."
+          },
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('Incorrect HMAC is unauthorized', function () {",
+              "    pm.response.to.have.status(401);",
+              "    pm.expect(pm.response.json().detail).to.be.a('string').and.not.empty;",
+              "});"
+            ] } }
+          ]
+        },
+        {
+          "name": "Signature from different bytes",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-GitHub-Event", "value": "ping" },
+              { "key": "X-Hub-Signature-256", "value": "{{webhook_signature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{{webhook_raw_body}}" },
+            "url": "{{base_url}}/api/webhooks/github",
+            "description": "The pre-request script signs body A but stores and transmits different body B unchanged. Both are valid JSON objects; only the exact-byte HMAC mismatch causes 401. Re-serializing or reformatting a signed payload has the same effect."
+          },
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('HMAC for different bytes is unauthorized', function () {",
+              "    pm.response.to.have.status(401);",
+              "    pm.expect(pm.response.json().detail).to.be.a('string').and.not.empty;",
+              "});"
+            ] } }
+          ]
+        },
+        {
+          "name": "Signed malformed JSON",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-GitHub-Event", "value": "ping" },
+              { "key": "X-Hub-Signature-256", "value": "{{webhook_signature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{{webhook_raw_body}}" },
+            "url": "{{base_url}}/api/webhooks/github",
+            "description": "Signs the exact malformed raw bytes ({\"zen\":) and sends them unchanged. HMAC passes, but JSON parsing fails with 400; authentication does not bypass body validation."
+          },
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('Signed malformed JSON is a bad request', function () {",
+              "    pm.response.to.have.status(400);",
+              "    pm.expect(pm.response.json().detail).to.be.a('string').and.not.empty;",
+              "});"
+            ] } }
+          ]
+        },
+        {
+          "name": "Signed non-object JSON",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-GitHub-Event", "value": "ping" },
+              { "key": "X-Hub-Signature-256", "value": "{{webhook_signature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{{webhook_raw_body}}" },
+            "url": "{{base_url}}/api/webhooks/github",
+            "description": "Signs and sends the exact bytes [] unchanged. The HMAC is valid, but this endpoint requires a JSON object and returns 400 before scheduling background work."
+          },
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('Signed non-object JSON is a bad request', function () {",
+              "    pm.response.to.have.status(400);",
+              "    pm.expect(pm.response.json().detail).to.be.a('string').and.not.empty;",
+              "});"
+            ] } }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "active_repo_name", "value": "" },
+    { "key": "ingestion_total_tokens", "value": "" },
+    { "key": "function_node_id", "value": "" },
+    { "key": "function_name", "value": "" },
+    { "key": "negative_delete_repo_name", "value": "" },
+    { "key": "chat_question", "value": "What are the major components of this repository and how do they interact?" },
+    { "key": "webhook_raw_body", "value": "{\"zen\":\"CodeGraph Postman HMAC check\"}" },
+    { "key": "webhook_signature", "value": "" }
+  ]
+}

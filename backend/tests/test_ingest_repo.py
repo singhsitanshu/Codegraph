@@ -157,6 +157,30 @@ def test_ingest_repository_rejects_non_github_url() -> None:
     assert response.status_code == 422
 
 
+def test_full_ingest_does_not_replace_graph_after_parse_failure(tmp_path: Path) -> None:
+    source_path = tmp_path / "broken.py"
+    source_path.write_text("def f(): pass\n", encoding="utf-8")
+
+    async def failed_parse(_paths: list[str]):
+        yield ParsedFileProgress(index=0, processed=1, total=1, result=None)
+
+    save = Mock()
+    with (
+        patch("app.main.download_and_extract_repo", new=AsyncMock(return_value=str(tmp_path))),
+        patch("app.main.parse_changed_files_with_progress", new=failed_parse),
+        patch("app.main.save_parsed_ast_to_neo4j_with_progress", new=save),
+        patch("app.main.cleanup_downloaded_repo"),
+    ):
+        response = TestClient(app).post(
+            "/api/ingest-repo", json={"url": "https://github.com/psf/requests"}
+        )
+
+    records = [json.loads(line) for line in response.text.splitlines()]
+    assert records[-1]["status"] == "Repository ingestion failed."
+    assert "could not be parsed" in records[-1]["error"]
+    save.assert_not_called()
+
+
 def test_downloaded_repository_lives_until_explicit_cleanup() -> None:
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(archive_buffer, mode="w") as archive:
