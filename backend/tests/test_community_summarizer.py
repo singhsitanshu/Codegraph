@@ -10,6 +10,8 @@ from app.services.community_summarizer import (
     DELETE_COMMUNITIES_QUERY,
     FETCH_COMMUNITIES_QUERY,
     STORE_COMMUNITIES_QUERY,
+    UNGROUP_SMALL_COMMUNITIES_QUERY,
+    UNGROUPED_COMMUNITY_ID,
     CommunityLabel,
     _generate_community_label,
     label_and_store_communities,
@@ -29,11 +31,13 @@ def test_label_and_store_communities_replaces_repository_labels_atomically() -> 
         return_value=[
             {
                 "comm_id": 2,
+                "size": 3,
                 "func_names": ["get", "post", "request"],
                 "file_paths": ["requests/api.py", "requests/sessions.py"],
             },
             {
                 "comm_id": 7,
+                "size": 4,
                 "func_names": ["extract_cookies"],
                 "file_paths": ["requests/cookies.py"],
             },
@@ -101,6 +105,69 @@ def test_label_and_store_communities_replaces_repository_labels_atomically() -> 
         ),
     ]
     write_session.execute_write.assert_awaited_once()
+
+
+def test_small_communities_are_grouped_without_llm_labels() -> None:
+    read_result = MagicMock()
+    read_result.data = AsyncMock(
+        return_value=[
+            {"comm_id": 1, "size": 5, "func_names": ["a"], "file_paths": ["a.py"]},
+            {"comm_id": 4, "size": 2, "func_names": ["b", "c"], "file_paths": ["b.py"]},
+            {"comm_id": 9, "size": 1, "func_names": ["d"], "file_paths": ["d.py"]},
+        ]
+    )
+    read_session = MagicMock()
+    read_session.run = AsyncMock(return_value=read_result)
+    transaction = MagicMock()
+    transaction_result = MagicMock()
+    transaction_result.consume = AsyncMock()
+    transaction.run = AsyncMock(return_value=transaction_result)
+    write_session = MagicMock()
+
+    async def execute_write(callback):
+        await callback(transaction)
+
+    write_session.execute_write = AsyncMock(side_effect=execute_write)
+    driver = MagicMock()
+    driver.session.side_effect = [
+        _async_context(read_session),
+        _async_context(write_session),
+    ]
+    generate_label = AsyncMock(
+        return_value=CommunityLabel(name="Core", description="Core logic.")
+    )
+
+    with (
+        patch(
+            "app.services.community_summarizer.get_neo4j_driver",
+            return_value=driver,
+        ),
+        patch(
+            "app.services.community_summarizer._generate_community_label",
+            new=generate_label,
+        ),
+    ):
+        communities = asyncio.run(label_and_store_communities("owner/repository"))
+
+    generate_label.assert_awaited_once_with(["a"], ["a.py"])
+    assert [(community["id"], community["name"]) for community in communities] == [
+        (1, "Core"),
+        (UNGROUPED_COMMUNITY_ID, "Ungrouped"),
+    ]
+    assert transaction.run.await_args_list == [
+        call(DELETE_COMMUNITIES_QUERY, repo_name="owner/repository"),
+        call(
+            UNGROUP_SMALL_COMMUNITIES_QUERY,
+            repo_name="owner/repository",
+            community_ids=[4, 9],
+            ungrouped_id=UNGROUPED_COMMUNITY_ID,
+        ),
+        call(
+            STORE_COMMUNITIES_QUERY,
+            repo_name="owner/repository",
+            communities=communities,
+        ),
+    ]
 
 
 def test_generate_community_label_uses_structured_output() -> None:
