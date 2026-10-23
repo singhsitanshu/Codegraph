@@ -21,14 +21,29 @@ COMMUNITY_LABEL_SYSTEM_PROMPT = (
     "name and a one-sentence description."
 )
 
+MIN_LABELED_COMMUNITY_SIZE = 3
+UNGROUPED_COMMUNITY_ID = -1
+UNGROUPED_COMMUNITY_NAME = "Ungrouped"
+UNGROUPED_COMMUNITY_DESCRIPTION = (
+    f"Functions whose detected community had fewer than "
+    f"{MIN_LABELED_COMMUNITY_SIZE} members; they do not form a subsystem."
+)
+
 FETCH_COMMUNITIES_QUERY = """
 MATCH (f:Function {repo_name: $repo_name})
 WHERE f.leiden_community IS NOT NULL
 WITH f.leiden_community AS comm_id,
+     count(f) AS size,
      collect(coalesce(f.qualified_name, f.name))[..15] AS func_names,
      collect(DISTINCT f.file_path)[..5] AS file_paths
-RETURN comm_id, func_names, file_paths
+RETURN comm_id, size, func_names, file_paths
 ORDER BY comm_id
+"""
+
+UNGROUP_SMALL_COMMUNITIES_QUERY = """
+MATCH (f:Function {repo_name: $repo_name})
+WHERE f.leiden_community IN $community_ids
+SET f.leiden_community = $ungrouped_id
 """
 
 DELETE_COMMUNITIES_QUERY = """
@@ -125,12 +140,22 @@ async def label_and_store_communities(
         records = await result.data()
 
     communities: list[dict[str, Any]] = []
+    small_community_ids: list[int] = []
     for record in records:
         community_id = record.get("comm_id")
         if not isinstance(community_id, int):
             continue
+        function_names = _string_list(record.get("func_names"))
+        size = record.get("size")
+        if not isinstance(size, int):
+            size = len(function_names)
+        # Tiny clusters carry no architectural signal and would each cost an
+        # LLM call, so they are pooled into one unlabeled community.
+        if size < MIN_LABELED_COMMUNITY_SIZE:
+            small_community_ids.append(community_id)
+            continue
         label = await _generate_community_label(
-            _string_list(record.get("func_names")),
+            function_names,
             _string_list(record.get("file_paths")),
         )
         communities.append(
@@ -138,6 +163,14 @@ async def label_and_store_communities(
                 "id": community_id,
                 "name": label.name,
                 "description": label.description,
+            }
+        )
+    if small_community_ids:
+        communities.append(
+            {
+                "id": UNGROUPED_COMMUNITY_ID,
+                "name": UNGROUPED_COMMUNITY_NAME,
+                "description": UNGROUPED_COMMUNITY_DESCRIPTION,
             }
         )
 
@@ -149,6 +182,14 @@ async def label_and_store_communities(
                 repo_name=normalized_repo_name,
             )
             await deleted.consume()
+            if small_community_ids:
+                ungrouped = await transaction.run(
+                    UNGROUP_SMALL_COMMUNITIES_QUERY,
+                    repo_name=normalized_repo_name,
+                    community_ids=small_community_ids,
+                    ungrouped_id=UNGROUPED_COMMUNITY_ID,
+                )
+                await ungrouped.consume()
             if communities:
                 stored = await transaction.run(
                     STORE_COMMUNITIES_QUERY,
@@ -160,9 +201,13 @@ async def label_and_store_communities(
         await session.execute_write(replace_communities)
 
     logger.info(
-        "Stored %d architectural community label(s) for %s with %s",
-        len(communities),
+        "Stored %d architectural community label(s) for %s with %s; "
+        "%d community(ies) under %d functions grouped as %s",
+        len(communities) - (1 if small_community_ids else 0),
         normalized_repo_name,
         COMMUNITY_LABEL_MODEL,
+        len(small_community_ids),
+        MIN_LABELED_COMMUNITY_SIZE,
+        UNGROUPED_COMMUNITY_NAME,
     )
     return communities

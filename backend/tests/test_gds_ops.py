@@ -1,6 +1,7 @@
 """Unit tests for repository-scoped Leiden community detection."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -144,3 +145,41 @@ def test_run_leiden_clustering_skips_empty_repository(caplog) -> None:
 def test_run_leiden_clustering_rejects_blank_repository() -> None:
     with pytest.raises(ValueError, match="repo_name must not be blank"):
         asyncio.run(run_leiden_clustering("  "))
+
+
+def test_run_leiden_clustering_warns_when_most_functions_are_singletons(
+    caplog,
+) -> None:
+    caplog.set_level(logging.INFO, logger="app.db.gds_ops")
+    count_result = _data_result([{"node_count": 10}])
+    projection = _consumable_result()
+    leiden = _data_result(
+        [
+            {
+                "communityCount": 9,
+                "modularity": 0.1,
+                "functionCount": 10,
+                "singletonCount": 8,
+                "projectedNodeCount": 10,
+                "projectedRelationshipCount": 2,
+            }
+        ]
+    )
+    dropped = _consumable_result()
+    driver, _ = _mock_driver([count_result, projection, leiden, dropped])
+
+    with patch("app.db.gds_ops.get_neo4j_driver", return_value=driver):
+        asyncio.run(run_leiden_clustering("owner/sparse"))
+
+    assert "projectedRelationships=2" in caplog.text
+    assert "singletonRatio=0.800" in caplog.text
+    assert "left 80% of functions in single-function communities" in caplog.text
+
+
+def test_leiden_writes_final_communities_to_functions_only() -> None:
+    assert "gds.leiden.mutate" in RUN_LEIDEN_QUERY
+    assert "includeIntermediateCommunities" not in RUN_LEIDEN_QUERY
+    assert "['Function']" in RUN_LEIDEN_QUERY
+    assert "File-[:DEFINES]->" not in PROJECT_CODEBASE_GRAPH_QUERY
+    assert "(s:File {repo_name: $repo_name})-[r:DEFINES]->" in PROJECT_CODEBASE_GRAPH_QUERY
+    assert "t:ExternalFunction" in PROJECT_CODEBASE_GRAPH_QUERY
