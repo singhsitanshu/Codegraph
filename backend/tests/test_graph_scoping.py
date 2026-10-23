@@ -405,9 +405,10 @@ def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
         100,
         5,
     ]
+    # Embedding requests are batched separately (up to 512 distinct inputs).
     assert [
         len(call.args[0]) for call in embed_batch.await_args_list
-    ] == [100, 100, 5]
+    ] == [205]
     cluster_graph.assert_awaited_once_with("owner/large-repository")
     label_communities.assert_awaited_once_with("owner/large-repository")
 
