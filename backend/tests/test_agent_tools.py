@@ -135,6 +135,37 @@ def test_query_outgoing_dependencies_formats_targets_and_locations() -> None:
     )
 
 
+def test_query_outgoing_dependencies_separates_same_named_definitions() -> None:
+    output, _ = _invoke_tool(
+        query_outgoing_dependencies,
+        {"repo_name": "owner/repository", "function_name": "run"},
+        [
+            {
+                "caller_name": "Alpha.run",
+                "caller_file": "src/a.py",
+                "target_name": "prepare",
+                "target_file": "src/a.py",
+                "is_external": False,
+            },
+            {
+                "caller_name": "Beta.run",
+                "caller_file": "src/b.py",
+                "target_name": "print",
+                "target_file": None,
+                "is_external": True,
+            },
+        ],
+    )
+
+    assert output == (
+        "Outgoing dependencies for 2 definitions named run:\n"
+        "Alpha.run (src/a.py):\n"
+        "  - prepare (src/a.py)\n"
+        "Beta.run (src/b.py):\n"
+        "  - print (External/Built-in)"
+    )
+
+
 def test_blast_radius_surfaces_external_target_status() -> None:
     output, run_query = _invoke_tool(
         query_graph_blast_radius,

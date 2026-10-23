@@ -14,26 +14,35 @@ from app.agent.graph import query_graph_blast_radius
 from app.db import close_neo4j_driver, neo4j_client
 from app.db.graph_ops import delete_repository_graph, save_parsed_ast_to_neo4j
 from app.main import app
+from app.services.parser_service import CodeParser
+from app.services.pipeline import _extract_push_removed_files
 
 TEST_FILE_PATH = "TEST_MOCK_FILE.py"
 TEST_REPO_NAME = "test/mock-repository"
 OTHER_TEST_REPO_NAME = "test/other-repository"
+MOCK_FUNC_A_SOURCE = (
+    "def mock_func_A():\n"
+    "    external_api_call()\n"
+    "    return mock_func_B()"
+)
+
+
+def _parse(
+    source: str,
+    repo_name: str = TEST_REPO_NAME,
+    file_path: str = TEST_FILE_PATH,
+) -> dict[str, object]:
+    return asyncio.run(
+        CodeParser().parse_file(
+            file_path,
+            source.encode("utf-8"),
+            repository=repo_name,
+        )
+    )
+
+
 MOCK_DATA: list[dict[str, object]] = [
-    {
-        "file_path": TEST_FILE_PATH,
-        "defined_functions": ["mock_func_A", "mock_func_B"],
-        "functions": [
-            {
-                "name": "mock_func_A",
-                "raw_code": "def mock_func_A():\n    return mock_func_B()",
-            },
-            {
-                "name": "mock_func_B",
-                "raw_code": "def mock_func_B():\n    return True",
-            },
-        ],
-        "outgoing_calls": ["mock_func_B", "external_api_call"],
-    }
+    _parse(MOCK_FUNC_A_SOURCE + "\n\ndef mock_func_B():\n    return True\n")
 ]
 
 
@@ -47,9 +56,8 @@ TEST_NODE_CLEANUP_QUERY = (
     "DETACH DELETE n"
 )
 ORPHAN_EXTERNAL_CLEANUP_QUERY = """
-MATCH (function:Function {
+MATCH (function:ExternalFunction {
     name: 'external_api_call',
-    external: true,
     repo_name: 'test/mock-repository'
 })
 WHERE NOT (function)<-[:CALLS]-()
@@ -131,9 +139,16 @@ def test_neo4j_ast_write(db_cleanup: None) -> None:
             repo_name=TEST_REPO_NAME,
         ).single(strict=True)["count"]
         external_count = session.run(
-            "MATCH (function:Function:ExternalFunction {"
+            "MATCH (function:ExternalFunction {"
             "name: 'external_api_call', repo_name: $repo_name, "
-            "is_external: true}) RETURN count(function) AS count",
+            "is_external: true}) WHERE NOT function:Function "
+            "RETURN count(function) AS count",
+            repo_name=TEST_REPO_NAME,
+        ).single(strict=True)["count"]
+        identified_count = session.run(
+            "MATCH (function:Function {repo_name: $repo_name}) "
+            "WHERE function.entity_id STARTS WITH 'fn:v1:' "
+            "RETURN count(function) AS count",
             repo_name=TEST_REPO_NAME,
         ).single(strict=True)["count"]
         stored_source = session.run(
@@ -146,7 +161,8 @@ def test_neo4j_ast_write(db_cleanup: None) -> None:
     assert function_count == 2
     assert calls_count == 1
     assert external_count == 1
-    assert stored_source == "def mock_func_A():\n    return mock_func_B()"
+    assert identified_count == 2
+    assert stored_source == MOCK_FUNC_A_SOURCE
 
 
 def test_api_graph_endpoint(db_cleanup: None) -> None:
@@ -179,7 +195,7 @@ def test_api_graph_endpoint(db_cleanup: None) -> None:
     )
     assert source_response.status_code == 200
     assert source_response.json() == {
-        "code": "def mock_func_A():\n    return mock_func_B()",
+        "code": MOCK_FUNC_A_SOURCE,
         "file_path": TEST_FILE_PATH,
         "name": "mock_func_A",
     }
@@ -338,19 +354,15 @@ def test_blast_radius_does_not_cross_repository_boundaries(
 ) -> None:
     """Return callers from repository A without leaking repository B."""
 
+    shared_source = "\n\ndef shared_target():\n    pass\n"
     repository_a = [
-        {
-            "file_path": TEST_FILE_PATH,
-            "defined_functions": ["caller_from_a", "shared_target"],
-            "outgoing_calls": ["shared_target"],
-        }
+        _parse("def caller_from_a():\n    shared_target()" + shared_source)
     ]
     repository_b = [
-        {
-            "file_path": TEST_FILE_PATH,
-            "defined_functions": ["caller_from_b", "shared_target"],
-            "outgoing_calls": ["shared_target"],
-        }
+        _parse(
+            "def caller_from_b():\n    shared_target()" + shared_source,
+            repo_name=OTHER_TEST_REPO_NAME,
+        )
     ]
 
     async def save_and_query() -> tuple[dict[str, object], dict[str, object]]:
@@ -402,3 +414,111 @@ def test_blast_radius_does_not_cross_repository_boundaries(
     assert "caller_from_b" not in caller_names_a
     assert "caller_from_b" in caller_names_b
     assert "caller_from_a" not in caller_names_b
+
+
+def test_initialize_database_creates_function_identity_constraint() -> None:
+    """The entity_id uniqueness constraint is accepted by the live database."""
+
+    if neo4j_client.driver is None:
+        neo4j_client.driver = neo4j_client._initialize_driver()
+    if neo4j_client.driver is None:
+        pytest.skip("Neo4j is unavailable; integration tests require a live database")
+
+    with patch.object(neo4j_client, "_database_initialized", False):
+        neo4j_client.initialize_database()
+    with neo4j_client.driver.session() as session:
+        constraint = session.run(
+            "SHOW CONSTRAINTS YIELD name, type, labelsOrTypes, properties "
+            "WHERE name = 'function_entity_id' "
+            "RETURN type, labelsOrTypes, properties"
+        ).single()
+    neo4j_client.close_driver()
+
+    assert constraint is not None
+    assert constraint["labelsOrTypes"] == ["Function"]
+    assert constraint["properties"] == ["entity_id"]
+
+
+def test_incremental_update_keeps_identity_and_incoming_edges(
+    db_cleanup: None,
+) -> None:
+    """A body edit keeps the node; removed definitions and files disappear."""
+
+    library_path = "src/library.py"
+    first_version = [
+        _parse(
+            "def target():\n    pass\n\ndef removed():\n    pass\n",
+            file_path=library_path,
+        ),
+        _parse("def caller():\n    target()\n", file_path="src/app.py"),
+        _parse("def obsolete():\n    pass\n", file_path="src/obsolete.py"),
+    ]
+    second_version = [
+        _parse("def target():\n    return 1\n", file_path=library_path)
+    ]
+    target_id = second_version[0]["functions"][0]["entity_id"]
+    assert target_id == first_version[0]["functions"][0]["entity_id"]
+
+    async def save() -> None:
+        try:
+            await save_parsed_ast_to_neo4j(
+                first_version, TEST_REPO_NAME, replace_existing=True
+            )
+            await save_parsed_ast_to_neo4j(
+                second_version,
+                TEST_REPO_NAME,
+                deleted_file_paths=["src/obsolete.py"],
+            )
+        finally:
+            await close_neo4j_driver()
+
+    with patch(
+        "app.db.graph_ops.generate_embeddings",
+        side_effect=_fake_embeddings,
+    ), patch(
+        "app.db.graph_ops.run_leiden_clustering",
+        new=AsyncMock(),
+    ), patch(
+        "app.db.graph_ops.label_and_store_communities",
+        new=AsyncMock(),
+    ):
+        asyncio.run(save())
+
+    assert neo4j_client.driver is not None
+    with neo4j_client.driver.session() as session:
+        functions = session.run(
+            "MATCH (function:Function {repo_name: $repo_name}) "
+            "RETURN function.qualified_name AS name, "
+            "function.entity_id AS entity_id, function.raw_code AS raw_code "
+            "ORDER BY name",
+            repo_name=TEST_REPO_NAME,
+        ).data()
+        files = session.run(
+            "MATCH (file:File {repo_name: $repo_name}) "
+            "RETURN file.path AS path ORDER BY path",
+            repo_name=TEST_REPO_NAME,
+        ).value()
+        incoming = session.run(
+            "MATCH (:Function {repo_name: $repo_name, name: 'caller'})"
+            "-[call:CALLS]->(target:Function {entity_id: $target_id}) "
+            "RETURN call.resolution AS resolution",
+            repo_name=TEST_REPO_NAME,
+            target_id=target_id,
+        ).value()
+
+    assert [function["name"] for function in functions] == ["caller", "target"]
+    assert functions[1]["entity_id"] == target_id
+    assert functions[1]["raw_code"] == "def target():\n    return 1"
+    assert files == ["src/app.py", library_path]
+    assert incoming == ["repository_unique"]
+
+
+def test_push_removed_files_use_each_path_final_state() -> None:
+    payload = {
+        "commits": [
+            {"removed": ["src/gone.py", "src/readded.py"], "modified": []},
+            {"added": ["src/readded.py"], "removed": ["src/late.py"]},
+        ]
+    }
+
+    assert _extract_push_removed_files(payload) == ["src/gone.py", "src/late.py"]

@@ -1,6 +1,12 @@
-"""Neo4j persistence operations for parsed source-code relationships."""
+"""Neo4j persistence operations for parsed source-code relationships.
 
-from collections.abc import AsyncIterator, Iterator
+Functions are keyed by the deterministic CG-002A ``entity_id`` rather than by
+their simple names, so same-named definitions in different files, classes, or
+lexical scopes remain separate graph nodes.
+"""
+
+import logging
+from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -8,15 +14,22 @@ from app.db import get_neo4j_driver
 from app.db.gds_ops import run_leiden_clustering
 from app.services.community_summarizer import label_and_store_communities
 from app.services.embedding_service import generate_embeddings
+from app.utils.entity_identity import (
+    generate_function_entity_id,
+    normalize_repository_path,
+)
 from app.utils.tokens import DEFAULT_TOKEN_MODEL
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 100
 BatchItem = TypeVar("BatchItem")
 
 DELETE_REPOSITORY_QUERY = """
 MATCH (node)
-WHERE (node:Repository OR node:File OR node:Function OR node:Community)
+WHERE (node:Repository OR node:File OR node:Function OR node:ExternalFunction
+       OR node:Community)
   AND node.repo_name = $repo_name
 DETACH DELETE node
 """
@@ -30,6 +43,41 @@ DELETE_ALL_REPOSITORY_GRAPHS_QUERY = """
 MATCH (n)
 WHERE n.repo_name IS NOT NULL
 DETACH DELETE n
+"""
+
+FETCH_EXISTING_DEFINITIONS_QUERY = """
+MATCH (fn:Function {repo_name: $repo_name})
+WHERE fn.entity_id IS NOT NULL
+  AND NOT fn.file_path IN $paths
+RETURN fn.entity_id AS entity_id,
+       fn.name AS name,
+       fn.qualified_name AS qualified_name,
+       fn.file_path AS file_path
+"""
+
+DELETE_FILES_QUERY = """
+MATCH (file:File {repo_name: $repo_name})
+WHERE file.path IN $paths
+DETACH DELETE file
+"""
+
+DELETE_STALE_FUNCTIONS_QUERY = """
+MATCH (fn:Function {repo_name: $repo_name})
+WHERE fn.file_path IN $paths
+  AND (fn.entity_id IS NULL OR NOT fn.entity_id IN $entity_ids)
+DETACH DELETE fn
+"""
+
+DELETE_OUTGOING_CALLS_QUERY = """
+MATCH (fn:Function {repo_name: $repo_name})-[call:CALLS]->()
+WHERE fn.file_path IN $paths
+DELETE call
+"""
+
+DELETE_ORPHAN_EXTERNAL_FUNCTIONS_QUERY = """
+MATCH (external:ExternalFunction {repo_name: $repo_name})
+WHERE NOT ()-[:CALLS]->(external)
+DETACH DELETE external
 """
 
 MERGE_FILES_QUERY = """
@@ -52,11 +100,20 @@ SET repository.name = $repo_name,
 MERGE_FUNCTIONS_QUERY = """
 UNWIND $batch AS func
 MATCH (f:File {path: func.file_path, repo_name: $repo_name})
-MERGE (fn:Function {name: func.name, repo_name: $repo_name})
-REMOVE fn:ExternalFunction
-SET fn.file = coalesce(fn.file, func.file_path),
+MERGE (fn:Function {entity_id: func.entity_id, repo_name: $repo_name})
+SET fn.name = func.name,
+    fn.qualified_name = func.qualified_name,
+    fn.file = func.file_path,
     fn.file_path = func.file_path,
+    fn.language = func.language,
+    fn.signature = func.signature,
+    fn.definition_discriminator = func.definition_discriminator,
+    fn.start_line = func.start_line,
+    fn.end_line = func.end_line,
+    fn.start_column = func.start_column,
+    fn.end_column = func.end_column,
     fn.raw_code = func.raw_code,
+    fn.ambiguous_calls = func.ambiguous_calls,
     fn.embedding = func.embedding,
     fn.external = false,
     fn.is_external = false
@@ -65,28 +122,26 @@ MERGE (f)-[:DEFINES]->(fn)
 
 MERGE_CALLS_QUERY = """
 UNWIND $batch AS call
-MATCH (caller:Function {
-    name: call.caller_name,
-    repo_name: $repo_name
-})
-MERGE (target:Function {
-    name: call.target_name,
-    repo_name: $repo_name
-})
-ON CREATE SET target.external = true
+MATCH (caller:Function {entity_id: call.caller_id, repo_name: $repo_name})
+MATCH (target:Function {entity_id: call.target_id, repo_name: $repo_name})
 MERGE (caller)-[relationship:CALLS]->(target)
-SET relationship.inferred_from_file_scope = true,
-    relationship.source_files = CASE
-        WHEN call.file_path IN coalesce(relationship.source_files, [])
-        THEN coalesce(relationship.source_files, [])
-        ELSE coalesce(relationship.source_files, []) + call.file_path
-    END
+SET relationship.resolution = call.resolution,
+    relationship.call_count = call.call_count,
+    relationship.source_file = call.file_path,
+    relationship.inferred_from_file_scope = false
 """
 
-TAG_EXTERNAL_FUNCTIONS_QUERY = """
-MATCH (fn:Function {repo_name: $repo_name})
-WHERE NOT ()-[:DEFINES]->(fn)
-SET fn:ExternalFunction, fn.is_external = true
+MERGE_EXTERNAL_CALLS_QUERY = """
+UNWIND $batch AS call
+MATCH (caller:Function {entity_id: call.caller_id, repo_name: $repo_name})
+MERGE (target:ExternalFunction {name: call.target_name, repo_name: $repo_name})
+ON CREATE SET target.external = true,
+              target.is_external = true
+MERGE (caller)-[relationship:CALLS]->(target)
+SET relationship.resolution = 'external',
+    relationship.call_count = call.call_count,
+    relationship.source_file = call.file_path,
+    relationship.inferred_from_file_scope = false
 """
 
 
@@ -110,106 +165,227 @@ def chunk_data(
         yield data_list[index : index + chunk_size]
 
 
-def _string_list(value: object) -> list[str]:
-    """Keep unique, non-empty strings from an untrusted parsed-data field."""
+def _repository_relative_path(file_path: str) -> str:
+    """Normalize a parsed path, explaining why absolute paths are rejected."""
+
+    try:
+        return normalize_repository_path(file_path)
+    except ValueError as exc:
+        raise ValueError(
+            f"parsed file path {file_path!r} must be repository-relative "
+            "before it is persisted"
+        ) from exc
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _call_names(value: object) -> list[str]:
+    """Return the callee names of a parser ``calls`` list in source order."""
 
     if not isinstance(value, list):
         return []
-    return list(
-        dict.fromkeys(item for item in value if isinstance(item, str) and item)
+    return [
+        call["name"]
+        for call in value
+        if isinstance(call, dict) and isinstance(call.get("name"), str) and call["name"]
+    ]
+
+
+def _function_record(
+    parsed_function: object,
+    repo_name: str,
+    file_path: str,
+) -> dict[str, Any] | None:
+    """Build one persisted Function record keyed by its CG-002A identity."""
+
+    if not isinstance(parsed_function, dict):
+        return None
+    # Declaration-only TypeScript overloads keep a parser identity, but the
+    # graph stores executable bodies only.
+    if parsed_function.get("has_body") is False:
+        return None
+
+    name = parsed_function.get("name")
+    qualified_name = parsed_function.get("qualified_name")
+    language = parsed_function.get("language")
+    discriminator = parsed_function.get("definition_discriminator")
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (name, qualified_name, language, discriminator)
+    ):
+        logger.warning(
+            "Skipping function %r in %s: missing CG-002A identity metadata",
+            name,
+            file_path,
+        )
+        return None
+
+    entity_id = generate_function_entity_id(
+        repo_name,
+        file_path,
+        language,
+        qualified_name,
+        discriminator,
     )
+    supplied_entity_id = parsed_function.get("entity_id")
+    if supplied_entity_id is not None and supplied_entity_id != entity_id:
+        raise ValueError(
+            f"function {qualified_name!r} in {file_path} has an entity_id "
+            f"that was not generated for repository {repo_name!r} and this path"
+        )
+
+    signature = parsed_function.get("signature")
+    raw_code = parsed_function.get("raw_code")
+    return {
+        "entity_id": entity_id,
+        "name": name,
+        "qualified_name": qualified_name,
+        "file_path": file_path,
+        "language": language,
+        "signature": signature if isinstance(signature, str) else None,
+        "definition_discriminator": discriminator,
+        "start_line": _optional_int(parsed_function.get("start_line")),
+        "end_line": _optional_int(parsed_function.get("end_line")),
+        "start_column": _optional_int(parsed_function.get("start_column")),
+        "end_column": _optional_int(parsed_function.get("end_column")),
+        "raw_code": raw_code if isinstance(raw_code, str) else "",
+    }
 
 
 def _extract_etl_records(
     parsed_data_list: list[dict[str, Any]],
-) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
-    """Flatten parsed AST data into file, function, and call records."""
+    repo_name: str,
+) -> tuple[list[dict[str, str]], list[dict[str, Any]], dict[str, list[str]]]:
+    """Flatten parsed files into File records, Function records, and call names.
+
+    The third value maps each caller ``entity_id`` to the callee names the
+    parser attributed to that function's body, in source order.
+    """
 
     files: list[dict[str, str]] = []
-    functions: list[dict[str, str]] = []
-    calls: list[dict[str, str]] = []
+    functions: list[dict[str, Any]] = []
+    function_calls: dict[str, list[str]] = {}
     seen_files: set[str] = set()
-    seen_functions: set[tuple[str, str]] = set()
-    seen_calls: set[tuple[str, str, str]] = set()
 
     for parsed_file in parsed_data_list:
-        file_path = parsed_file.get("file_path")
-        if not isinstance(file_path, str) or not file_path:
+        raw_path = parsed_file.get("file_path")
+        if not isinstance(raw_path, str) or not raw_path:
             continue
+        file_path = _repository_relative_path(raw_path)
         if file_path not in seen_files:
             seen_files.add(file_path)
             files.append({"path": file_path})
 
-        function_records: list[dict[str, str]] = []
-        seen_function_names: set[str] = set()
         parsed_functions = parsed_file.get("functions")
-        if isinstance(parsed_functions, list):
-            for parsed_function in parsed_functions:
-                if not isinstance(parsed_function, dict):
-                    continue
-                # Declaration-only TypeScript overloads are retained by the
-                # parser for identity, but the legacy graph stores one body
-                # per simple name until CG-002B migrates persistence.
-                if parsed_function.get("has_body") is False:
-                    continue
-                function_name = parsed_function.get("name")
-                raw_code = parsed_function.get("raw_code")
-                if (
-                    not isinstance(function_name, str)
-                    or not function_name
-                    or function_name in seen_function_names
-                ):
-                    continue
-                seen_function_names.add(function_name)
-                function_records.append(
-                    {
-                        "name": function_name,
-                        "raw_code": raw_code if isinstance(raw_code, str) else "",
-                    }
-                )
-        for function_name in _string_list(
-            parsed_file.get("defined_functions")
-        ):
-            if function_name in seen_function_names:
+        if not isinstance(parsed_functions, list):
+            continue
+        for parsed_function in parsed_functions:
+            record = _function_record(parsed_function, repo_name, file_path)
+            if record is None:
                 continue
-            seen_function_names.add(function_name)
-            function_records.append({"name": function_name, "raw_code": ""})
-
-        outgoing_calls = _string_list(parsed_file.get("outgoing_calls"))
-        for function_record in function_records:
-            function_name = function_record["name"]
-            function_key = (file_path, function_name)
-            if function_key not in seen_functions:
-                seen_functions.add(function_key)
-                functions.append(
-                    {
-                        "name": function_name,
-                        "file_path": file_path,
-                        "raw_code": function_record["raw_code"],
-                    }
+            entity_id = record["entity_id"]
+            if entity_id in function_calls:
+                logger.warning(
+                    "Skipping duplicate function identity %s in %s",
+                    record["qualified_name"],
+                    file_path,
                 )
+                continue
+            functions.append(record)
+            function_calls[entity_id] = _call_names(parsed_function.get("calls"))
 
-            for target_name in outgoing_calls:
-                call_key = (function_name, target_name, file_path)
-                if call_key in seen_calls:
-                    continue
-                seen_calls.add(call_key)
-                calls.append(
+    return files, functions, function_calls
+
+
+def _append_index(index: dict[Any, list[str]], key: Any, entity_id: str) -> None:
+    index.setdefault(key, []).append(entity_id)
+
+
+def _resolve_calls(
+    functions: list[dict[str, Any]],
+    function_calls: dict[str, list[str]],
+    definitions: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, list[str]]]:
+    """Map call names to Function IDs without collapsing same-named definitions.
+
+    A callee resolves to exactly one definition: first the nearest enclosing
+    lexical scope in the caller's file, then a unique same-file name, then a
+    unique repository-wide name. Names that never match become external calls;
+    names with several equally plausible definitions are recorded as ambiguous
+    on the caller instead of being linked to an arbitrary one.
+    """
+
+    by_scope: dict[tuple[str, str], list[str]] = {}
+    by_file_name: dict[tuple[str, str], list[str]] = {}
+    by_name: dict[str, list[str]] = {}
+    for definition in definitions:
+        entity_id = definition["entity_id"]
+        file_path = definition["file_path"]
+        name = definition["name"]
+        _append_index(by_scope, (file_path, definition["qualified_name"]), entity_id)
+        _append_index(by_file_name, (file_path, name), entity_id)
+        _append_index(by_name, name, entity_id)
+
+    def resolve(caller: dict[str, Any], name: str) -> tuple[list[str], str]:
+        file_path = caller["file_path"]
+        scope = caller["qualified_name"].split(".")
+        for depth in range(len(scope), -1, -1):
+            qualified_name = ".".join([*scope[:depth], name])
+            matches = by_scope.get((file_path, qualified_name), [])
+            if matches:
+                return matches, "lexical_scope"
+        matches = by_file_name.get((file_path, name), [])
+        if matches:
+            return matches, "same_file"
+        return by_name.get(name, []), "repository_unique"
+
+    internal: dict[tuple[str, str], dict[str, Any]] = {}
+    external: dict[tuple[str, str], dict[str, Any]] = {}
+    ambiguous: dict[str, list[str]] = {}
+    for caller in functions:
+        caller_id = caller["entity_id"]
+        for name in function_calls.get(caller_id, []):
+            matches, resolution = resolve(caller, name)
+            if len(matches) > 1:
+                names = ambiguous.setdefault(caller_id, [])
+                if name not in names:
+                    names.append(name)
+                continue
+            if matches:
+                key = (caller_id, matches[0])
+                record = internal.setdefault(
+                    key,
                     {
-                        "caller_name": function_name,
-                        "target_name": target_name,
-                        "file_path": file_path,
-                    }
+                        "caller_id": caller_id,
+                        "target_id": matches[0],
+                        "resolution": resolution,
+                        "call_count": 0,
+                        "file_path": caller["file_path"],
+                    },
                 )
+            else:
+                key = (caller_id, name)
+                record = external.setdefault(
+                    key,
+                    {
+                        "caller_id": caller_id,
+                        "target_name": name,
+                        "call_count": 0,
+                        "file_path": caller["file_path"],
+                    },
+                )
+            record["call_count"] += 1
 
-    return files, functions, calls
+    return list(internal.values()), list(external.values()), ambiguous
 
 
-def _function_embedding_text(function: dict[str, str]) -> str:
+def _function_embedding_text(function: dict[str, Any]) -> str:
     """Build stable semantic context from currently available AST fields."""
 
     return (
-        f"Function: {function['name']}\n"
+        f"Function: {function['qualified_name']}\n"
         f"File: {function['file_path']}"
     )
 
@@ -241,8 +417,16 @@ async def save_parsed_ast_to_neo4j_with_progress(
     replace_existing: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     total_repo_tokens: int | None = None,
+    deleted_file_paths: list[str] | None = None,
 ) -> AsyncIterator[DatabaseWriteProgress]:
-    """Persist one repository through bounded file, function, and call passes."""
+    """Persist one repository through bounded file, function, and call passes.
+
+    With ``replace_existing`` the repository graph is rebuilt from scratch.
+    Otherwise the parsed files and ``deleted_file_paths`` are treated as an
+    incremental change set: definitions that disappeared from those files are
+    removed, surviving IDs keep their incoming edges, and outgoing calls from
+    the changed files are rebuilt.
+    """
 
     normalized_repo_name = repo_name.strip()
     if not normalized_repo_name:
@@ -250,7 +434,19 @@ async def save_parsed_ast_to_neo4j_with_progress(
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
 
-    files, functions, calls = _extract_etl_records(parsed_data_list)
+    files, functions, function_calls = _extract_etl_records(
+        parsed_data_list,
+        normalized_repo_name,
+    )
+    changed_paths = [file["path"] for file in files]
+    deleted_paths = sorted(
+        {
+            _repository_relative_path(path)
+            for path in deleted_file_paths or []
+        }
+        - set(changed_paths)
+    )
+    affected_paths = sorted({*changed_paths, *deleted_paths})
     resolved_total_tokens = _resolve_total_repo_tokens(
         parsed_data_list,
         total_repo_tokens,
@@ -275,8 +471,29 @@ async def save_parsed_ast_to_neo4j_with_progress(
 
             await session.execute_write(execute)
 
+        existing_definitions: list[dict[str, Any]] = []
         if replace_existing:
             await run_transaction(DELETE_REPOSITORY_QUERY)
+        elif affected_paths:
+            result = await session.run(
+                FETCH_EXISTING_DEFINITIONS_QUERY,
+                repo_name=normalized_repo_name,
+                paths=affected_paths,
+            )
+            existing_definitions = [
+                record
+                for record in await result.data()
+                if all(
+                    isinstance(record.get(key), str)
+                    for key in ("entity_id", "name", "qualified_name", "file_path")
+                )
+            ]
+
+        calls, external_calls, ambiguous_calls = _resolve_calls(
+            functions,
+            function_calls,
+            [*existing_definitions, *functions],
+        )
 
         if resolved_total_tokens is not None:
             await run_transaction(
@@ -285,6 +502,26 @@ async def save_parsed_ast_to_neo4j_with_progress(
                     "total_tokens": resolved_total_tokens,
                     "tokenizer_model": DEFAULT_TOKEN_MODEL,
                 },
+            )
+
+        if not replace_existing and affected_paths:
+            if deleted_paths:
+                await run_transaction(
+                    DELETE_FILES_QUERY,
+                    extra_parameters={"paths": deleted_paths},
+                )
+            await run_transaction(
+                DELETE_STALE_FUNCTIONS_QUERY,
+                extra_parameters={
+                    "paths": affected_paths,
+                    "entity_ids": [
+                        function["entity_id"] for function in functions
+                    ],
+                },
+            )
+            await run_transaction(
+                DELETE_OUTGOING_CALLS_QUERY,
+                extra_parameters={"paths": changed_paths},
             )
 
         yield DatabaseWriteProgress("Pass 1: Creating Files...", 86)
@@ -300,7 +537,13 @@ async def save_parsed_ast_to_neo4j_with_progress(
                 [_function_embedding_text(function) for function in batch]
             )
             embedded_batch = [
-                {**function, "embedding": embedding}
+                {
+                    **function,
+                    "ambiguous_calls": ambiguous_calls.get(
+                        function["entity_id"], []
+                    ),
+                    "embedding": embedding,
+                }
                 for function, embedding in zip(batch, embeddings, strict=True)
             ]
             await run_transaction(MERGE_FUNCTIONS_QUERY, embedded_batch)
@@ -308,8 +551,11 @@ async def save_parsed_ast_to_neo4j_with_progress(
         yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
         for batch in chunk_data(calls, batch_size):
             await run_transaction(MERGE_CALLS_QUERY, batch)
+        for batch in chunk_data(external_calls, batch_size):
+            await run_transaction(MERGE_EXTERNAL_CALLS_QUERY, batch)
 
-        await run_transaction(TAG_EXTERNAL_FUNCTIONS_QUERY)
+        if not replace_existing and affected_paths:
+            await run_transaction(DELETE_ORPHAN_EXTERNAL_FUNCTIONS_QUERY)
 
     yield DatabaseWriteProgress(
         "Detecting architectural communities...",
@@ -329,6 +575,7 @@ async def save_parsed_ast_to_neo4j(
     repo_name: str,
     replace_existing: bool = False,
     total_repo_tokens: int | None = None,
+    deleted_file_paths: list[str] | None = None,
 ) -> None:
     """Persist parsed AST data while discarding optional progress updates."""
 
@@ -337,6 +584,7 @@ async def save_parsed_ast_to_neo4j(
         repo_name,
         replace_existing=replace_existing,
         total_repo_tokens=total_repo_tokens,
+        deleted_file_paths=deleted_file_paths,
     ):
         pass
 
