@@ -1,8 +1,7 @@
 """Versioned, repository-scoped identities for parsed function definitions.
 
-These are application keys, not Neo4j element IDs. Persistence will adopt them
-in CG-002B; the current database writer deliberately continues using its old
-schema until that migration is ready.
+These are application keys, not Neo4j element IDs. The database writer persists
+them as repository-scoped Function identities.
 """
 
 import hashlib

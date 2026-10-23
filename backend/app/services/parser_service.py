@@ -526,6 +526,11 @@ class CodeParser:
         """Attribute syntax to the innermost captured lexical function body."""
 
         unattributed: list[dict[str, Any]] = []
+        owners_by_body: dict[int, tuple[Node, dict[str, Any]]] = {}
+        for definition, record in definitions:
+            body = cls._definition_body(definition)
+            if body is not None:
+                owners_by_body.setdefault(body.id, (definition, record))
         captures = QueryCursor(query).captures(root_node).get("call", [])
         for name_node in sorted(captures, key=lambda node: node.start_byte):
             call_node = name_node
@@ -562,17 +567,17 @@ class CodeParser:
                 "end_column": call_node.end_point.column,
                 "resolution": "unresolved",
             }
-            candidates: list[tuple[int, Node, dict[str, Any]]] = []
-            for definition, record in definitions:
-                body = cls._definition_body(definition)
-                if body is None or not (
-                    body.start_byte <= call_node.start_byte
-                    and call_node.end_byte <= body.end_byte
-                ):
-                    continue
-                candidates.append((body.end_byte - body.start_byte, definition, record))
-            if candidates:
-                _, definition, owner = min(candidates, key=lambda item: item[0])
+            # The nearest enclosing body is the innermost lexical owner. Walking
+            # ancestors avoids checking every definition for every call site.
+            current = call_node
+            captured_owner = None
+            while current is not None:
+                captured_owner = owners_by_body.get(current.id)
+                if captured_owner is not None:
+                    break
+                current = current.parent
+            if captured_owner is not None:
+                definition, owner = captured_owner
                 current = call_node.parent
                 anonymous_boundary = False
                 while current is not None and current != definition:

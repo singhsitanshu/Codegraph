@@ -543,3 +543,15 @@ def test_repository_token_baseline_read_is_scoped() -> None:
         REPOSITORY_TOKEN_QUERY,
         repo_name="owner/repository",
     )
+
+
+def test_incremental_write_keeps_repository_token_baseline() -> None:
+    driver, _, transaction = _mock_driver()
+    parsed_file = _parse("src/a.py", "def a():\n    pass\n")
+    parsed_file["source_tokens"] = 9
+
+    _save(driver, [parsed_file])
+
+    assert MERGE_REPOSITORY_TOKENS_QUERY not in [
+        call.args[0] for call in transaction.run.await_args_list
+    ]

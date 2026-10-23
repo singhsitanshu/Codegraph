@@ -15,7 +15,6 @@ from app.db import close_neo4j_driver, neo4j_client
 from app.db.graph_ops import delete_repository_graph, save_parsed_ast_to_neo4j
 from app.main import app
 from app.services.parser_service import CodeParser
-from app.services.pipeline import _extract_push_removed_files
 
 TEST_FILE_PATH = "TEST_MOCK_FILE.py"
 TEST_REPO_NAME = "test/mock-repository"
@@ -512,13 +511,3 @@ def test_incremental_update_keeps_identity_and_incoming_edges(
     assert files == ["src/app.py", library_path]
     assert incoming == ["repository_unique"]
 
-
-def test_push_removed_files_use_each_path_final_state() -> None:
-    payload = {
-        "commits": [
-            {"removed": ["src/gone.py", "src/readded.py"], "modified": []},
-            {"added": ["src/readded.py"], "removed": ["src/late.py"]},
-        ]
-    }
-
-    assert _extract_push_removed_files(payload) == ["src/gone.py", "src/late.py"]

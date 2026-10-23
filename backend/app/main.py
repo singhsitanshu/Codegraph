@@ -428,6 +428,19 @@ async def _stream_repository_ingestion(
                 progress=current_progress,
             )
 
+        if any(parsed_file is None for parsed_file in parsed_data_by_index):
+            logger.warning(
+                "Aborting full ingest for %s because a supported source file "
+                "could not be parsed",
+                canonical_repo_name,
+            )
+            yield _ndjson_record(
+                status="Repository ingestion failed.",
+                progress=current_progress,
+                error="A supported source file could not be parsed",
+            )
+            return
+
         parsed_data = [
             parsed_file
             for parsed_file in parsed_data_by_index
