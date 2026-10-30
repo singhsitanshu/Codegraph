@@ -4,8 +4,9 @@ import asyncio
 from contextlib import aclosing
 from unittest.mock import patch
 
-from app.services.parser_service import CodeParser
-from app.db.graph_ops import _embedded_function_batches, _resolve_calls
+from app.ingestion.graph_ingestion import _embedded_function_batches
+from app.ingestion.graph_records import resolve_calls
+from app.parsing.parser import CodeParser
 
 
 def test_call_resolution_does_not_rescan_definitions():
@@ -25,7 +26,7 @@ def test_call_resolution_does_not_rescan_definitions():
         dict(entity_id=f"caller:{i}", qualified_name="caller", file_path=f"src/{i % 1000}.py")
         for i in range(3000)
     ]
-    calls, external, ambiguous = _resolve_calls(
+    calls, external, ambiguous = resolve_calls(
         callers, {caller["entity_id"]: ["validate"] for caller in callers}, definitions
     )
     # Each definition is indexed once, however many calls are resolved.
@@ -41,10 +42,10 @@ def test_parser_does_not_check_every_function_body_for_each_call():
         f"def f{i}():\n    target{i}()\n    other{i}()\n" for i in range(count)
     ).encode()
     with patch.object(CodeParser, "_definition_body", wraps=CodeParser._definition_body) as body:
-        parsed = asyncio.run(CodeParser().parse_file("src/large.py", source, repository="test/repo"))
+        parsed = asyncio.run(CodeParser().parse_file("src/large.py", source))
     assert body.call_count <= 3 * count
-    for i, function in enumerate(parsed["functions"]):
-        assert [call["name"] for call in function["calls"]] == [f"target{i}", f"other{i}"]
+    for i, function in enumerate(parsed.functions):
+        assert [call.name for call in function.calls] == [f"target{i}", f"other{i}"]
 
 
 def test_embedding_groups_keep_all_definitions_and_bound_parallel_requests():
@@ -68,9 +69,9 @@ def test_embedding_groups_keep_all_definitions_and_bound_parallel_requests():
         return [row async for batch in _embedded_function_batches(functions) for row in batch]
 
     with (
-        patch("app.db.graph_ops.EMBEDDING_REQUEST_BATCH_SIZE", 2),
-        patch("app.db.graph_ops.MAX_CONCURRENT_EMBEDDING_REQUESTS", 2),
-        patch("app.db.graph_ops.generate_embeddings", side_effect=generate),
+        patch("app.ingestion.graph_ingestion.EMBEDDING_REQUEST_BATCH_SIZE", 2),
+        patch("app.ingestion.graph_ingestion.MAX_CONCURRENT_EMBEDDING_REQUESTS", 2),
+        patch("app.ingestion.graph_ingestion.generate_embeddings", side_effect=generate),
     ):
         embedded = asyncio.run(collect())
     assert peak == 2
@@ -101,8 +102,8 @@ def test_failed_consumer_cancels_embedding_prefetch():
                 raise RuntimeError("database write failed")
 
     with (
-        patch("app.db.graph_ops.EMBEDDING_REQUEST_BATCH_SIZE", 1),
-        patch("app.db.graph_ops.generate_embeddings", side_effect=generate),
+        patch("app.ingestion.graph_ingestion.EMBEDDING_REQUEST_BATCH_SIZE", 1),
+        patch("app.ingestion.graph_ingestion.generate_embeddings", side_effect=generate),
     ):
         try:
             asyncio.run(fail_write())

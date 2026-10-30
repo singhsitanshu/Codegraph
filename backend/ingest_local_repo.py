@@ -8,13 +8,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from app.db import close_neo4j_driver
-from app.db.graph_ops import save_parsed_ast_to_neo4j
-from app.db.neo4j_client import driver
-from app.services.parser_service import (
-    attach_function_entity_ids,
-    parse_changed_files,
-)
+from app.database.driver import close_neo4j_driver, get_neo4j_driver
+from app.ingestion.graph_ingestion import ingest_identified_files
+from app.parsing.batch_parsing import parse_changed_files
+from app.parsing.source_identity import identify_parsed_source
 
 
 TARGET_REPO_PATH = "/Users/sitanshusingh/Downloads/requests"
@@ -41,16 +38,11 @@ def discover_python_files(repo_path: str) -> list[str]:
     return files_to_parse
 
 
-def verify_ingestion() -> list[dict[str, Any]]:
+async def verify_ingestion() -> list[dict[str, Any]]:
     """Query Neo4j node counts by label and return JSON-like records."""
-    if driver is None:
-        raise RuntimeError(
-            "Neo4j is unavailable. Check NEO4J_URI, NEO4J_USER, and "
-            "NEO4J_PASSWORD before running ingestion."
-        )
-
-    with driver.session() as session:
-        return session.run(NODE_COUNT_QUERY).data()
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(NODE_COUNT_QUERY)
+        return await result.data()
 
 
 async def ingest_repository() -> None:
@@ -65,31 +57,36 @@ async def ingest_repository() -> None:
     if not files_to_parse:
         raise RuntimeError("No Python files were discovered; ingestion aborted")
 
-    parsed_data = await parse_changed_files(files_to_parse)
-    if len(parsed_data) != len(files_to_parse):
+    parsed_batch = await parse_changed_files(files_to_parse)
+    if len(parsed_batch.files) != len(files_to_parse):
         raise RuntimeError(
             "Full ingestion aborted because a discovered source file could not be parsed"
         )
     repository_root = Path(TARGET_REPO_PATH).resolve()
-    for parsed_file in parsed_data:
-        relative_path = Path(parsed_file["file_path"]).resolve().relative_to(
-            repository_root
-        ).as_posix()
-        attach_function_entity_ids(
-            parsed_file, repository=TARGET_REPO_NAME, file_path=relative_path
+    identified_files = [
+        identify_parsed_source(
+            parsed_source,
+            repository=TARGET_REPO_NAME,
+            file_path=Path(parsed_source.file_path)
+            .resolve()
+            .relative_to(repository_root)
+            .as_posix(),
         )
-    print(f"Successfully parsed {len(parsed_data)} Python files")
-    if not parsed_data:
+        for parsed_source in parsed_batch.files
+    ]
+    print(f"Successfully parsed {len(identified_files)} Python files")
+    if not identified_files:
         raise RuntimeError("Tree-sitter produced no parsed data; ingestion aborted")
 
-    await save_parsed_ast_to_neo4j(
-        parsed_data,
+    await ingest_identified_files(
+        identified_files,
         repo_name=TARGET_REPO_NAME,
         replace_existing=True,
+        total_repo_tokens=parsed_batch.source_tokens,
     )
-    print(f"Persisted AST data for {len(parsed_data)} files")
+    print(f"Persisted AST data for {len(identified_files)} files")
 
-    counts = await asyncio.to_thread(verify_ingestion)
+    counts = await verify_ingestion()
     print("Neo4j node counts:")
     for record in counts:
         print(f"  {record['type']}: {record['count']}")
@@ -104,8 +101,6 @@ async def main() -> int:
         return 1
     finally:
         await close_neo4j_driver()
-        if driver is not None:
-            driver.close()
 
     return 0
 

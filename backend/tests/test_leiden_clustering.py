@@ -7,10 +7,13 @@ from collections.abc import Iterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from neo4j import Driver
 
-from app.db import close_neo4j_driver, neo4j_client
-from app.db.graph_ops import save_parsed_ast_to_neo4j
-from app.services.parser_service import CodeParser
+from app.database.driver import close_neo4j_driver
+from app.ingestion.graph_ingestion import ingest_identified_files
+from app.parsing.parse_results import IdentifiedFile
+from app.parsing.parser import CodeParser
+from app.parsing.source_identity import identify_parsed_source
 
 TEST_REPO_NAME = "test/leiden-two-groups"
 CLEANUP_QUERY = "MATCH (n {repo_name: $repo_name}) DETACH DELETE n"
@@ -27,13 +30,14 @@ def _group_source(prefix: str) -> str:
     )
 
 
-def _parse(file_path: str, source: str) -> dict[str, object]:
-    return asyncio.run(
-        CodeParser().parse_file(
-            file_path,
-            source.encode("utf-8"),
-            repository=TEST_REPO_NAME,
-        )
+def _parse(file_path: str, source: str) -> IdentifiedFile:
+    parsed_source = asyncio.run(
+        CodeParser().parse_file(file_path, source.encode("utf-8"))
+    )
+    return identify_parsed_source(
+        parsed_source,
+        repository=TEST_REPO_NAME,
+        file_path=file_path,
     )
 
 
@@ -42,29 +46,22 @@ async def _fake_embeddings(texts: list[str]) -> list[list[float]]:
 
 
 @pytest.fixture
-def gds_database() -> Iterator[None]:
-    if neo4j_client.driver is None:
-        neo4j_client.driver = neo4j_client._initialize_driver()
-    if neo4j_client.driver is None:
-        pytest.skip("Neo4j is unavailable; integration tests require a live database")
-    with neo4j_client.driver.session() as session:
+def gds_database(live_neo4j: Driver) -> Iterator[Driver]:
+    with live_neo4j.session() as session:
         try:
             session.run("RETURN gds.version() AS version").consume()
         except Exception:
-            neo4j_client.close_driver()
             pytest.skip("Neo4j Graph Data Science is not installed")
         session.run(CLEANUP_QUERY, repo_name=TEST_REPO_NAME).consume()
     try:
-        yield
+        yield live_neo4j
     finally:
-        if neo4j_client.driver is not None:
-            with neo4j_client.driver.session() as session:
-                session.run(CLEANUP_QUERY, repo_name=TEST_REPO_NAME).consume()
-        neo4j_client.close_driver()
+        with live_neo4j.session() as session:
+            session.run(CLEANUP_QUERY, repo_name=TEST_REPO_NAME).consume()
 
 
 def test_two_connected_groups_produce_exactly_two_communities(
-    gds_database: None,
+    gds_database: Driver,
 ) -> None:
     parsed_data = [
         _parse("src/alpha.py", _group_source("alpha")),
@@ -73,7 +70,7 @@ def test_two_connected_groups_produce_exactly_two_communities(
 
     async def save() -> None:
         try:
-            await save_parsed_ast_to_neo4j(
+            await ingest_identified_files(
                 parsed_data,
                 TEST_REPO_NAME,
                 replace_existing=True,
@@ -82,16 +79,15 @@ def test_two_connected_groups_produce_exactly_two_communities(
             await close_neo4j_driver()
 
     with patch(
-        "app.db.graph_ops.generate_embeddings",
+        "app.ingestion.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.db.graph_ops.label_and_store_communities",
+        "app.ingestion.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         asyncio.run(save())
 
-    assert neo4j_client.driver is not None
-    with neo4j_client.driver.session() as session:
+    with gds_database.session() as session:
         rows = session.run(
             "MATCH (function:Function {repo_name: $repo_name}) "
             "RETURN function.file_path AS file_path, "

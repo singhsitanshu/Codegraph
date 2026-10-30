@@ -1,0 +1,130 @@
+"""GitHub download and raw-content access used by ingestion pipelines."""
+
+import asyncio
+import io
+import tempfile
+import zipfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import quote
+
+import httpx
+
+from app.config import settings
+
+
+RAW_GITHUB_BASE_URL = "https://raw.githubusercontent.com"
+GITHUB_API_BASE_URL = "https://api.github.com"
+GITHUB_HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "code-knowledge-graph-agent",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+
+
+def _github_headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
+    """Build GitHub headers, including optional configured authentication."""
+
+    headers = {**GITHUB_HEADERS, "Accept": accept}
+    if settings.GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {settings.GITHUB_TOKEN}"
+    return headers
+
+
+def _extract_zip_safely(archive_bytes: bytes, destination: Path) -> Path:
+    """Extract a GitHub zipball without allowing paths outside destination."""
+
+    destination = destination.resolve()
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        members = archive.infolist()
+        if not members:
+            raise ValueError("GitHub returned an empty repository archive")
+
+        for member in members:
+            member_path = (destination / member.filename).resolve()
+            if not member_path.is_relative_to(destination):
+                raise ValueError("Repository archive contains an unsafe path")
+        archive.extractall(destination)
+
+    roots = [path for path in destination.iterdir() if path.is_dir()]
+    if len(roots) != 1:
+        raise ValueError("GitHub repository archive has an unexpected layout")
+    return roots[0]
+
+
+@asynccontextmanager
+async def download_and_extract_repo(
+    repo_owner: str,
+    repo_name: str,
+) -> AsyncIterator[Path]:
+    """Download and extract a GitHub repository for the duration of a block.
+
+    Yields the extracted root. The temporary storage behind it is deleted when
+    the ``async with`` block exits, whether it completes or raises. Omitting a
+    Git reference from GitHub's zipball URL makes GitHub serve the repository's
+    configured default branch.
+    """
+
+    encoded_owner = quote(repo_owner, safe="")
+    encoded_repo = quote(repo_name, safe="")
+
+    with tempfile.TemporaryDirectory(prefix="github-repo-") as temporary_directory:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(60.0),
+            headers=_github_headers(),
+        ) as client:
+            archive_url = (
+                f"{GITHUB_API_BASE_URL}/repos/{encoded_owner}/{encoded_repo}/"
+                "zipball"
+            )
+            response = await client.get(archive_url)
+            response.raise_for_status()
+
+        yield await asyncio.to_thread(
+            _extract_zip_safely,
+            response.content,
+            Path(temporary_directory),
+        )
+
+
+async def fetch_raw_file_content(
+    owner: str,
+    repo: str,
+    file_path: str,
+    commit_sha: str,
+) -> str:
+    """Fetch one repository file exactly as it existed at a commit.
+
+    Args:
+        owner: GitHub repository owner or organization.
+        repo: GitHub repository name.
+        file_path: Repository-relative file path.
+        commit_sha: Immutable Git commit SHA supplied by the webhook.
+
+    Returns:
+        The decoded text response returned by GitHub.
+
+    Raises:
+        httpx.HTTPStatusError: If GitHub returns a non-success status.
+        httpx.RequestError: If the request cannot be completed.
+    """
+
+    encoded_owner = quote(owner, safe="")
+    encoded_repo = quote(repo, safe="")
+    encoded_sha = quote(commit_sha, safe="")
+    encoded_path = quote(file_path, safe="/")
+    url = (
+        f"{RAW_GITHUB_BASE_URL}/{encoded_owner}/{encoded_repo}/"
+        f"{encoded_sha}/{encoded_path}"
+    )
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(20.0),
+        headers=_github_headers(accept="text/plain"),
+    ) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.text

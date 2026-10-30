@@ -1,40 +1,35 @@
-import asyncio
 import json
 import logging
-import os
-import re
-import zipfile
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any, Literal
-from urllib.parse import unquote, urlparse
+from collections.abc import AsyncIterator, Iterator
+from contextlib import aclosing, asynccontextmanager, contextmanager
+from typing import Annotated, Any, Literal
 
-import httpx
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
-from app.api import webhooks
 from app.agent.graph import ask_code_agent_with_metrics
-from app.db import close_neo4j_driver, fetch_graph_data, fetch_node_code
-from app.db.graph_ops import (
-    delete_all_repository_graphs,
-    delete_repository_graph,
-    save_parsed_ast_to_neo4j_with_progress,
+from app.config import settings
+from app.database.driver import close_neo4j_driver
+from app.database.errors import NEO4J_ERRORS, Neo4jFailureDetails, is_neo4j_unavailable
+from app.graph.queries import fetch_node_code
+from app.graph.schema import initialize_database
+from app.graph.view import fetch_graph_view
+from app.graph.writer import delete_all_repository_graphs, delete_repository_graph
+from app.ingestion import ingestion_progress
+from app.ingestion.repository_ingestion import (
+    IngestionComplete,
+    IngestionFailed,
+    RepositoryIngestionEvent,
+    ingest_github_repository,
 )
-from app.db.neo4j_client import close_driver, initialize_database
-from app.services.github_service import (
-    cleanup_downloaded_repo,
-    download_and_extract_repo,
+from app.repositories.names import (
+    GitHubRepository,
+    GitHubRepositoryUrl,
+    RepositoryName,
 )
-from app.services.parser_service import (
-    SUPPORTED_EXTENSIONS,
-    attach_function_entity_ids,
-    parse_changed_files_with_progress,
-)
+from app.webhooks import routes as webhook_routes
 
 
 logging.basicConfig(
@@ -43,30 +38,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SOURCE_SUFFIXES = frozenset(SUPPORTED_EXTENSIONS)
-IGNORED_REPOSITORY_DIRECTORIES = frozenset(
-    {
-        ".git",
-        ".venv",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "venv",
-    }
+GRAPH_QUERY_FAILURES = Neo4jFailureDetails(
+    authentication="Neo4j authentication failed; check backend/.env credentials",
+    unavailable="Neo4j is unavailable",
+    failure="Neo4j graph query failed",
 )
-GITHUB_REPOSITORY_PART = re.compile(r"[A-Za-z0-9_.-]+")
+NODE_SOURCE_FAILURES = Neo4jFailureDetails(
+    authentication="Neo4j authentication failed; check backend/.env credentials",
+    unavailable="Neo4j is unavailable",
+    failure="Neo4j node source query failed",
+)
+REPOSITORY_DELETION_FAILURES = Neo4jFailureDetails(
+    authentication="Neo4j authentication failed during repository deletion",
+    unavailable="Neo4j is unavailable during repository deletion",
+    failure="Neo4j repository deletion failed",
+)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Initialize Neo4j, clear stale session graphs, and release drivers."""
+    """Initialize Neo4j, clear stale session graphs, and release the driver."""
 
-    await asyncio.to_thread(initialize_database)
     try:
+        await initialize_database()
         await delete_all_repository_graphs()
         yield
     finally:
-        close_driver()
         await close_neo4j_driver()
 
 
@@ -74,7 +71,7 @@ class ChatRequest(BaseModel):
     """Validated request body for the basic chat endpoint."""
 
     message: str = Field(min_length=1, max_length=10_000)
-    repo_name: str = Field(min_length=3, max_length=201)
+    repo_name: RepositoryName
 
     @field_validator("message")
     @classmethod
@@ -86,106 +83,39 @@ class ChatRequest(BaseModel):
             raise ValueError("message must not be blank")
         return stripped
 
-    @field_validator("repo_name")
-    @classmethod
-    def repo_name_must_be_canonical(cls, value: str) -> str:
-        """Require the same ``owner/repository`` key used by ingestion."""
-
-        return _normalize_repo_identifier(value)
-
 
 class IngestRepositoryRequest(BaseModel):
     """GitHub repository requested for on-demand graph ingestion."""
 
-    url: str = Field(min_length=1, max_length=2_048)
-
-    @field_validator("url")
-    @classmethod
-    def url_must_not_be_blank(cls, value: str) -> str:
-        """Trim the URL and reject whitespace-only input."""
-
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("url must not be blank")
-        return stripped
+    repository: GitHubRepositoryUrl = Field(alias="url")
 
 
 class RepositoryCleanupRequest(BaseModel):
     """Repository graph to remove during browser lifecycle cleanup."""
 
-    repo_name: str = Field(min_length=3, max_length=201)
-
-    @field_validator("repo_name")
-    @classmethod
-    def repo_name_must_be_canonical(cls, value: str) -> str:
-        """Normalize the cleanup scope before it reaches Neo4j."""
-
-        return _normalize_repo_identifier(value)
+    repo_name: RepositoryName
 
 
-def _normalize_repo_identifier(repo_name: str) -> str:
-    """Validate and normalize an ``owner/repository`` identifier."""
-
-    normalized = repo_name.strip().removesuffix(".git")
-    parts = normalized.split("/")
-    if (
-        len(parts) != 2
-        or not all(GITHUB_REPOSITORY_PART.fullmatch(part) for part in parts)
-    ):
-        raise ValueError("repo_name must use the 'owner/repository' format")
-    return normalized
+NodeId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+"""Neo4j element ID of a graph node, trimmed and required to be non-blank."""
 
 
-def _parse_github_repository_url(url: str) -> tuple[str, str]:
-    """Extract an owner and repository from a canonical GitHub HTTPS URL."""
+@contextmanager
+def _neo4j_errors_as_http(details: Neo4jFailureDetails) -> Iterator[None]:
+    """Translate Neo4j failures raised in the block into API errors."""
 
-    parsed_url = urlparse(url)
-    if parsed_url.scheme.lower() != "https" or parsed_url.hostname not in {
-        "github.com",
-        "www.github.com",
-    }:
-        raise ValueError("url must be an HTTPS github.com repository URL")
-
-    decoded_path = unquote(parsed_url.path).strip("/")
-    owner, repo = _normalize_repo_identifier(decoded_path).split("/", 1)
-    return owner, repo
-
-
-def _discover_repository_source_files(extracted_root: str) -> list[str]:
-    """Walk an extracted repository and return supported source file paths."""
-
-    source_files: list[str] = []
-    for root, directory_names, file_names in os.walk(extracted_root):
-        directory_names[:] = sorted(
-            name
-            for name in directory_names
-            if name not in IGNORED_REPOSITORY_DIRECTORIES
+    try:
+        yield
+    except NEO4J_ERRORS as exc:
+        status_code = (
+            status.HTTP_503_SERVICE_UNAVAILABLE
+            if is_neo4j_unavailable(exc)
+            else status.HTTP_500_INTERNAL_SERVER_ERROR
         )
-        for file_name in sorted(file_names):
-            if Path(file_name).suffix.lower() in SUPPORTED_SOURCE_SUFFIXES:
-                source_files.append(str(Path(root, file_name)))
-    return source_files
-
-
-def _use_repository_relative_paths(
-    parsed_data: list[dict[str, Any]],
-    extracted_root: str,
-    repository: str | None = None,
-) -> None:
-    """Replace random temporary paths with stable repository-relative paths."""
-
-    repository_root = Path(extracted_root).resolve()
-    for parsed_file in parsed_data:
-        file_path = parsed_file.get("file_path")
-        if isinstance(file_path, str):
-            relative_path = (
-                Path(file_path).resolve().relative_to(repository_root).as_posix()
-            )
-            parsed_file["file_path"] = relative_path
-            if repository is not None:
-                attach_function_entity_ids(
-                    parsed_file, repository=repository, file_path=relative_path
-                )
+        raise HTTPException(
+            status_code=status_code,
+            detail=details.describe(exc),
+        ) from exc
 
 
 app = FastAPI(
@@ -195,100 +125,36 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.include_router(webhooks.router)
+app.include_router(webhook_routes.router)
 
 
 @app.get("/api/graph", tags=["graph"])
 async def get_graph(
-    repo_name: str | None = None,
+    repo_name: RepositoryName | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Return one repository graph, or an empty graph without a scope."""
 
     if repo_name is None:
         return {"nodes": [], "edges": []}
 
-    try:
-        normalized_repo_name = _normalize_repo_identifier(repo_name)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-
-    try:
-        return await fetch_graph_data(normalized_repo_name)
-    except AuthError as exc:
-        logger.warning("Neo4j rejected the configured credentials")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Neo4j authentication failed; check backend/.env credentials",
-        ) from exc
-    except ServiceUnavailable as exc:
-        logger.warning("Neo4j is unavailable")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Neo4j is unavailable",
-        ) from exc
-    except Neo4jError as exc:
-        logger.exception("Neo4j graph query failed")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Neo4j graph query failed",
-        ) from exc
+    with _neo4j_errors_as_http(GRAPH_QUERY_FAILURES):
+        return await fetch_graph_view(repo_name)
 
 
 @app.get("/api/node/{node_id}/code", tags=["graph"])
 async def get_node_code(
-    node_id: str,
-    repo_name: str,
+    node_id: NodeId,
+    repo_name: RepositoryName,
 ) -> dict[str, str]:
     """Return one repository-scoped function's source code on demand."""
 
-    normalized_node_id = node_id.strip()
-    if not normalized_node_id:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="node_id must not be blank",
-        )
-    try:
-        normalized_repo_name = _normalize_repo_identifier(repo_name)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-
-    try:
-        source = await fetch_node_code(
-            normalized_node_id,
-            normalized_repo_name,
-        )
-    except AuthError as exc:
-        logger.warning("Neo4j rejected the node source query credentials")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Neo4j authentication failed; check backend/.env credentials",
-        ) from exc
-    except ServiceUnavailable as exc:
-        logger.warning("Neo4j is unavailable during node source lookup")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Neo4j is unavailable",
-        ) from exc
-    except Neo4jError as exc:
-        logger.exception("Neo4j node source query failed")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Neo4j node source query failed",
-        ) from exc
+    with _neo4j_errors_as_http(NODE_SOURCE_FAILURES):
+        source = await fetch_node_code(node_id, repo_name)
 
     if source is None:
         raise HTTPException(
@@ -298,31 +164,12 @@ async def get_node_code(
     return source
 
 
-async def _delete_repository_scope(normalized_repo_name: str) -> dict[str, str]:
+async def _delete_repository_scope(repo_name: str) -> dict[str, str]:
     """Delete one validated scope and map Neo4j failures to API errors."""
 
-    try:
-        await delete_repository_graph(normalized_repo_name)
-    except AuthError as exc:
-        logger.warning("Neo4j rejected repository deletion credentials")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Neo4j authentication failed during repository deletion",
-        ) from exc
-    except ServiceUnavailable as exc:
-        logger.warning("Neo4j is unavailable during repository deletion")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Neo4j is unavailable during repository deletion",
-        ) from exc
-    except Neo4jError as exc:
-        logger.exception("Neo4j repository deletion failed")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Neo4j repository deletion failed",
-        ) from exc
-
-    return {"status": "success", "repo_name": normalized_repo_name}
+    with _neo4j_errors_as_http(REPOSITORY_DELETION_FAILURES):
+        await delete_repository_graph(repo_name)
+    return {"status": "success", "repo_name": repo_name}
 
 
 @app.delete("/api/repo", tags=["graph"])
@@ -333,17 +180,10 @@ async def cleanup_repository(request: RepositoryCleanupRequest) -> dict[str, str
 
 
 @app.delete("/api/repositories/{repo_name:path}", tags=["graph"])
-async def delete_repository(repo_name: str) -> dict[str, str]:
+async def delete_repository(repo_name: RepositoryName) -> dict[str, str]:
     """Permanently delete one repository-scoped graph from Neo4j."""
 
-    try:
-        normalized_repo_name = _normalize_repo_identifier(repo_name)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-    return await _delete_repository_scope(normalized_repo_name)
+    return await _delete_repository_scope(repo_name)
 
 
 @app.post("/api/chat", tags=["chat"])
@@ -362,8 +202,8 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
             detail="The code agent could not complete the request",
         ) from exc
     return {
-        "response": agent_result["answer"],
-        "metrics": agent_result["metrics"],
+        "response": agent_result.answer,
+        "metrics": agent_result.metrics.as_dict(),
     }
 
 
@@ -373,161 +213,33 @@ def _ndjson_record(**payload: object) -> str:
     return json.dumps(payload, separators=(",", ":")) + "\n"
 
 
-async def _stream_repository_ingestion(
-    owner: str,
-    repository: str,
-) -> AsyncIterator[str]:
-    """Run repository ingestion while emitting NDJSON progress records."""
+def _ingestion_record(event: RepositoryIngestionEvent) -> str:
+    """Serialize one repository ingestion event as an NDJSON record."""
 
-    canonical_repo_name = f"{owner}/{repository}"
-    extracted_root: str | None = None
-    current_progress = 0
-    total_repo_tokens = 0
-    try:
-        current_progress = 10
-        yield _ndjson_record(
-            status="Downloading repository...",
-            progress=current_progress,
-        )
-        extracted_root = await download_and_extract_repo(owner, repository)
-
-        current_progress = 20
-        yield _ndjson_record(
-            status="Repository downloaded and extracted.",
-            progress=current_progress,
-        )
-        source_files = await asyncio.to_thread(
-            _discover_repository_source_files,
-            extracted_root,
-        )
-
-        parsed_data_by_index: list[dict[str, Any] | None] = [
-            None for _ in source_files
-        ]
-        if source_files:
-            async for file_progress in parse_changed_files_with_progress(
-                source_files
-            ):
-                total_repo_tokens += file_progress.source_tokens
-                if file_progress.result is not None:
-                    parsed_data_by_index[file_progress.index] = file_progress.result
-                current_progress = 20 + int(
-                    file_progress.processed / file_progress.total * 60
-                )
-                yield _ndjson_record(
-                    status=(
-                        f"Parsing files ({file_progress.processed}/"
-                        f"{file_progress.total})..."
-                    ),
-                    progress=current_progress,
-                )
-        else:
-            current_progress = 80
-            yield _ndjson_record(
-                status="No supported source files found.",
-                progress=current_progress,
-            )
-
-        if any(parsed_file is None for parsed_file in parsed_data_by_index):
-            logger.warning(
-                "Aborting full ingest for %s because a supported source file "
-                "could not be parsed",
-                canonical_repo_name,
-            )
-            yield _ndjson_record(
-                status="Repository ingestion failed.",
-                progress=current_progress,
-                error="A supported source file could not be parsed",
-            )
-            return
-
-        parsed_data = [
-            parsed_file
-            for parsed_file in parsed_data_by_index
-            if parsed_file is not None
-        ]
-        _use_repository_relative_paths(
-            parsed_data, extracted_root, repository=canonical_repo_name
-        )
-        logger.info(
-            "Full repository token baseline for %s: %d",
-            canonical_repo_name,
-            total_repo_tokens,
-        )
-
-        current_progress = 85
-        yield _ndjson_record(
-            status="Batching data to Neo4j...",
-            progress=current_progress,
-        )
-        async for database_progress in save_parsed_ast_to_neo4j_with_progress(
-            parsed_data,
-            repo_name=canonical_repo_name,
-            replace_existing=True,
-            total_repo_tokens=total_repo_tokens,
-        ):
-            current_progress = database_progress.progress
-            yield _ndjson_record(
-                status=database_progress.status,
-                progress=current_progress,
-            )
-
-        yield _ndjson_record(
+    if isinstance(event, IngestionComplete):
+        return _ndjson_record(
             status="Repository ingestion complete.",
-            progress=100,
-            repo_name=canonical_repo_name,
-            total_repo_tokens=total_repo_tokens,
+            progress=ingestion_progress.COMPLETE,
+            repo_name=event.repo_name,
+            total_repo_tokens=event.total_repo_tokens,
         )
-    except httpx.HTTPStatusError as exc:
-        response_status = exc.response.status_code
-        if response_status == status.HTTP_404_NOT_FOUND:
-            detail = "GitHub repository was not found"
-        else:
-            detail = f"GitHub archive download failed with status {response_status}"
-        logger.warning("Unable to ingest %s: %s", canonical_repo_name, detail)
-        yield _ndjson_record(
+    if isinstance(event, IngestionFailed):
+        return _ndjson_record(
             status="Repository ingestion failed.",
-            progress=current_progress,
-            error=detail,
+            progress=event.progress,
+            error=event.error,
         )
-    except (httpx.RequestError, zipfile.BadZipFile, ValueError) as exc:
-        logger.warning("Unable to download or extract %s: %s", canonical_repo_name, exc)
-        yield _ndjson_record(
-            status="Repository ingestion failed.",
-            progress=current_progress,
-            error="GitHub repository download or extraction failed",
-        )
-    except AuthError:
-        logger.warning("Neo4j rejected ingestion credentials")
-        yield _ndjson_record(
-            status="Repository ingestion failed.",
-            progress=current_progress,
-            error="Neo4j authentication failed during repository ingestion",
-        )
-    except ServiceUnavailable:
-        logger.warning("Neo4j is unavailable during repository ingestion")
-        yield _ndjson_record(
-            status="Repository ingestion failed.",
-            progress=current_progress,
-            error="Neo4j is unavailable during repository ingestion",
-        )
-    except Neo4jError:
-        logger.exception("Neo4j repository ingestion failed")
-        yield _ndjson_record(
-            status="Repository ingestion failed.",
-            progress=current_progress,
-            error="Neo4j repository ingestion failed",
-        )
-    except Exception:
-        logger.exception("Unexpected repository ingestion failure")
-        yield _ndjson_record(
-            status="Repository ingestion failed.",
-            progress=current_progress,
-            error="Unexpected repository ingestion failure",
-        )
-    finally:
-        if extracted_root is not None:
-            cleanup_downloaded_repo(extracted_root)
+    return _ndjson_record(status=event.status, progress=event.progress)
+
+
+async def _stream_repository_ingestion(
+    repository: GitHubRepository,
+) -> AsyncIterator[str]:
+    """Stream repository ingestion as NDJSON progress records."""
+
+    async with aclosing(ingest_github_repository(repository)) as events:
+        async for event in events:
+            yield _ingestion_record(event)
 
 
 @app.post("/api/ingest-repo", tags=["ingestion"])
@@ -536,16 +248,8 @@ async def ingest_repository(
 ) -> StreamingResponse:
     """Stream progress while ingesting a public GitHub repository."""
 
-    try:
-        owner, repository = _parse_github_repository_url(request.url)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-
     return StreamingResponse(
-        _stream_repository_ingestion(owner, repository),
+        _stream_repository_ingestion(request.repository),
         media_type="application/x-ndjson",
         headers={
             "Cache-Control": "no-cache",

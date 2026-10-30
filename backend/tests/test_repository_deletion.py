@@ -3,11 +3,12 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app.db.graph_ops import (
+from app.graph.writer import (
     DELETE_ALL_REPOSITORY_GRAPHS_QUERY,
-    DELETE_REPOSITORY_GRAPH_QUERY,
+    DELETE_REPOSITORY_QUERY,
     delete_all_repository_graphs,
     delete_repository_graph,
 )
@@ -30,11 +31,11 @@ def test_delete_repository_graph_uses_scoped_detach_delete() -> None:
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.db.graph_ops.get_neo4j_driver", return_value=driver):
-        asyncio.run(delete_repository_graph(" owner/repository "))
+    with patch("app.graph.writer.get_neo4j_driver", return_value=driver):
+        asyncio.run(delete_repository_graph("owner/repository"))
 
     transaction.run.assert_awaited_once_with(
-        DELETE_REPOSITORY_GRAPH_QUERY,
+        DELETE_REPOSITORY_QUERY,
         repo_name="owner/repository",
     )
     transaction.run.return_value.consume.assert_awaited_once_with()
@@ -57,7 +58,7 @@ def test_delete_all_repository_graphs_removes_only_scoped_nodes() -> None:
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.db.graph_ops.get_neo4j_driver", return_value=driver):
+    with patch("app.graph.writer.get_neo4j_driver", return_value=driver):
         asyncio.run(delete_all_repository_graphs())
 
     transaction.run.assert_awaited_once_with(
@@ -67,10 +68,9 @@ def test_delete_all_repository_graphs_removes_only_scoped_nodes() -> None:
 
 
 def test_lifespan_cleans_stale_graphs_on_startup() -> None:
-    initialize = MagicMock()
+    initialize = AsyncMock()
     cleanup = AsyncMock()
-    close_sync_driver = MagicMock()
-    close_async_driver = AsyncMock()
+    close_driver = AsyncMock()
 
     async def run_lifespan() -> None:
         async with lifespan(app):
@@ -79,14 +79,32 @@ def test_lifespan_cleans_stale_graphs_on_startup() -> None:
     with (
         patch("app.main.initialize_database", new=initialize),
         patch("app.main.delete_all_repository_graphs", new=cleanup),
-        patch("app.main.close_driver", new=close_sync_driver),
-        patch("app.main.close_neo4j_driver", new=close_async_driver),
+        patch("app.main.close_neo4j_driver", new=close_driver),
     ):
         asyncio.run(run_lifespan())
 
-    initialize.assert_called_once_with()
-    close_sync_driver.assert_called_once_with()
-    close_async_driver.assert_awaited_once_with()
+    initialize.assert_awaited_once_with()
+    close_driver.assert_awaited_once_with()
+
+
+def test_lifespan_releases_the_driver_when_schema_setup_fails() -> None:
+    close_driver = AsyncMock()
+
+    async def run_lifespan() -> None:
+        async with lifespan(app):
+            pass
+
+    with (
+        patch(
+            "app.main.initialize_database",
+            new=AsyncMock(side_effect=RuntimeError("Neo4j unreachable")),
+        ),
+        patch("app.main.close_neo4j_driver", new=close_driver),
+        pytest.raises(RuntimeError),
+    ):
+        asyncio.run(run_lifespan())
+
+    close_driver.assert_awaited_once_with()
 
 
 def test_delete_repository_endpoint_normalizes_and_deletes_scope() -> None:

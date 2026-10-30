@@ -6,14 +6,16 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from app.services.community_summarizer import (
-    COMMUNITY_LABEL_BATCH_SIZE,
-    COMMUNITY_LABEL_MODEL,
-    MAX_CONCURRENT_COMMUNITY_LABELS,
+from app.communities.store import (
     DELETE_COMMUNITIES_QUERY,
     FETCH_COMMUNITIES_QUERY,
     STORE_COMMUNITIES_QUERY,
     UNGROUP_SMALL_COMMUNITIES_QUERY,
+)
+from app.communities.summarizer import (
+    COMMUNITY_LABEL_BATCH_SIZE,
+    COMMUNITY_LABEL_MODEL,
+    MAX_CONCURRENT_COMMUNITY_LABELS,
     UNGROUPED_COMMUNITY_ID,
     CommunityLabel,
     _generate_community_labels,
@@ -57,10 +59,10 @@ def test_label_and_store_communities_replaces_repository_labels_atomically():
         dict(id=7, name="Cookie Handling", description="Extracts cookies."),
     ]
     with (
-        patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
-        patch("app.services.community_summarizer._generate_community_labels", new=AsyncMock(return_value=labels)) as generate,
+        patch("app.communities.store.get_neo4j_driver", return_value=driver),
+        patch("app.communities.summarizer._generate_community_labels", new=AsyncMock(return_value=labels)) as generate,
     ):
-        communities = asyncio.run(label_and_store_communities(" owner/repository "))
+        communities = asyncio.run(label_and_store_communities("owner/repository"))
     assert communities == labels
     generate.assert_awaited_once_with(records)
     session.run.assert_awaited_once_with(FETCH_COMMUNITIES_QUERY, repo_name="owner/repository")
@@ -81,7 +83,7 @@ def test_generate_community_labels_uses_structured_ids_and_restores_order():
         choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, refusal=None))]
     ))
     records = [dict(comm_id=2, func_names=["send"], file_paths=["adapters.py"]), dict(comm_id=7, func_names=["cookies"], file_paths=["cookies.py"])]
-    with patch("app.services.community_summarizer._get_community_label_client", return_value=client):
+    with patch("app.communities.summarizer._get_community_label_client", return_value=client):
         labels = asyncio.run(_generate_community_labels(records))
     assert [label["id"] for label in labels] == [2, 7]
     kwargs = client.beta.chat.completions.parse.await_args.kwargs
@@ -97,14 +99,9 @@ def test_label_response_rejects_missing_duplicate_or_foreign_ids(ids):
     client.beta.chat.completions.parse = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, refusal=None))]
     ))
-    with patch("app.services.community_summarizer._get_community_label_client", return_value=client):
+    with patch("app.communities.summarizer._get_community_label_client", return_value=client):
         with pytest.raises(RuntimeError, match="missing a required key"):
             asyncio.run(_generate_community_labels([dict(comm_id=2), dict(comm_id=7)]))
-
-
-def test_label_and_store_communities_rejects_blank_repository():
-    with pytest.raises(ValueError, match="repo_name must not be blank"):
-        asyncio.run(label_and_store_communities("  "))
 
 
 def test_small_communities_are_grouped_without_model_requests():
@@ -116,8 +113,8 @@ def test_small_communities_are_grouped_without_model_requests():
     driver, _, transaction = _driver_for_records(records)
     labels = [dict(id=1, name="Core", description="Core logic.")]
     with (
-        patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
-        patch("app.services.community_summarizer._generate_community_labels", new=AsyncMock(return_value=labels)) as generate,
+        patch("app.communities.store.get_neo4j_driver", return_value=driver),
+        patch("app.communities.summarizer._generate_community_labels", new=AsyncMock(return_value=labels)) as generate,
     ):
         communities = asyncio.run(label_and_store_communities("owner/repo"))
     generate.assert_awaited_once_with([records[0]])
@@ -153,8 +150,8 @@ def test_community_requests_are_batched_bounded_and_keep_order():
         return [dict(id=r["comm_id"], name=str(r["comm_id"]), description="Community") for r in batch]
 
     with (
-        patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
-        patch("app.services.community_summarizer._generate_community_labels", side_effect=generate) as generated,
+        patch("app.communities.store.get_neo4j_driver", return_value=driver),
+        patch("app.communities.summarizer._generate_community_labels", side_effect=generate) as generated,
     ):
         labels = asyncio.run(label_and_store_communities("owner/repo"))
     assert peak == MAX_CONCURRENT_COMMUNITY_LABELS
@@ -180,8 +177,8 @@ def test_label_failure_cancels_other_requests_without_replacing_stored_labels():
             active -= 1
 
     with (
-        patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
-        patch("app.services.community_summarizer._generate_community_labels", side_effect=generate),
+        patch("app.communities.store.get_neo4j_driver", return_value=driver),
+        patch("app.communities.summarizer._generate_community_labels", side_effect=generate),
     ):
         with pytest.raises(RuntimeError, match="label request failed"):
             asyncio.run(label_and_store_communities("owner/repo"))

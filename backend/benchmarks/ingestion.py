@@ -9,11 +9,21 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 import sys
 from time import perf_counter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.repositories.names import GitHubRepository  # noqa: E402
+
+
+def repository_argument(value):
+    try:
+        return GitHubRepository.from_full_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 async def benchmark(args):
@@ -22,23 +32,27 @@ async def benchmark(args):
         os.environ["EMBEDDING_CACHE_PATH"] = args.cache_path
 
     from app import main
+    from app.communities import summarizer as community_summarizer
     from app.config import settings
-    from app.db import close_neo4j_driver, fetch_node_code, get_neo4j_driver
-    from app.db.neo4j_client import close_driver, initialize_database
-    from app.services import community_summarizer, embedding_service
+    from app.database.driver import close_neo4j_driver, get_neo4j_driver
+    from app.embeddings import generation as embedding_generation
+    from app.embeddings.constants import EMBEDDING_DIMENSIONS
+    from app.graph.queries import fetch_node_code
+    from app.graph.schema import initialize_database
+    from app.ingestion import repository_ingestion
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=str(args.output.with_suffix(".log")), level=logging.INFO, force=True)
-    await asyncio.to_thread(initialize_database)
+    await initialize_database()
     stats = {
-        "repo_name": args.repo,
+        "repo_name": args.repo.full_name,
         "timing_scope": "download, parse, embeddings, graph writes, GDS, community labels, cleanup",
         "embedding_cache_was_empty": not Path(settings.EMBEDDING_CACHE_PATH).exists() if settings.EMBEDDING_CACHE_PATH else True,
         "embedding_requests": 0, "embedding_inputs": 0,
         "embedding_input_tokens": 0, "label_requests": 0,
     }
     unique_inputs = set()
-    embedding_create = embedding_service._get_embedding_client().embeddings.create
+    embedding_create = embedding_generation._get_embedding_client().embeddings.create
 
     async def counted_embeddings(*call_args, **kwargs):
         stats["embedding_requests"] += 1
@@ -48,7 +62,7 @@ async def benchmark(args):
         stats["embedding_input_tokens"] += result.usage.total_tokens
         return result
 
-    embedding_service._get_embedding_client().embeddings.create = counted_embeddings
+    embedding_generation._get_embedding_client().embeddings.create = counted_embeddings
     label_generate = community_summarizer._generate_community_labels
 
     async def counted_labels(*call_args, **kwargs):
@@ -56,20 +70,21 @@ async def benchmark(args):
         return await label_generate(*call_args, **kwargs)
 
     community_summarizer._generate_community_labels = counted_labels
-    download = main.download_and_extract_repo
+    download = repository_ingestion.download_and_extract_repo
 
+    @asynccontextmanager
     async def measured_download(*call_args, **kwargs):
-        root = await download(*call_args, **kwargs)
-        stats["archive_root_name"] = Path(root).name
-        return root
+        async with download(*call_args, **kwargs) as root:
+            stats["archive_root_name"] = root.name
+            yield root
 
-    main.download_and_extract_repo = measured_download
+    repository_ingestion.download_and_extract_repo = measured_download
     started = perf_counter()
     stage = None
     last_print = 0
     stats["stages"] = []
     try:
-        async for line in main._stream_repository_ingestion(*args.repo.split("/")):
+        async for line in main._stream_repository_ingestion(args.repo):
             record = json.loads(line)
             elapsed = perf_counter() - started
             status = record["status"]
@@ -96,24 +111,25 @@ async def benchmark(args):
                 "count(DISTINCT CASE WHEN f.embedding IS NOT NULL THEN f END) AS embedded_functions, "
                 "count(file) AS defines_links, "
                 "sum(CASE WHEN file IS NULL OR file.path <> f.file_path THEN 1 ELSE 0 END) AS invalid_defines, "
-                "sum(CASE WHEN f.embedding IS NULL OR size(f.embedding) <> 1536 THEN 1 ELSE 0 END) AS invalid_vectors, "
-                "count(DISTINCT CASE WHEN f.has_body THEN [f.file_path, f.name] END) AS previous_embedding_inputs",
-                repo=args.repo,
+                "sum(CASE WHEN f.embedding IS NULL OR size(f.embedding) <> $dimensions THEN 1 ELSE 0 END) AS invalid_vectors, "
+                # Only definitions with bodies are persisted as Function nodes.
+                "count(DISTINCT [f.file_path, f.name]) AS previous_embedding_inputs",
+                repo=args.repo.full_name, dimensions=EMBEDDING_DIMENSIONS,
             )
             stats["persisted"] = dict(await result.single())
             result = await session.run(
                 "MATCH (f:Function {repo_name:$repo}) WHERE NOT (f)-[:IN_COMMUNITY]->(:Community) "
-                "RETURN count(f) AS missing_communities", repo=args.repo,
+                "RETURN count(f) AS missing_communities", repo=args.repo.full_name,
             )
             stats["missing_communities"] = (await result.single())["missing_communities"]
             result = await session.run(
                 "MATCH (f:Function {repo_name:$repo}) "
                 "RETURN elementId(f) AS node_id, f.raw_code AS code, f.file_path AS path LIMIT 2",
-                repo=args.repo,
+                repo=args.repo.full_name,
             )
             samples = await result.data()
         for sample in samples:
-            source = await fetch_node_code(sample["node_id"], args.repo)
+            source = await fetch_node_code(sample["node_id"], args.repo.full_name)
             assert source["code"] == sample["code"] and source["file_path"] == sample["path"]
         stats["source_samples_verified"] = len(samples)
         persisted = stats["persisted"]
@@ -126,17 +142,14 @@ async def benchmark(args):
         args.output.write_text(json.dumps(stats, indent=2) + "\n")
         print(json.dumps(stats, indent=2), flush=True)
         await close_neo4j_driver()
-        close_driver()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", default="tiangolo/fastapi")
+    parser.add_argument("--repo", type=repository_argument, default="tiangolo/fastapi")
     parser.add_argument("--neo4j-uri", required=True)
     parser.add_argument("--cache-path")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-under", type=float)
     arguments = parser.parse_args()
-    if len(arguments.repo.split("/")) != 2 or not all(arguments.repo.split("/")):
-        parser.error("--repo must be owner/repository")
     asyncio.run(benchmark(arguments))

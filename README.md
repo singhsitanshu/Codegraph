@@ -15,7 +15,7 @@ The resulting graph is both visual and conversational. The React dashboard expos
 - **Semantic retrieval:** OpenAI `text-embedding-3-small` vectors are stored in a 1,536-dimensional Neo4j vector index.
 - **Architectural discovery:** Neo4j GDS projects each repository's function-call graph as undirected, runs Leiden clustering, and releases the in-memory projection even when the algorithm fails.
 - **Interactive graph UI:** React Flow visualization with force-directed layout, dependency highlighting, module filtering, minimap navigation, and on-demand syntax-highlighted source.
-- **Incremental GitHub path:** HMAC-verified `push` and `pull_request` webhooks can process changed files in a FastAPI background task.
+- **Incremental GitHub path:** HMAC-verified `push` webhooks with a complete change set update changed files in a FastAPI background task.
 - **Focused correctness tests:** the test suite covers repository isolation, bounded database batches, source redaction from graph payloads, index creation, GDS cleanup, parser failure handling, API contracts, and frontend scoping.
 
 ## Architecture
@@ -100,7 +100,7 @@ This diagram represents the streamed request lifecycle; the backend does not per
 
 1. **Validate the repository.** `POST /api/ingest-repo` accepts only an HTTPS `github.com` repository URL. The UI also accepts `owner/repository` shorthand and converts it to that URL form.
 2. **Download the default branch.** The backend requests GitHub's repository zipball without a ref, follows redirects, checks every archive member against path traversal, and extracts into a managed temporary directory.
-3. **Discover source.** `.py`, `.js`, `.jsx`, `.ts`, `.tsx`, `.go`, and `.java` files are included. `.git`, virtual environments, caches, `build`, `dist`, and `node_modules` directories are skipped.
+3. **Discover source.** Files with an extension registered in [`backend/app/parsing/languages.py`](backend/app/parsing/languages.py) (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`, `.go`, and `.java`) are included; supporting another language means adding one `LanguageSpec` there plus its grammar package in `backend/requirements.txt`. `.git`, virtual environments, caches, `build`, `dist`, and `node_modules` directories are skipped, both here and for webhook pushes ([`backend/app/ingestion/source_discovery.py`](backend/app/ingestion/source_discovery.py)).
 4. **Parse concurrently.** File work is scheduled asynchronously with at most 32 file-read slots. CPU-bound Tree-sitter parsing runs in worker threads; a per-language lock prevents concurrent use of a shared parser instance. Failed files advance progress but are not persisted.
 5. **Create a token baseline.** Every readable discovered source file is counted with tiktoken's `gpt-4o` encoding, including files whose parse later fails. The total is stored on the repository node for context-efficiency reporting.
 6. **Normalize and flatten.** Temporary paths become stable repository-relative paths. Parsed files are flattened into file, function, and call records.
@@ -141,7 +141,7 @@ The chat endpoint invokes a repository-scoped LangGraph ReAct agent backed by `c
 | Semantic code search | Top vector matches for a natural-language query |
 | Architectural subsystems | Stored community names, descriptions, and function counts |
 
-Every Cypher query includes a repository predicate. The agent system prompt also instructs Claude to use the exact active repository name and to use stored community summaries for architecture questions.
+Every Cypher query includes a repository predicate. The agent's tools are built per request with the validated repository name bound in code, so the model never supplies or chooses the repository scope. The system prompt instructs Claude to use stored community summaries for architecture questions.
 
 After a response, Codegraph counts only the graph-tool outputs supplied to the model and compares that count with the stored full-source baseline:
 
@@ -194,47 +194,50 @@ cd Codegraph
 
 ### 2. Start Neo4j with GDS
 
+Create `backend/.env` and set `NEO4J_PASSWORD` to a password of your choice. Compose reads it from there; no credentials are checked in.
+
 ```bash
-docker compose up -d neo4j
+cp backend/.env.example backend/.env
+# edit backend/.env: NEO4J_PASSWORD=<your local password>
+docker compose --env-file backend/.env up -d neo4j
 ```
 
-The Compose service uses the tested Neo4j `2026.07.1` image, exposes Neo4j Browser on port `7474` and Bolt on `7687`, stores data in the `neo4j_data` volume, and installs the Graph Data Science (GDS) plugin. The checked-in development credentials are `neo4j` / `gladline`; change them before using the service outside an isolated local machine. Docker Desktop (or another Docker daemon) must be running first.
+The Compose service uses the tested Neo4j `2026.07.1` image, exposes Neo4j Browser on port `7474` and Bolt on `7687`, stores data in the `neo4j_data` volume, and installs the Graph Data Science (GDS) plugin. The Neo4j user is `neo4j` with the `NEO4J_PASSWORD` from `backend/.env`. Neo4j applies it only when the `neo4j_data` volume is first created; to change it later, run `ALTER CURRENT USER SET PASSWORD` in `cypher-shell` or recreate the volume with `docker compose down -v`. Docker Desktop (or another Docker daemon) must be running first.
 
 Confirm that Bolt accepts queries and GDS is loaded before starting the API:
 
 ```bash
-docker compose exec -T neo4j cypher-shell -u neo4j -p gladline 'RETURN 1 AS ready'
-docker compose exec -T neo4j cypher-shell -u neo4j -p gladline 'RETURN gds.version() AS gds_version'
+docker compose exec -T neo4j sh -c 'cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" "RETURN 1 AS ready"'
+docker compose exec -T neo4j sh -c 'cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" "RETURN gds.version() AS gds_version"'
 ```
 
-If the container has not finished starting, retry the checks after a few seconds. Codegraph needs GDS for Leiden community detection during ingestion; a responding Browser port alone is not enough. The development plugin install may need network access when the container first starts. Do not use the checked-in credentials for a public deployment.
+If the container has not finished starting, retry the checks after a few seconds. Codegraph needs GDS for Leiden community detection during ingestion; a responding Browser port alone is not enough. The development plugin install may need network access when the container first starts.
 
 ### 3. Configure and install the backend
 
-The active backend reads `backend/.env`, not the root `.env` used by older prototype files.
+The backend reads `backend/.env`.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r backend/requirements.txt
-cp backend/.env.example backend/.env
 ```
 
-`backend/requirements.txt` is the active backend's dependency list; the root `requirements.txt` belongs to earlier prototype code and is not sufficient for the current tests. Use the virtual environment's `python -m pip` and `python -m pytest` so installation and test collection use the same interpreter. The copied example already matches the local Compose credentials and leaves the optional GitHub token blank. Add model-provider keys to `backend/.env` for ingestion and chat:
+`backend/requirements.txt` is the backend's dependency list. Use the virtual environment's `python -m pip` and `python -m pytest` so installation and test collection use the same interpreter. `backend/.env` (created in step 2) also holds the webhook secret, the optional GitHub token, and the model-provider keys for ingestion and chat:
 
 ```dotenv
-GITHUB_WEBHOOK_SECRET=replace-with-a-long-random-secret
+GITHUB_WEBHOOK_SECRET=<long random secret, also set on the GitHub webhook>
 GITHUB_TOKEN=
 
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=gladline
+NEO4J_PASSWORD=<the password from step 2>
 
 ANTHROPIC_API_KEY=replace-with-your-anthropic-key
 OPENAI_API_KEY=replace-with-your-openai-key
 ```
 
-Start FastAPI **from the backend directory** so Python resolves the current `app` package:
+Start FastAPI **from the backend directory** so Python resolves the `app` package:
 
 ```bash
 cd backend
@@ -346,12 +349,11 @@ Configure GitHub to send JSON events to:
 https://your-host.example/api/webhooks/github
 ```
 
-The endpoint requires GitHub's `X-Hub-Signature-256` HMAC header and compares it in constant time against `GITHUB_WEBHOOK_SECRET`. Valid JSON object payloads are acknowledged with HTTP `202`, then processed through a FastAPI background task.
+The endpoint requires GitHub's `X-Hub-Signature-256` HMAC header and compares it in constant time against `GITHUB_WEBHOOK_SECRET`. Bodies that are not JSON objects receive HTTP `400`. The route parses `push` payloads into a validated change set before responding: a processable push is acknowledged with HTTP `202` and `"status": "accepted"`, then applied in a FastAPI background task. Other signed events, incomplete pushes, and pushes without supported source changes are also acknowledged with `202` (so GitHub does not retry them), but with `"status": "ignored"` and a `reason`.
 
 Current event behavior:
 
 - `push` uses added and modified paths, fetches each file at the immutable `after` SHA, skips unsupported/deleted/unavailable files, parses successful responses, and merges them into the existing repository scope;
-- `pull_request` can process filenames only when they are embedded in the payload by a provider or fixture; GitHub's standard pull-request payload does not include the file list, and the current backend does not yet call the pull-request files API;
 - background exceptions are logged rather than returned to GitHub because acknowledgment has already occurred; and
 - the placeholder "blast radius" stage logs changed filenames but does not yet run a separate impact-analysis agent.
 
@@ -403,23 +405,22 @@ pnpm build
 
 The Node test suite covers repository input normalization, chunked NDJSON parsing, error propagation, graph/chat scoping, source lookup, explicit and unload cleanup, deterministic community colors, and cluster selection. The production Vite build is also part of the recommended validation pass.
 
-The root-level `tests/` directory exercises the older webhook prototype. Run active-backend tests from `backend/` to avoid importing the legacy root `app` package by mistake.
-
 ## Configuration
 
-The active settings class loads `backend/.env`, is case-insensitive, ignores unknown keys, and provides development defaults.
+The active settings class loads `backend/.env`, is case-insensitive, ignores unknown keys, and provides development defaults for everything except credentials.
 
 | Variable | Required for | Default | Notes |
 | --- | --- | --- | --- |
-| `GITHUB_WEBHOOK_SECRET` | Secure webhook verification | `development_secret` | Replace before accepting webhook traffic. |
+| `GITHUB_WEBHOOK_SECRET` | Webhooks | empty | Webhooks return `503` until it is set. |
 | `GITHUB_TOKEN` | Private repositories / higher GitHub limits | unset | Sent as a bearer token to GitHub API and raw-content requests. |
 | `NEO4J_URI` | All graph operations | `bolt://localhost:7687` | Matches local Compose networking from the host. |
 | `NEO4J_USER` | All graph operations | `neo4j` | Compose uses the same username. |
-| `NEO4J_PASSWORD` | All graph operations | `password` | The copied `backend/.env.example` sets `gladline` to match the checked-in local Compose configuration. |
+| `NEO4J_PASSWORD` | All graph operations | empty | `docker-compose.yml` reads the same value via `--env-file backend/.env`. |
 | `ANTHROPIC_API_KEY` | Chat | empty | The active model is currently hard-coded to `claude-sonnet-5`. |
 | `OPENAI_API_KEY` | Ingestion and semantic search | empty | Used by `text-embedding-3-small` and `gpt-4o-mini`. |
+| `CORS_ORIGINS` | Browser access from the dashboard | `["http://localhost:3000","http://localhost:5173"]` | JSON list of allowed dashboard origins. |
 
-The older root `.env.example` includes `ANTHROPIC_MODEL` and `NEO4J_DATABASE`, but the active `backend/app` does not read those options. The frontend also hard-codes `http://localhost:8000` as its API base; Vite proxies relative `/api` requests to the same backend during development.
+The frontend reads its API base from `VITE_API_BASE` (see `frontend/.env.example`), defaulting to `http://localhost:8000`; Vite proxies relative `/api` requests to the same backend during development. A dashboard served from another origin must also be listed in the backend's `CORS_ORIGINS`.
 
 ## Repository structure
 
@@ -427,32 +428,36 @@ The older root `.env.example` includes `ANTHROPIC_MODEL` and `NEO4J_DATABASE`, b
 Codegraph/
 ├── backend/
 │   ├── app/
-│   │   ├── agent/          # LangGraph tools and agent orchestration
-│   │   ├── api/            # GitHub webhook route and signature dependency
-│   │   ├── db/             # Neo4j serialization, ETL, indexes, and GDS
-│   │   ├── services/       # GitHub, parsing, embedding, labeling, and pipeline code
-│   │   ├── utils/          # Token counting
-│   │   ├── config.py       # Active backend settings
-│   │   └── main.py         # FastAPI routes and ingestion lifecycle
-│   ├── tests/              # Active backend unit/API/integration tests
+│   │   ├── agent/          # LangGraph tools, agent orchestration, and its graph queries
+│   │   ├── communities/    # Leiden clustering, community storage, and LLM labeling
+│   │   ├── database/       # Shared Neo4j driver and error mapping
+│   │   ├── embeddings/     # Embedding model constants, generation, and local cache
+│   │   ├── graph/          # Neo4j schema, graph writes and reads, dashboard graph view
+│   │   ├── ingestion/      # GitHub download, source discovery, call resolution, graph ingestion, progress
+│   │   ├── parsing/        # Language registry, tree-sitter parser, and function identity
+│   │   ├── repositories/   # Validated GitHub repository names and URLs
+│   │   ├── webhooks/       # GitHub webhook route, signature check, push events, and pipeline
+│   │   ├── config.py       # Backend settings
+│   │   ├── tokens.py       # Token counting shared by ingestion and agent metrics
+│   │   └── main.py         # FastAPI routes and NDJSON ingestion stream
+│   ├── tests/              # Backend unit/API/integration tests
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
-│   │   ├── components/     # Source drawer and community legend
-│   │   ├── utils/          # Community colors and filters
-│   │   ├── App.jsx         # Dashboard and graph interaction
-│   │   └── api.js          # Backend client and NDJSON reader
+│   │   ├── features/
+│   │   │   ├── chat/       # Chat panel, messages, composer, and streamed answers
+│   │   │   ├── code/       # Source drawer
+│   │   │   ├── graph/      # Graph canvas, legend, layout, highlighting, and community colors
+│   │   │   └── repository/ # Repository form and ingestion state
+│   │   ├── shared/         # Backend client, API base resolution, and icons
+│   │   ├── App.jsx         # Dashboard shell wiring the features together
+│   │   └── main.jsx        # React entrypoint
 │   ├── package.json
 │   └── pnpm-lock.yaml
-├── app/                    # Earlier webhook/API prototype
-├── tests/                  # Tests for the earlier webhook prototype
-├── agent.py                # Earlier single-tool LangGraph prototype
-├── database.py             # Earlier Neo4j wrapper
-├── parse_python.py         # Earlier single-file Python parser CLI
 └── docker-compose.yml      # Local Neo4j + GDS service
 ```
 
-The `backend/` and `frontend/` directories form the current full application. Root-level Python modules remain useful as development history and focused prototypes, but their endpoints, environment file, and behavior differ from the active backend.
+The `backend/` and `frontend/` directories form the full application.
 
 ## Security and data handling
 

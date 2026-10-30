@@ -5,13 +5,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.db import (
-    GRAPH_QUERY,
-    NODE_CODE_QUERY,
+from app.agent.code_queries import (
     REPOSITORY_TOKEN_QUERY,
     fetch_repository_total_tokens,
 )
-from app.db.graph_ops import (
+from app.graph.queries import GRAPH_QUERY, NODE_CODE_QUERY
+from app.graph.writer import (
+    DEFAULT_BATCH_SIZE,
     DELETE_FILES_QUERY,
     DELETE_ORPHAN_EXTERNAL_FUNCTIONS_QUERY,
     DELETE_OUTGOING_CALLS_QUERY,
@@ -23,11 +23,17 @@ from app.db.graph_ops import (
     MERGE_FILES_QUERY,
     MERGE_FUNCTIONS_QUERY,
     MERGE_REPOSITORY_TOKENS_QUERY,
-    chunk_data,
-    save_parsed_ast_to_neo4j,
 )
-from app.services.parser_service import CodeParser
-from app.utils.entity_identity import generate_function_entity_id
+from app.ingestion import ingestion_progress
+from app.ingestion.batching import chunk_data
+from app.ingestion.graph_ingestion import (
+    ingest_identified_files,
+    ingest_identified_files_with_progress,
+)
+from app.parsing.entity_identity import generate_function_entity_id
+from app.parsing.parse_results import IdentifiedFile, IdentifiedFunction
+from app.parsing.parser import CodeParser
+from app.parsing.source_identity import identify_parsed_source
 
 
 REPO = "owner/repository-a"
@@ -58,33 +64,70 @@ async def _fake_embeddings(texts: list[str]) -> list[list[float]]:
     return [[0.1, 0.2, 0.3] for _ in texts]
 
 
-def _parse(file_path: str, source: str, repository: str = REPO) -> dict:
-    return asyncio.run(
-        CodeParser().parse_file(
-            file_path,
-            source.encode("utf-8"),
-            repository=repository,
-        )
+def _parse(file_path: str, source: str, repository: str = REPO) -> IdentifiedFile:
+    parsed_source = asyncio.run(
+        CodeParser().parse_file(file_path, source.encode("utf-8"))
+    )
+    return identify_parsed_source(
+        parsed_source,
+        repository=repository,
+        file_path=file_path,
+    )
+
+
+def _identified_file(
+    file_path: str,
+    function_names: tuple[str, ...] = (),
+    repository: str = REPO,
+) -> IdentifiedFile:
+    """Build writer input directly, without running the parser."""
+
+    return IdentifiedFile(
+        repository=repository,
+        file_path=file_path,
+        language="python",
+        functions=tuple(
+            IdentifiedFunction(
+                name=name,
+                qualified_name=name,
+                signature="()",
+                definition_discriminator="signature:();occurrence:1",
+                start_line=1,
+                end_line=1,
+                start_column=0,
+                end_column=0,
+                raw_code="",
+                calls=(),
+                entity_id=generate_function_entity_id(
+                    repository,
+                    file_path,
+                    "python",
+                    name,
+                    "signature:();occurrence:1",
+                ),
+            )
+            for name in function_names
+        ),
     )
 
 
 def _save(driver, parsed_data, repo_name=REPO, **kwargs):
     with (
-        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
+        patch("app.graph.writer.get_neo4j_driver", return_value=driver),
         patch(
-            "app.db.graph_ops.generate_embeddings",
+            "app.ingestion.graph_ingestion.generate_embeddings",
             side_effect=_fake_embeddings,
         ) as embed_batch,
         patch(
-            "app.db.graph_ops.run_leiden_clustering",
+            "app.ingestion.graph_ingestion.run_leiden_clustering",
             new=AsyncMock(),
         ) as cluster_graph,
         patch(
-            "app.db.graph_ops.label_and_store_communities",
+            "app.ingestion.graph_ingestion.label_and_store_communities",
             new=AsyncMock(),
         ) as label_communities,
     ):
-        asyncio.run(save_parsed_ast_to_neo4j(parsed_data, repo_name, **kwargs))
+        asyncio.run(ingest_identified_files(parsed_data, repo_name, **kwargs))
     return embed_batch, cluster_graph, label_communities
 
 
@@ -133,7 +176,7 @@ def test_node_code_read_uses_graph_id_and_repository_scope() -> None:
 
 
 def test_chunk_data_uses_bounded_slices() -> None:
-    chunks = list(chunk_data(list(range(205))))
+    chunks = list(chunk_data(list(range(205)), DEFAULT_BATCH_SIZE))
 
     assert [len(chunk) for chunk in chunks] == [100, 100, 5]
     assert [item for chunk in chunks for item in chunk] == list(range(205))
@@ -145,7 +188,7 @@ def test_three_pass_write_receives_repository_scope() -> None:
         "src/example.py",
         "def example():\n    external_call()\n",
     )
-    entity_id = parsed_file["functions"][0]["entity_id"]
+    entity_id = parsed_file.functions[0].entity_id
 
     embed_batch, cluster_graph, label_communities = _save(
         driver,
@@ -294,7 +337,7 @@ def test_typescript_declaration_only_overloads_are_not_persisted() -> None:
         "function format(value: number): string;\n"
         "function format(value: any): string { return String(value); }\n",
     )
-    assert len(parsed_file["functions"]) == 3
+    assert len(parsed_file.functions) == 1
 
     _save(driver, [parsed_file], replace_existing=True)
 
@@ -302,12 +345,9 @@ def test_typescript_declaration_only_overloads_are_not_persisted() -> None:
     assert [function["signature"] for function in persisted] == ["(value: any)"]
 
 
-def test_writer_generates_missing_entity_ids_with_the_cg002a_utility() -> None:
+def test_writer_persists_entity_ids_from_the_cg002a_utility() -> None:
     driver, _, transaction = _mock_driver()
-    parsed_file = asyncio.run(
-        CodeParser().parse_file("src/example.py", b"def example():\n    pass\n")
-    )
-    assert "entity_id" not in parsed_file["functions"][0]
+    parsed_file = _parse("src/example.py", "def example():\n    pass\n")
 
     _save(driver, [parsed_file], replace_existing=True)
 
@@ -330,56 +370,19 @@ def test_entity_id_scoped_to_another_repository_is_rejected() -> None:
         repository="someone/else",
     )
 
-    with pytest.raises(ValueError, match="entity_id"):
+    with pytest.raises(ValueError, match="identified for repository"):
         _save(driver, [parsed_file], replace_existing=True)
     session.execute_write.assert_not_awaited()
-
-
-def test_absolute_parsed_paths_are_rejected_before_writing() -> None:
-    driver, session, _ = _mock_driver()
-    parsed_file = asyncio.run(
-        CodeParser().parse_file("/tmp/checkout/example.py", b"def example(): pass\n")
-    )
-
-    with pytest.raises(ValueError, match="repository-relative"):
-        _save(driver, [parsed_file], replace_existing=True)
-    session.execute_write.assert_not_awaited()
-
-
-def test_functions_without_identity_metadata_are_skipped() -> None:
-    driver, _, transaction = _mock_driver()
-    parsed_data = [
-        {
-            "file_path": "src/legacy.py",
-            "defined_functions": ["legacy"],
-            "functions": [{"name": "legacy", "raw_code": "def legacy(): pass"}],
-            "outgoing_calls": ["other"],
-        }
-    ]
-
-    _save(driver, parsed_data, replace_existing=True)
-
-    assert [call.args[0] for call in transaction.run.await_args_list] == [
-        DELETE_REPOSITORY_QUERY,
-        MERGE_FILES_QUERY,
-    ]
 
 
 def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
     driver, session, transaction = _mock_driver()
     parsed_data = [
-        {
-            "file_path": f"src/file_{index}.py",
-            "functions": [
-                {
-                    "name": f"function_{index}",
-                    "qualified_name": f"function_{index}",
-                    "language": "python",
-                    "definition_discriminator": "signature:();occurrence:1",
-                    "raw_code": "",
-                }
-            ],
-        }
+        _identified_file(
+            f"src/file_{index}.py",
+            (f"function_{index}",),
+            repository="owner/large-repository",
+        )
         for index in range(205)
     ]
 
@@ -428,7 +431,7 @@ def test_incremental_write_replaces_only_affected_files() -> None:
         ]
     )
     parsed_file = _parse("src/a.py", "def caller():\n    shared()\n")
-    caller_id = parsed_file["functions"][0]["entity_id"]
+    caller_id = parsed_file.functions[0].entity_id
 
     _save(
         driver,
@@ -496,19 +499,17 @@ def test_repository_replacement_includes_community_and_external_nodes() -> None:
 def test_full_ingestion_stores_repository_token_baseline() -> None:
     driver, _, transaction = _mock_driver()
     parsed_data = [
-        {
-            "file_path": "src/example.py",
-            "functions": [],
-            "source_tokens": 37,
-        },
-        {
-            "file_path": "src/helper.py",
-            "functions": [],
-            "source_tokens": 13,
-        },
+        _identified_file("src/example.py", repository="owner/repository"),
+        _identified_file("src/helper.py", repository="owner/repository"),
     ]
 
-    _save(driver, parsed_data, repo_name="owner/repository", replace_existing=True)
+    _save(
+        driver,
+        parsed_data,
+        repo_name="owner/repository",
+        replace_existing=True,
+        total_repo_tokens=50,
+    )
 
     metadata_call = next(
         call
@@ -534,7 +535,7 @@ def test_repository_token_baseline_read_is_scoped() -> None:
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.db.get_neo4j_driver", return_value=driver):
+    with patch("app.agent.code_queries.get_neo4j_driver", return_value=driver):
         total = asyncio.run(
             fetch_repository_total_tokens("owner/repository")
         )
@@ -549,10 +550,79 @@ def test_repository_token_baseline_read_is_scoped() -> None:
 def test_incremental_write_keeps_repository_token_baseline() -> None:
     driver, _, transaction = _mock_driver()
     parsed_file = _parse("src/a.py", "def a():\n    pass\n")
-    parsed_file["source_tokens"] = 9
 
     _save(driver, [parsed_file])
 
     assert MERGE_REPOSITORY_TOKENS_QUERY not in [
         call.args[0] for call in transaction.run.await_args_list
     ]
+
+
+def _progress_values(driver, parsed_data, **kwargs) -> list[int]:
+    async def collect() -> list[int]:
+        return [
+            update.progress
+            async for update in ingest_identified_files_with_progress(
+                parsed_data, REPO, **kwargs
+            )
+        ]
+
+    with (
+        patch("app.graph.writer.get_neo4j_driver", return_value=driver),
+        patch(
+            "app.ingestion.graph_ingestion.generate_embeddings",
+            side_effect=_fake_embeddings,
+        ),
+        patch("app.ingestion.graph_ingestion.run_leiden_clustering", new=AsyncMock()),
+        patch("app.ingestion.graph_ingestion.label_and_store_communities", new=AsyncMock()),
+    ):
+        return asyncio.run(collect())
+
+
+def test_database_progress_fills_its_stages_on_the_ingestion_scale() -> None:
+    driver, _, _ = _mock_driver()
+    parsed_data = [
+        _parse(
+            "src/app.py",
+            "def first():\n    second()\n    remote()\n\n"
+            "def second():\n    pass\n",
+        )
+    ]
+
+    progress = _progress_values(driver, parsed_data, batch_size=1)
+
+    assert progress == [86, 90, 91, 93, 94, 95, 96, 97, 98, 99]
+    assert progress[0] > ingestion_progress.DATABASE_STARTED
+    assert progress[-1] < ingestion_progress.COMPLETE
+
+
+def test_database_progress_skips_empty_passes_without_dividing_by_zero() -> None:
+    driver, _, _ = _mock_driver()
+
+    progress = _progress_values(driver, [_identified_file("src/empty.py")])
+
+    assert progress == [86, 90, 94, 97, 98, 99]
+
+
+def test_ingestion_progress_stages_are_ordered() -> None:
+    stage_bounds = [
+        ingestion_progress.DOWNLOAD_STARTED,
+        ingestion_progress.DOWNLOADED,
+        ingestion_progress.PARSING.start,
+        ingestion_progress.PARSING.end,
+        ingestion_progress.DATABASE_STARTED,
+        ingestion_progress.FILES_STARTED,
+        ingestion_progress.FUNCTIONS.start,
+        ingestion_progress.FUNCTIONS.end,
+        ingestion_progress.DEPENDENCIES.start,
+        ingestion_progress.DEPENDENCIES.end,
+        ingestion_progress.COMMUNITY_DETECTION_STARTED,
+        ingestion_progress.COMMUNITY_LABELING_STARTED,
+        ingestion_progress.COMMITTING,
+        ingestion_progress.COMPLETE,
+    ]
+
+    assert stage_bounds == sorted(stage_bounds)
+    assert stage_bounds[-1] == 100
+    assert ingestion_progress.PARSING.at(1, 3) == 40
+    assert ingestion_progress.PARSING.at(0, 0) == ingestion_progress.PARSING.end
