@@ -7,13 +7,15 @@ from functools import lru_cache
 from typing import Annotated, Any
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
 from langgraph.prebuilt import create_react_agent
 from pydantic import Field, StringConstraints
 
 from app.config import settings
 from app.db import fetch_repository_total_tokens, get_neo4j_driver
 from app.services.embedding_service import generate_embedding
+from app.utils.embeddings import FUNCTION_EMBEDDING_INDEX
+from app.utils.repository import RepositoryName
 from app.utils.tokens import count_tokens
 
 
@@ -72,10 +74,10 @@ RETURN fn.name AS function_name
 ORDER BY fn.name
 """
 
-SEMANTIC_CODE_SEARCH_QUERY = """
+SEMANTIC_CODE_SEARCH_QUERY = f"""
 MATCH (node:Function)
   SEARCH node IN (
-    VECTOR INDEX function_embeddings
+    VECTOR INDEX {FUNCTION_EMBEDDING_INDEX}
     FOR $query_vector
     LIMIT $top_k
   ) SCORE AS score
@@ -96,7 +98,10 @@ RETURN c.community_id AS id,
 ORDER BY function_count DESC
 """
 
-CODE_AGENT_SYSTEM_PROMPT = """You are an expert Senior Staff Engineer analyzing a codebase.
+# The system prompt points Claude at this tool by name.
+ARCHITECTURE_TOOL_NAME = "analyze_architectural_subsystems"
+
+CODE_AGENT_SYSTEM_PROMPT = f"""You are an expert Senior Staff Engineer analyzing a codebase.
 You MUST format your responses for maximum readability.
 - Never output large walls of text.
 - Use Markdown headings (`##`) to organize your thoughts.
@@ -105,12 +110,11 @@ You MUST format your responses for maximum readability.
 - Use fenced code blocks with a language identifier (for example, ```python) when writing or displaying code snippets.
 - Be concise, direct, and highly structured.
 
-You are analyzing only the GitHub repository `{repo_name}`. When calling graph
-tools, always use that exact repository name. Do not mix results from other
-repositories.
+You are analyzing the GitHub repository `{{repo_name}}`. Every graph tool reads
+that repository's code graph.
 
 When asked to explain the architecture or high-level structure of a repository,
-use the `analyze_architectural_subsystems` tool. It returns labeled architectural
+use the `{ARCHITECTURE_TOOL_NAME}` tool. It returns labeled architectural
 modules with a title, description, and function count. Use those stored labels
 to present a high-level architectural summary."""
 
@@ -129,191 +133,180 @@ def _string_values(records: list[dict[str, Any]], key: str) -> list[str]:
     return [record[key] for record in records if isinstance(record.get(key), str)]
 
 
-@tool
-async def query_graph_blast_radius(
-    repo_name: str,
-    function_name: ToolText,
-) -> str:
-    """Find direct callers of a function within one ``owner/repository`` graph."""
+def build_repository_tools(repo_name: RepositoryName) -> list[BaseTool]:
+    """Build the graph tools for one validated repository.
 
-    records = await _read_records(
-        CALLERS_QUERY,
-        repo_name=repo_name,
-        func_name=function_name,
-    )
+    The repository is bound here rather than exposed as a tool argument, so the
+    model cannot choose which repository's graph a tool reads.
+    """
 
-    return json.dumps(
-        {
-            "repo_name": repo_name,
-            "function_name": function_name,
-            "target_is_external": any(
-                record.get("target_is_external") is True for record in records
-            ),
-            "callers": records,
-        },
-        default=str,
-    )
+    async def read_repository_records(
+        query: str,
+        **parameters: Any,
+    ) -> list[dict[str, Any]]:
+        return await _read_records(query, repo_name=repo_name, **parameters)
 
+    @tool
+    async def query_graph_blast_radius(function_name: ToolText) -> str:
+        """Find direct callers of a function in the repository graph."""
 
-@tool
-async def list_codebase_structure(repo_name: str) -> str:
-    """List every source file path in one ``owner/repository`` code graph."""
-
-    records = await _read_records(CODEBASE_STRUCTURE_QUERY, repo_name=repo_name)
-
-    return "\n".join(_string_values(records, "file_path"))
-
-
-@tool
-async def list_functions_in_file(repo_name: str, file_path: ToolText) -> str:
-    """List functions defined in a file within one repository graph."""
-
-    records = await _read_records(
-        FUNCTIONS_IN_FILE_QUERY,
-        repo_name=repo_name,
-        file_path=file_path,
-    )
-
-    function_names = _string_values(records, "function_name")
-    if not function_names:
-        return f"No functions found in {file_path}."
-    return "\n".join(
-        [
-            f"Functions in {file_path}:",
-            *(f"- {function_name}" for function_name in function_names),
-        ]
-    )
-
-
-@tool
-async def query_outgoing_dependencies(
-    repo_name: str,
-    function_name: ToolText,
-) -> str:
-    """List functions called by a function within one repository graph."""
-
-    records = await _read_records(
-        OUTGOING_DEPENDENCIES_QUERY,
-        repo_name=repo_name,
-        func_name=function_name,
-    )
-
-    dependencies_by_caller: dict[tuple[object, object], list[str]] = {}
-    for record in records:
-        target_name = record.get("target_name")
-        if not isinstance(target_name, str):
-            continue
-        dependencies = dependencies_by_caller.setdefault(
-            (record.get("caller_name"), record.get("caller_file")), []
+        records = await read_repository_records(
+            CALLERS_QUERY,
+            func_name=function_name,
         )
-        if record.get("is_external") is True:
-            dependencies.append(f"- {target_name} (External/Built-in)")
-            continue
-        target_file = record.get("target_file")
-        location = target_file if isinstance(target_file, str) else "unknown file"
-        dependencies.append(f"- {target_name} ({location})")
 
-    if not dependencies_by_caller:
-        return f"No outgoing dependencies found for {function_name}."
-    if len(dependencies_by_caller) == 1:
+        return json.dumps(
+            {
+                "repo_name": repo_name,
+                "function_name": function_name,
+                "target_is_external": any(
+                    record.get("target_is_external") is True
+                    for record in records
+                ),
+                "callers": records,
+            },
+            default=str,
+        )
+
+    @tool
+    async def list_codebase_structure() -> str:
+        """List every source file path in the repository graph."""
+
+        records = await read_repository_records(CODEBASE_STRUCTURE_QUERY)
+
+        return "\n".join(_string_values(records, "file_path"))
+
+    @tool
+    async def list_functions_in_file(file_path: ToolText) -> str:
+        """List functions defined in a file of the repository graph."""
+
+        records = await read_repository_records(
+            FUNCTIONS_IN_FILE_QUERY,
+            file_path=file_path,
+        )
+
+        function_names = _string_values(records, "function_name")
+        if not function_names:
+            return f"No functions found in {file_path}."
         return "\n".join(
             [
-                f"Outgoing dependencies for {function_name}:",
-                *next(iter(dependencies_by_caller.values())),
+                f"Functions in {file_path}:",
+                *(f"- {function_name}" for function_name in function_names),
             ]
         )
-    # Several definitions share this name; keep their dependencies apart.
-    lines = [
-        f"Outgoing dependencies for {len(dependencies_by_caller)} definitions "
-        f"named {function_name}:"
-    ]
-    for (caller_name, caller_file), dependencies in dependencies_by_caller.items():
-        lines.append(f"{caller_name} ({caller_file or 'unknown file'}):")
-        lines.extend(f"  {dependency}" for dependency in dependencies)
-    return "\n".join(lines)
 
+    @tool
+    async def query_outgoing_dependencies(function_name: ToolText) -> str:
+        """List functions called by a function in the repository graph."""
 
-@tool
-async def list_external_dependencies(repo_name: str) -> str:
-    """List external, standard-library, or third-party repository calls."""
-
-    records = await _read_records(EXTERNAL_DEPENDENCIES_QUERY, repo_name=repo_name)
-
-    function_names = _string_values(records, "function_name")
-    if not function_names:
-        return "No external dependencies found."
-    return "\n".join(
-        [
-            "External dependencies:",
-            *(f"- {function_name}" for function_name in function_names),
-        ]
-    )
-
-
-@tool
-async def semantic_code_search(
-    query: ToolText,
-    repo_name: str,
-    top_k: SearchResultLimit = 5,
-) -> str:
-    """Find functions related to a natural-language query in one repository."""
-
-    query_vector = await generate_embedding(query)
-    records = await _read_records(
-        SEMANTIC_CODE_SEARCH_QUERY,
-        query_vector=query_vector,
-        repo_name=repo_name,
-        top_k=top_k,
-    )
-
-    matches: list[str] = []
-    for record in records:
-        function_name = record.get("function_name")
-        if not isinstance(function_name, str):
-            continue
-        file_path = record.get("file_path")
-        location = file_path if isinstance(file_path, str) else "unknown file"
-        score = record.get("score")
-        score_text = (
-            f"{float(score):.4f}"
-            if isinstance(score, (int, float))
-            else "unknown"
-        )
-        matches.append(
-            f"- {function_name} ({location}) — similarity {score_text}"
+        records = await read_repository_records(
+            OUTGOING_DEPENDENCIES_QUERY,
+            func_name=function_name,
         )
 
-    if not matches:
-        return f'No semantic code matches found for "{query}".'
-    return "\n".join(
-        [
-            f'Semantic code matches for "{query}":',
-            *matches,
+        dependencies_by_caller: dict[tuple[object, object], list[str]] = {}
+        for record in records:
+            target_name = record.get("target_name")
+            if not isinstance(target_name, str):
+                continue
+            dependencies = dependencies_by_caller.setdefault(
+                (record.get("caller_name"), record.get("caller_file")), []
+            )
+            if record.get("is_external") is True:
+                dependencies.append(f"- {target_name} (External/Built-in)")
+                continue
+            target_file = record.get("target_file")
+            location = (
+                target_file if isinstance(target_file, str) else "unknown file"
+            )
+            dependencies.append(f"- {target_name} ({location})")
+
+        if not dependencies_by_caller:
+            return f"No outgoing dependencies found for {function_name}."
+        if len(dependencies_by_caller) == 1:
+            return "\n".join(
+                [
+                    f"Outgoing dependencies for {function_name}:",
+                    *next(iter(dependencies_by_caller.values())),
+                ]
+            )
+        # Several definitions share this name; keep their dependencies apart.
+        lines = [
+            f"Outgoing dependencies for {len(dependencies_by_caller)} "
+            f"definitions named {function_name}:"
         ]
-    )
+        for (caller_name, caller_file), dependencies in (
+            dependencies_by_caller.items()
+        ):
+            lines.append(f"{caller_name} ({caller_file or 'unknown file'}):")
+            lines.extend(f"  {dependency}" for dependency in dependencies)
+        return "\n".join(lines)
 
+    @tool
+    async def list_external_dependencies() -> str:
+        """List external, standard-library, or third-party repository calls."""
 
-@tool
-async def analyze_architectural_subsystems(repo_name: str) -> str:
-    """Return the largest Leiden communities in one repository code graph."""
+        records = await read_repository_records(EXTERNAL_DEPENDENCIES_QUERY)
 
-    records = await _read_records(
-        ARCHITECTURAL_SUBSYSTEMS_QUERY,
-        repo_name=repo_name,
-    )
+        function_names = _string_values(records, "function_name")
+        if not function_names:
+            return "No external dependencies found."
+        return "\n".join(
+            [
+                "External dependencies:",
+                *(f"- {function_name}" for function_name in function_names),
+            ]
+        )
 
-    return json.dumps(records, default=str)
+    @tool
+    async def semantic_code_search(
+        query: ToolText,
+        top_k: SearchResultLimit = 5,
+    ) -> str:
+        """Find functions related to a natural-language query in the repository."""
 
+        query_vector = await generate_embedding(query)
+        records = await read_repository_records(
+            SEMANTIC_CODE_SEARCH_QUERY,
+            query_vector=query_vector,
+            top_k=top_k,
+        )
 
-@lru_cache(maxsize=1)
-def _get_code_agent() -> Any:
-    """Create and cache the Sonnet 5 ReAct graph on first chat request."""
+        matches: list[str] = []
+        for record in records:
+            function_name = record.get("function_name")
+            if not isinstance(function_name, str):
+                continue
+            file_path = record.get("file_path")
+            location = file_path if isinstance(file_path, str) else "unknown file"
+            score = record.get("score")
+            score_text = (
+                f"{float(score):.4f}"
+                if isinstance(score, (int, float))
+                else "unknown"
+            )
+            matches.append(
+                f"- {function_name} ({location}) — similarity {score_text}"
+            )
 
-    llm = ChatAnthropic(
-        model="claude-sonnet-5",
-        api_key=settings.ANTHROPIC_API_KEY,
-    )
-    tools = [
+        if not matches:
+            return f'No semantic code matches found for "{query}".'
+        return "\n".join(
+            [
+                f'Semantic code matches for "{query}":',
+                *matches,
+            ]
+        )
+
+    @tool(ARCHITECTURE_TOOL_NAME)
+    async def analyze_architectural_subsystems() -> str:
+        """Return the largest Leiden communities in the repository graph."""
+
+        records = await read_repository_records(ARCHITECTURAL_SUBSYSTEMS_QUERY)
+
+        return json.dumps(records, default=str)
+
+    return [
         query_graph_blast_radius,
         list_codebase_structure,
         list_functions_in_file,
@@ -322,7 +315,16 @@ def _get_code_agent() -> Any:
         semantic_code_search,
         analyze_architectural_subsystems,
     ]
-    return create_react_agent(llm, tools=tools)
+
+
+@lru_cache(maxsize=1)
+def _get_code_model() -> ChatAnthropic:
+    """Create and cache the Sonnet 5 chat model on first chat request."""
+
+    return ChatAnthropic(
+        model="claude-sonnet-5",
+        api_key=settings.ANTHROPIC_API_KEY,
+    )
 
 
 def _message_text(content: object) -> str:
@@ -356,11 +358,15 @@ def _tool_context_text(messages: list[Any]) -> str:
 
 async def _run_code_agent(
     user_message: str,
-    repo_name: str,
+    repo_name: RepositoryName,
 ) -> tuple[str, list[Any]]:
     """Run the repository-scoped agent and return its answer and trace."""
 
-    result = await _get_code_agent().ainvoke(
+    code_agent = create_react_agent(
+        _get_code_model(),
+        tools=build_repository_tools(repo_name),
+    )
+    result = await code_agent.ainvoke(
         {
             "messages": [
                 {
@@ -371,7 +377,6 @@ async def _run_code_agent(
                 },
                 {"role": "user", "content": user_message},
             ],
-            "repo_name": repo_name,
         }
     )
     messages = result.get("messages", [])
@@ -428,7 +433,7 @@ class CodeAgentAnswer:
 
 async def ask_code_agent_with_metrics(
     user_message: str,
-    repo_name: str,
+    repo_name: RepositoryName,
 ) -> CodeAgentAnswer:
     """Answer a question and report Graph-RAG context token efficiency."""
 

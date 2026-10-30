@@ -1,4 +1,7 @@
-export const API_BASE = "http://localhost:8000";
+import { resolveApiBase } from "./apiBase.js";
+
+// import.meta.env is undefined outside Vite (for example under node --test).
+export const API_BASE = resolveApiBase(import.meta.env);
 
 function formatErrorDetail(detail) {
   if (typeof detail === "string") return detail;

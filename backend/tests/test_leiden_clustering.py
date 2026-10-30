@@ -7,8 +7,9 @@ from collections.abc import Iterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from neo4j import Driver
 
-from app.db import close_neo4j_driver, neo4j_client
+from app.db import close_neo4j_driver
 from app.db.graph_ops import save_parsed_ast_to_neo4j
 from app.services.parser_service import (
     CodeParser,
@@ -47,29 +48,22 @@ async def _fake_embeddings(texts: list[str]) -> list[list[float]]:
 
 
 @pytest.fixture
-def gds_database() -> Iterator[None]:
-    if neo4j_client.driver is None:
-        neo4j_client.driver = neo4j_client._initialize_driver()
-    if neo4j_client.driver is None:
-        pytest.skip("Neo4j is unavailable; integration tests require a live database")
-    with neo4j_client.driver.session() as session:
+def gds_database(live_neo4j: Driver) -> Iterator[Driver]:
+    with live_neo4j.session() as session:
         try:
             session.run("RETURN gds.version() AS version").consume()
         except Exception:
-            neo4j_client.close_driver()
             pytest.skip("Neo4j Graph Data Science is not installed")
         session.run(CLEANUP_QUERY, repo_name=TEST_REPO_NAME).consume()
     try:
-        yield
+        yield live_neo4j
     finally:
-        if neo4j_client.driver is not None:
-            with neo4j_client.driver.session() as session:
-                session.run(CLEANUP_QUERY, repo_name=TEST_REPO_NAME).consume()
-        neo4j_client.close_driver()
+        with live_neo4j.session() as session:
+            session.run(CLEANUP_QUERY, repo_name=TEST_REPO_NAME).consume()
 
 
 def test_two_connected_groups_produce_exactly_two_communities(
-    gds_database: None,
+    gds_database: Driver,
 ) -> None:
     parsed_data = [
         _parse("src/alpha.py", _group_source("alpha")),
@@ -95,8 +89,7 @@ def test_two_connected_groups_produce_exactly_two_communities(
     ):
         asyncio.run(save())
 
-    assert neo4j_client.driver is not None
-    with neo4j_client.driver.session() as session:
+    with gds_database.session() as session:
         rows = session.run(
             "MATCH (function:Function {repo_name: $repo_name}) "
             "RETURN function.file_path AS file_path, "

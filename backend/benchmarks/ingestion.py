@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 import sys
 from time import perf_counter
@@ -33,12 +34,13 @@ async def benchmark(args):
     from app import main
     from app.config import settings
     from app.db import close_neo4j_driver, fetch_node_code, get_neo4j_driver
-    from app.db.neo4j_client import close_driver, initialize_database
+    from app.db.neo4j_client import initialize_database
     from app.services import community_summarizer, embedding_service
+    from app.utils.embeddings import EMBEDDING_DIMENSIONS
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=str(args.output.with_suffix(".log")), level=logging.INFO, force=True)
-    await asyncio.to_thread(initialize_database)
+    await initialize_database()
     stats = {
         "repo_name": args.repo.full_name,
         "timing_scope": "download, parse, embeddings, graph writes, GDS, community labels, cleanup",
@@ -67,10 +69,11 @@ async def benchmark(args):
     community_summarizer._generate_community_labels = counted_labels
     download = main.download_and_extract_repo
 
+    @asynccontextmanager
     async def measured_download(*call_args, **kwargs):
-        root = await download(*call_args, **kwargs)
-        stats["archive_root_name"] = Path(root).name
-        return root
+        async with download(*call_args, **kwargs) as root:
+            stats["archive_root_name"] = root.name
+            yield root
 
     main.download_and_extract_repo = measured_download
     started = perf_counter()
@@ -105,9 +108,10 @@ async def benchmark(args):
                 "count(DISTINCT CASE WHEN f.embedding IS NOT NULL THEN f END) AS embedded_functions, "
                 "count(file) AS defines_links, "
                 "sum(CASE WHEN file IS NULL OR file.path <> f.file_path THEN 1 ELSE 0 END) AS invalid_defines, "
-                "sum(CASE WHEN f.embedding IS NULL OR size(f.embedding) <> 1536 THEN 1 ELSE 0 END) AS invalid_vectors, "
-                "count(DISTINCT CASE WHEN f.has_body THEN [f.file_path, f.name] END) AS previous_embedding_inputs",
-                repo=args.repo.full_name,
+                "sum(CASE WHEN f.embedding IS NULL OR size(f.embedding) <> $dimensions THEN 1 ELSE 0 END) AS invalid_vectors, "
+                # Only definitions with bodies are persisted as Function nodes.
+                "count(DISTINCT [f.file_path, f.name]) AS previous_embedding_inputs",
+                repo=args.repo.full_name, dimensions=EMBEDDING_DIMENSIONS,
             )
             stats["persisted"] = dict(await result.single())
             result = await session.run(
@@ -135,7 +139,6 @@ async def benchmark(args):
         args.output.write_text(json.dumps(stats, indent=2) + "\n")
         print(json.dumps(stats, indent=2), flush=True)
         await close_neo4j_driver()
-        close_driver()
 
 
 if __name__ == "__main__":

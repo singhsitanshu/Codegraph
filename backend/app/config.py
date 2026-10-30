@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     EMBEDDING_CACHE_PATH: str = str(BACKEND_DIR / ".cache" / "embeddings.sqlite3")
+    # Browser origins allowed to call the API: the dashboard's dev servers.
+    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env",

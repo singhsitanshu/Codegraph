@@ -8,12 +8,11 @@ from openai import AsyncOpenAI
 
 from app.config import settings
 from app.services.embedding_cache import read_embeddings, write_embeddings
+from app.utils.embeddings import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
 
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIMENSIONS = 1536
 EMBEDDING_REQUEST_BATCH_SIZE = 512
 MAX_CONCURRENT_EMBEDDING_REQUESTS = 4
 
@@ -68,6 +67,6 @@ async def generate_embeddings(texts: list[str]) -> list[list[float]]:
 
 
 async def generate_embedding(text: str) -> list[float]:
-    """Generate one 1,536-dimensional semantic embedding."""
+    """Generate one ``EMBEDDING_DIMENSIONS``-long semantic embedding."""
 
     return (await generate_embeddings([text]))[0]

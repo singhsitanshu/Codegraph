@@ -141,7 +141,7 @@ The chat endpoint invokes a repository-scoped LangGraph ReAct agent backed by `c
 | Semantic code search | Top vector matches for a natural-language query |
 | Architectural subsystems | Stored community names, descriptions, and function counts |
 
-Every Cypher query includes a repository predicate. The agent system prompt also instructs Claude to use the exact active repository name and to use stored community summaries for architecture questions.
+Every Cypher query includes a repository predicate. The agent's tools are built per request with the validated repository name bound in code, so the model never supplies or chooses the repository scope. The system prompt instructs Claude to use stored community summaries for architecture questions.
 
 After a response, Codegraph counts only the graph-tool outputs supplied to the model and compares that count with the stored full-source baseline:
 
@@ -415,8 +415,9 @@ The active settings class loads `backend/.env`, is case-insensitive, ignores unk
 | `NEO4J_PASSWORD` | All graph operations | `password` | The copied `backend/.env.example` sets `gladline` to match the checked-in local Compose configuration. |
 | `ANTHROPIC_API_KEY` | Chat | empty | The active model is currently hard-coded to `claude-sonnet-5`. |
 | `OPENAI_API_KEY` | Ingestion and semantic search | empty | Used by `text-embedding-3-small` and `gpt-4o-mini`. |
+| `CORS_ORIGINS` | Browser access from the dashboard | `["http://localhost:3000","http://localhost:5173"]` | JSON list of allowed dashboard origins. |
 
-The frontend hard-codes `http://localhost:8000` as its API base; Vite proxies relative `/api` requests to the same backend during development.
+The frontend reads its API base from `VITE_API_BASE` (see `frontend/.env.example`), defaulting to `http://localhost:8000`; Vite proxies relative `/api` requests to the same backend during development. A dashboard served from another origin must also be listed in the backend's `CORS_ORIGINS`.
 
 ## Repository structure
 

@@ -23,6 +23,7 @@ from app.services.embedding_service import (
     generate_embeddings,
 )
 from app.services.parser_service import IdentifiedFile, IdentifiedFunction
+from app.utils import ingestion_progress
 from app.utils.entity_identity import normalize_repository_path
 from app.utils.tokens import DEFAULT_TOKEN_MODEL
 
@@ -148,7 +149,7 @@ SET relationship.resolution = 'external',
 
 @dataclass(frozen=True, slots=True)
 class DatabaseWriteProgress:
-    """One database-stage update for the ingestion stream."""
+    """One database-stage update on the ingestion stream's progress scale."""
 
     status: str
     progress: int
@@ -461,13 +462,16 @@ async def save_parsed_ast_to_neo4j_with_progress(
                 extra_parameters={"paths": changed_paths},
             )
 
-        yield DatabaseWriteProgress("Pass 1: Creating Files...", 86)
+        yield DatabaseWriteProgress(
+            "Pass 1: Creating Files...",
+            ingestion_progress.FILES_STARTED,
+        )
         for batch in chunk_data(files, batch_size):
             await run_transaction(MERGE_FILES_QUERY, batch)
 
         yield DatabaseWriteProgress(
             "Pass 2: Embedding and Creating Functions...",
-            90,
+            ingestion_progress.FUNCTIONS.start,
         )
         stage_started = perf_counter()
         function_count = 0
@@ -489,14 +493,19 @@ async def save_parsed_ast_to_neo4j_with_progress(
                     function_count += len(embedded_batch)
                     yield DatabaseWriteProgress(
                         f"Pass 2: Embedding and Creating Functions ({function_count}/{len(functions)})...",
-                        90 + 3 * function_count // len(functions),
+                        ingestion_progress.FUNCTIONS.at(
+                            function_count, len(functions)
+                        ),
                     )
         logger.info(
             "Ingestion %s: embedded and stored functions in %.2fs",
             repo_name, perf_counter() - stage_started,
         )
 
-        yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
+        yield DatabaseWriteProgress(
+            "Pass 3: Mapping Dependencies...",
+            ingestion_progress.DEPENDENCIES.start,
+        )
         stage_started = perf_counter()
         call_count = 0
         total_calls = len(calls) + len(external_calls)
@@ -509,7 +518,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
                 call_count += len(batch)
                 yield DatabaseWriteProgress(
                     f"Pass 3: Mapping Dependencies ({call_count}/{total_calls})...",
-                    94 + 2 * call_count // total_calls,
+                    ingestion_progress.DEPENDENCIES.at(call_count, total_calls),
                 )
         logger.info(
             "Ingestion %s: stored dependencies in %.2fs",
@@ -521,7 +530,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
 
     yield DatabaseWriteProgress(
         "Detecting architectural communities...",
-        97,
+        ingestion_progress.COMMUNITY_DETECTION_STARTED,
     )
     stage_started = perf_counter()
     await run_leiden_clustering(repo_name)
@@ -531,7 +540,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
     )
     yield DatabaseWriteProgress(
         "Labeling architectural communities...",
-        98,
+        ingestion_progress.COMMUNITY_LABELING_STARTED,
     )
     stage_started = perf_counter()
     await label_and_store_communities(repo_name)
@@ -539,7 +548,10 @@ async def save_parsed_ast_to_neo4j_with_progress(
         "Ingestion %s: labeled communities in %.2fs",
         repo_name, perf_counter() - stage_started,
     )
-    yield DatabaseWriteProgress("Completing transaction...", 99)
+    yield DatabaseWriteProgress(
+        "Completing transaction...",
+        ingestion_progress.COMMITTING,
+    )
 
 
 async def save_parsed_ast_to_neo4j(

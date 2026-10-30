@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import zipfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -11,10 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import _discover_repository_source_files, app
-from app.services.github_service import (
-    cleanup_downloaded_repo,
-    download_and_extract_repo,
-)
+from app.services.github_service import download_and_extract_repo
 from app.services.parser_service import (
     IdentifiedFile,
     ParsedFileProgress,
@@ -22,6 +20,19 @@ from app.services.parser_service import (
 )
 from app.db.graph_ops import DatabaseWriteProgress
 from app.utils.repository import GitHubRepository
+
+
+def _fake_download(extracted_root: Path, released: list[tuple[str, str]]):
+    """Stand in for the download scope and record when it is released."""
+
+    @asynccontextmanager
+    async def download(owner: str, name: str):
+        try:
+            yield extracted_root
+        finally:
+            released.append((owner, name))
+
+    return download
 
 
 def test_parse_github_repository_url() -> None:
@@ -58,7 +69,7 @@ def test_repository_discovery_includes_every_supported_language(
     for file_name in [*supported_names, "README.md"]:
         (tmp_path / file_name).write_text("", encoding="utf-8")
 
-    discovered = _discover_repository_source_files(str(tmp_path))
+    discovered = _discover_repository_source_files(tmp_path)
 
     assert {Path(file_path).name for file_path in discovered} == supported_names
 
@@ -80,7 +91,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
         unattributed_calls=(),
         outgoing_calls=(),
     )
-    cleanup = Mock()
+    released: list[tuple[str, str]] = []
     save_calls = []
 
     async def parse_with_progress(_file_paths: list[str]):
@@ -110,7 +121,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
     with (
         patch(
             "app.main.download_and_extract_repo",
-            new=AsyncMock(return_value=str(repository_root)),
+            new=_fake_download(repository_root, released),
         ),
         patch(
             "app.main.parse_changed_files_with_progress",
@@ -120,7 +131,6 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
             "app.main.save_parsed_ast_to_neo4j_with_progress",
             new=save_with_progress,
         ),
-        patch("app.main.cleanup_downloaded_repo", new=cleanup),
     ):
         response = TestClient(app).post(
             "/api/ingest-repo",
@@ -170,7 +180,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
             },
         )
     ]
-    cleanup.assert_called_once_with(str(repository_root))
+    assert released == [("psf", "requests")]
 
 
 def test_ingest_repository_rejects_non_github_url() -> None:
@@ -196,11 +206,11 @@ def test_full_ingest_does_not_replace_graph_after_parse_failure(tmp_path: Path) 
         )
 
     save = Mock()
+    released: list[tuple[str, str]] = []
     with (
-        patch("app.main.download_and_extract_repo", new=AsyncMock(return_value=str(tmp_path))),
+        patch("app.main.download_and_extract_repo", new=_fake_download(tmp_path, released)),
         patch("app.main.parse_changed_files_with_progress", new=failed_parse),
         patch("app.main.save_parsed_ast_to_neo4j_with_progress", new=save),
-        patch("app.main.cleanup_downloaded_repo"),
     ):
         response = TestClient(app).post(
             "/api/ingest-repo", json={"url": "https://github.com/psf/requests"}
@@ -210,12 +220,14 @@ def test_full_ingest_does_not_replace_graph_after_parse_failure(tmp_path: Path) 
     assert records[-1]["status"] == "Repository ingestion failed."
     assert "could not be parsed" in records[-1]["error"]
     save.assert_not_called()
+    assert released == [("psf", "requests")]
 
 
-def test_downloaded_repository_lives_until_explicit_cleanup() -> None:
+def _archive_client(*entries: tuple[str, str]) -> MagicMock:
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(archive_buffer, mode="w") as archive:
-        archive.writestr("psf-requests-sha/src/example.py", "def example(): pass\n")
+        for name, content in entries:
+            archive.writestr(name, content)
 
     archive_response = Mock(content=archive_buffer.getvalue())
     archive_response.raise_for_status = Mock()
@@ -224,23 +236,50 @@ def test_downloaded_repository_lives_until_explicit_cleanup() -> None:
     client_context = MagicMock()
     client_context.__aenter__ = AsyncMock(return_value=client)
     client_context.__aexit__ = AsyncMock(return_value=None)
+    return client_context
+
+
+def test_downloaded_repository_lives_for_the_download_scope() -> None:
+    client_context = _archive_client(
+        ("psf-requests-sha/src/example.py", "def example(): pass\n")
+    )
+
+    async def download() -> Path:
+        async with download_and_extract_repo("psf", "requests") as extracted_root:
+            assert (extracted_root / "src" / "example.py").is_file()
+            return extracted_root
 
     with patch(
         "app.services.github_service.httpx.AsyncClient",
         return_value=client_context,
     ):
-        extracted_root = asyncio.run(
-            download_and_extract_repo("psf", "requests")
-        )
+        extracted_root = asyncio.run(download())
 
-    extracted_path = Path(extracted_root)
-    temporary_parent = extracted_path.parent
-    try:
-        assert (extracted_path / "src" / "example.py").is_file()
-        client.get.assert_awaited_once_with(
-            "https://api.github.com/repos/psf/requests/zipball",
-        )
-    finally:
-        cleanup_downloaded_repo(extracted_root)
+    client = client_context.__aenter__.return_value
+    client.get.assert_awaited_once_with(
+        "https://api.github.com/repos/psf/requests/zipball",
+    )
+    assert not extracted_root.parent.exists()
 
-    assert not temporary_parent.exists()
+
+def test_downloaded_repository_is_removed_when_the_scope_fails() -> None:
+    client_context = _archive_client(
+        ("psf-requests-sha/src/example.py", "def example(): pass\n")
+    )
+    extracted_roots: list[Path] = []
+
+    async def download() -> None:
+        async with download_and_extract_repo("psf", "requests") as extracted_root:
+            extracted_roots.append(extracted_root)
+            raise RuntimeError("ingestion failed")
+
+    with (
+        patch(
+            "app.services.github_service.httpx.AsyncClient",
+            return_value=client_context,
+        ),
+        pytest.raises(RuntimeError),
+    ):
+        asyncio.run(download())
+
+    assert not extracted_roots[0].parent.exists()

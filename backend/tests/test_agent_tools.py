@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from app.agent.graph import (
     ARCHITECTURAL_SUBSYSTEMS_QUERY,
+    ARCHITECTURE_TOOL_NAME,
     CALLERS_QUERY,
     CODE_AGENT_SYSTEM_PROMPT,
     CODEBASE_STRUCTURE_QUERY,
@@ -19,23 +20,22 @@ from app.agent.graph import (
     SEMANTIC_CODE_SEARCH_QUERY,
     CodeAgentAnswer,
     GraphRagMetrics,
-    _get_code_agent,
+    _run_code_agent,
     _tool_context_text,
-    analyze_architectural_subsystems,
     ask_code_agent_with_metrics,
-    list_external_dependencies,
-    list_codebase_structure,
-    list_functions_in_file,
-    query_graph_blast_radius,
-    query_outgoing_dependencies,
-    semantic_code_search,
+    build_repository_tools,
 )
+from app.utils.embeddings import FUNCTION_EMBEDDING_INDEX
+
+
+REPO = "owner/repository"
+TOOLS = {
+    graph_tool.name: graph_tool for graph_tool in build_repository_tools(REPO)
+}
 
 
 def test_code_agent_system_prompt_requires_structured_markdown() -> None:
-    rendered_prompt = CODE_AGENT_SYSTEM_PROMPT.format(
-        repo_name="owner/repository"
-    )
+    rendered_prompt = CODE_AGENT_SYSTEM_PROMPT.format(repo_name=REPO)
 
     assert "expert Senior Staff Engineer" in rendered_prompt
     assert "Never output large walls of text" in rendered_prompt
@@ -44,7 +44,8 @@ def test_code_agent_system_prompt_requires_structured_markdown() -> None:
     assert "`api.py`" in rendered_prompt
     assert "```python" in rendered_prompt
     assert "owner/repository" in rendered_prompt
-    assert "analyze_architectural_subsystems" in rendered_prompt
+    assert f"`{ARCHITECTURE_TOOL_NAME}` tool" in rendered_prompt
+    assert ARCHITECTURE_TOOL_NAME in TOOLS
     assert "labeled architectural" in rendered_prompt
     assert "function count" in rendered_prompt
 
@@ -67,8 +68,8 @@ def _invoke_tool(tool, arguments, records):
 
 def test_list_codebase_structure_returns_newline_separated_paths() -> None:
     output, run_query = _invoke_tool(
-        list_codebase_structure,
-        {"repo_name": "owner/repository"},
+        TOOLS["list_codebase_structure"],
+        {},
         [
             {"file_path": "src/a.py"},
             {"file_path": "src/b.py"},
@@ -84,9 +85,8 @@ def test_list_codebase_structure_returns_newline_separated_paths() -> None:
 
 def test_list_functions_in_file_formats_function_names() -> None:
     output, run_query = _invoke_tool(
-        list_functions_in_file,
+        TOOLS["list_functions_in_file"],
         {
-            "repo_name": "owner/repository",
             "file_path": " src/client.py ",
         },
         [
@@ -109,9 +109,8 @@ def test_list_functions_in_file_formats_function_names() -> None:
 
 def test_query_outgoing_dependencies_formats_targets_and_locations() -> None:
     output, run_query = _invoke_tool(
-        query_outgoing_dependencies,
+        TOOLS["query_outgoing_dependencies"],
         {
-            "repo_name": "owner/repository",
             "function_name": " send ",
         },
         [
@@ -142,8 +141,8 @@ def test_query_outgoing_dependencies_formats_targets_and_locations() -> None:
 
 def test_query_outgoing_dependencies_separates_same_named_definitions() -> None:
     output, _ = _invoke_tool(
-        query_outgoing_dependencies,
-        {"repo_name": "owner/repository", "function_name": "run"},
+        TOOLS["query_outgoing_dependencies"],
+        {"function_name": "run"},
         [
             {
                 "caller_name": "Alpha.run",
@@ -173,9 +172,8 @@ def test_query_outgoing_dependencies_separates_same_named_definitions() -> None:
 
 def test_blast_radius_surfaces_external_target_status() -> None:
     output, run_query = _invoke_tool(
-        query_graph_blast_radius,
+        TOOLS["query_graph_blast_radius"],
         {
-            "repo_name": "owner/repository",
             "function_name": "Exception",
         },
         [
@@ -199,8 +197,8 @@ def test_blast_radius_surfaces_external_target_status() -> None:
 
 def test_list_external_dependencies_formats_repository_boundary() -> None:
     output, run_query = _invoke_tool(
-        list_external_dependencies,
-        {"repo_name": "owner/repository"},
+        TOOLS["list_external_dependencies"],
+        {},
         [
             {"function_name": "Exception"},
             {"function_name": "requests_get"},
@@ -244,11 +242,10 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
         patch("app.agent.graph.generate_embedding", new=embed_query),
     ):
         output = asyncio.run(
-            semantic_code_search.ainvoke(
+            TOOLS["semantic_code_search"].ainvoke(
                 {
                     "query": "take a customer payment",
-                    "repo_name": "owner/repository",
-                    "top_k": 5,
+                            "top_k": 5,
                 }
             )
         )
@@ -265,7 +262,9 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
         top_k=5,
     )
     assert "SEARCH node IN" in SEMANTIC_CODE_SEARCH_QUERY
-    assert "VECTOR INDEX function_embeddings" in SEMANTIC_CODE_SEARCH_QUERY
+    assert (
+        f"VECTOR INDEX {FUNCTION_EMBEDDING_INDEX}" in SEMANTIC_CODE_SEARCH_QUERY
+    )
     assert "SCORE AS score" in SEMANTIC_CODE_SEARCH_QUERY
     assert "db.index.vector.queryNodes" not in SEMANTIC_CODE_SEARCH_QUERY
 
@@ -280,8 +279,8 @@ def test_analyze_architectural_subsystems_returns_scoped_communities() -> None:
         }
     ]
     output, run_query = _invoke_tool(
-        analyze_architectural_subsystems,
-        {"repo_name": "owner/repository"},
+        TOOLS["analyze_architectural_subsystems"],
+        {},
         records,
     )
 
@@ -293,43 +292,44 @@ def test_analyze_architectural_subsystems_returns_scoped_communities() -> None:
 
 
 @pytest.mark.parametrize(
-    ("graph_tool", "arguments"),
+    ("tool_name", "arguments"),
     [
-        (query_graph_blast_radius, {"function_name": "  "}),
-        (list_functions_in_file, {"file_path": ""}),
-        (query_outgoing_dependencies, {"function_name": " "}),
-        (semantic_code_search, {"query": "  "}),
-        (semantic_code_search, {"query": "payments", "top_k": 0}),
-        (semantic_code_search, {"query": "payments", "top_k": 21}),
+        ("query_graph_blast_radius", {"function_name": "  "}),
+        ("list_functions_in_file", {"file_path": ""}),
+        ("query_outgoing_dependencies", {"function_name": " "}),
+        ("semantic_code_search", {"query": "  "}),
+        ("semantic_code_search", {"query": "payments", "top_k": 0}),
+        ("semantic_code_search", {"query": "payments", "top_k": 21}),
     ],
 )
 def test_tools_reject_invalid_llm_arguments_before_querying(
-    graph_tool, arguments
+    tool_name, arguments
 ) -> None:
     driver = MagicMock()
     with (
         patch("app.agent.graph.get_neo4j_driver", return_value=driver),
         pytest.raises(ValidationError),
     ):
-        asyncio.run(
-            graph_tool.ainvoke({"repo_name": "owner/repository", **arguments})
-        )
+        asyncio.run(TOOLS[tool_name].ainvoke(arguments))
     driver.session.assert_not_called()
 
 
-def test_code_agent_registers_all_repository_tools() -> None:
-    _get_code_agent.cache_clear()
-    compiled_agent = object()
+def test_code_agent_runs_with_tools_bound_to_the_requested_repository() -> None:
+    compiled_agent = MagicMock()
+    compiled_agent.ainvoke = AsyncMock(
+        return_value={"messages": [SimpleNamespace(content="Answer")]}
+    )
 
     with (
-        patch("app.agent.graph.ChatAnthropic", return_value=MagicMock()),
+        patch("app.agent.graph._get_code_model", return_value=MagicMock()),
         patch(
             "app.agent.graph.create_react_agent",
             return_value=compiled_agent,
         ) as create_agent,
     ):
-        assert _get_code_agent() is compiled_agent
+        response, _ = asyncio.run(_run_code_agent("Explain it", REPO))
 
+    assert response == "Answer"
     registered_tools = create_agent.call_args.kwargs["tools"]
     assert [registered_tool.name for registered_tool in registered_tools] == [
         "query_graph_blast_radius",
@@ -340,7 +340,36 @@ def test_code_agent_registers_all_repository_tools() -> None:
         "semantic_code_search",
         "analyze_architectural_subsystems",
     ]
-    _get_code_agent.cache_clear()
+    output, run_query = _invoke_tool(
+        registered_tools[1],
+        {},
+        [{"file_path": "src/a.py"}],
+    )
+    assert output == "src/a.py"
+    run_query.assert_awaited_once_with(
+        CODEBASE_STRUCTURE_QUERY,
+        repo_name=REPO,
+    )
+
+
+@pytest.mark.parametrize("graph_tool", TOOLS.values(), ids=TOOLS.keys())
+def test_model_cannot_choose_the_repository_scope(graph_tool) -> None:
+    assert "repo_name" not in graph_tool.tool_call_schema.model_json_schema()[
+        "properties"
+    ]
+
+
+def test_model_supplied_repository_name_is_ignored() -> None:
+    _, run_query = _invoke_tool(
+        TOOLS["list_external_dependencies"],
+        {"repo_name": "attacker/other-repository"},
+        [],
+    )
+
+    run_query.assert_awaited_once_with(
+        EXTERNAL_DEPENDENCIES_QUERY,
+        repo_name=REPO,
+    )
 
 
 def test_tool_context_includes_only_context_sent_by_graph_tools() -> None:

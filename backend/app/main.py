@@ -18,17 +18,15 @@ from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 from app.api import webhooks
 from app.agent.graph import ask_code_agent_with_metrics
+from app.config import settings
 from app.db import close_neo4j_driver, fetch_graph_data, fetch_node_code
 from app.db.graph_ops import (
     delete_all_repository_graphs,
     delete_repository_graph,
     save_parsed_ast_to_neo4j_with_progress,
 )
-from app.db.neo4j_client import close_driver, initialize_database
-from app.services.github_service import (
-    cleanup_downloaded_repo,
-    download_and_extract_repo,
-)
+from app.db.neo4j_client import initialize_database
+from app.services.github_service import download_and_extract_repo
 from app.services.parser_service import (
     SUPPORTED_EXTENSIONS,
     IdentifiedFile,
@@ -36,6 +34,7 @@ from app.services.parser_service import (
     identify_parsed_source,
     parse_changed_files_with_progress,
 )
+from app.utils import ingestion_progress
 from app.utils.repository import (
     GitHubRepository,
     GitHubRepositoryUrl,
@@ -96,14 +95,13 @@ REPOSITORY_INGESTION_FAILURES = Neo4jFailureDetails(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Initialize Neo4j, clear stale session graphs, and release drivers."""
+    """Initialize Neo4j, clear stale session graphs, and release the driver."""
 
-    await asyncio.to_thread(initialize_database)
     try:
+        await initialize_database()
         await delete_all_repository_graphs()
         yield
     finally:
-        close_driver()
         await close_neo4j_driver()
 
 
@@ -167,7 +165,7 @@ def _neo4j_errors_as_http(details: Neo4jFailureDetails) -> Iterator[None]:
         raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
-def _discover_repository_source_files(extracted_root: str) -> list[str]:
+def _discover_repository_source_files(extracted_root: Path) -> list[str]:
     """Walk an extracted repository and return supported source file paths."""
 
     source_files: list[str] = []
@@ -185,12 +183,12 @@ def _discover_repository_source_files(extracted_root: str) -> list[str]:
 
 def _identify_repository_files(
     parsed_sources: list[ParsedSource],
-    extracted_root: str,
+    extracted_root: Path,
     repository: str,
 ) -> list[IdentifiedFile]:
     """Identify files parsed from a temporary checkout by repository-relative paths."""
 
-    repository_root = Path(extracted_root).resolve()
+    repository_root = extracted_root.resolve()
     return [
         identify_parsed_source(
             parsed_source,
@@ -213,10 +211,7 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -322,17 +317,16 @@ async def _stream_repository_ingestion(
     canonical_repo_name = repository.full_name
     current_progress = 0
     try:
-        current_progress = 10
+        current_progress = ingestion_progress.DOWNLOAD_STARTED
         yield _ndjson_record(
             status="Downloading repository...",
             progress=current_progress,
         )
-        extracted_root = await download_and_extract_repo(
+        async with download_and_extract_repo(
             repository.owner,
             repository.name,
-        )
-        try:
-            current_progress = 20
+        ) as extracted_root:
+            current_progress = ingestion_progress.DOWNLOADED
             yield _ndjson_record(
                 status="Repository downloaded and extracted.",
                 progress=current_progress,
@@ -351,8 +345,9 @@ async def _stream_repository_ingestion(
                     total_repo_tokens += file_progress.source_tokens
                     if file_progress.result is not None:
                         parsed_by_index[file_progress.index] = file_progress.result
-                    current_progress = 20 + int(
-                        file_progress.processed / file_progress.total * 60
+                    current_progress = ingestion_progress.PARSING.at(
+                        file_progress.processed,
+                        file_progress.total,
                     )
                     yield _ndjson_record(
                         status=(
@@ -362,7 +357,7 @@ async def _stream_repository_ingestion(
                         progress=current_progress,
                     )
             else:
-                current_progress = 80
+                current_progress = ingestion_progress.PARSING.end
                 yield _ndjson_record(
                     status="No supported source files found.",
                     progress=current_progress,
@@ -391,7 +386,7 @@ async def _stream_repository_ingestion(
                 total_repo_tokens,
             )
 
-            current_progress = 85
+            current_progress = ingestion_progress.DATABASE_STARTED
             yield _ndjson_record(
                 status="Batching data to Neo4j...",
                 progress=current_progress,
@@ -410,12 +405,10 @@ async def _stream_repository_ingestion(
 
             yield _ndjson_record(
                 status="Repository ingestion complete.",
-                progress=100,
+                progress=ingestion_progress.COMPLETE,
                 repo_name=canonical_repo_name,
                 total_repo_tokens=total_repo_tokens,
             )
-        finally:
-            cleanup_downloaded_repo(extracted_root)
     except httpx.HTTPStatusError as exc:
         response_status = exc.response.status_code
         if response_status == status.HTTP_404_NOT_FOUND:

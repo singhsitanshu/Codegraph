@@ -179,7 +179,7 @@ def test_full_ingest_attaches_identity_after_temporary_path_is_relativized(
     assert parsed.file_path == str(source_file)
 
     (identified,) = _identify_repository_files(
-        [parsed], str(tmp_path), repository=REPOSITORY
+        [parsed], tmp_path, repository=REPOSITORY
     )
 
     assert identified.file_path == "src/payments.py"

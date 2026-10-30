@@ -8,9 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from app.db import close_neo4j_driver
+from app.db import close_neo4j_driver, get_neo4j_driver
 from app.db.graph_ops import save_parsed_ast_to_neo4j
-from app.db.neo4j_client import driver
 from app.services.parser_service import (
     identify_parsed_source,
     parse_changed_files,
@@ -41,16 +40,11 @@ def discover_python_files(repo_path: str) -> list[str]:
     return files_to_parse
 
 
-def verify_ingestion() -> list[dict[str, Any]]:
+async def verify_ingestion() -> list[dict[str, Any]]:
     """Query Neo4j node counts by label and return JSON-like records."""
-    if driver is None:
-        raise RuntimeError(
-            "Neo4j is unavailable. Check NEO4J_URI, NEO4J_USER, and "
-            "NEO4J_PASSWORD before running ingestion."
-        )
-
-    with driver.session() as session:
-        return session.run(NODE_COUNT_QUERY).data()
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(NODE_COUNT_QUERY)
+        return await result.data()
 
 
 async def ingest_repository() -> None:
@@ -94,7 +88,7 @@ async def ingest_repository() -> None:
     )
     print(f"Persisted AST data for {len(identified_files)} files")
 
-    counts = await asyncio.to_thread(verify_ingestion)
+    counts = await verify_ingestion()
     print("Neo4j node counts:")
     for record in counts:
         print(f"  {record['type']}: {record['count']}")
@@ -109,8 +103,6 @@ async def main() -> int:
         return 1
     finally:
         await close_neo4j_driver()
-        if driver is not None:
-            driver.close()
 
     return 0
 

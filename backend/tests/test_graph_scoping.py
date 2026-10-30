@@ -25,6 +25,7 @@ from app.db.graph_ops import (
     MERGE_REPOSITORY_TOKENS_QUERY,
     chunk_data,
     save_parsed_ast_to_neo4j,
+    save_parsed_ast_to_neo4j_with_progress,
 )
 from app.services.parser_service import (
     CodeParser,
@@ -32,6 +33,7 @@ from app.services.parser_service import (
     IdentifiedFunction,
     identify_parsed_source,
 )
+from app.utils import ingestion_progress
 from app.utils.entity_identity import generate_function_entity_id
 
 
@@ -555,3 +557,73 @@ def test_incremental_write_keeps_repository_token_baseline() -> None:
     assert MERGE_REPOSITORY_TOKENS_QUERY not in [
         call.args[0] for call in transaction.run.await_args_list
     ]
+
+
+def _progress_values(driver, parsed_data, **kwargs) -> list[int]:
+    async def collect() -> list[int]:
+        return [
+            update.progress
+            async for update in save_parsed_ast_to_neo4j_with_progress(
+                parsed_data, REPO, **kwargs
+            )
+        ]
+
+    with (
+        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
+        patch(
+            "app.db.graph_ops.generate_embeddings",
+            side_effect=_fake_embeddings,
+        ),
+        patch("app.db.graph_ops.run_leiden_clustering", new=AsyncMock()),
+        patch("app.db.graph_ops.label_and_store_communities", new=AsyncMock()),
+    ):
+        return asyncio.run(collect())
+
+
+def test_database_progress_fills_its_stages_on_the_ingestion_scale() -> None:
+    driver, _, _ = _mock_driver()
+    parsed_data = [
+        _parse(
+            "src/app.py",
+            "def first():\n    second()\n    remote()\n\n"
+            "def second():\n    pass\n",
+        )
+    ]
+
+    progress = _progress_values(driver, parsed_data, batch_size=1)
+
+    assert progress == [86, 90, 91, 93, 94, 95, 96, 97, 98, 99]
+    assert progress[0] > ingestion_progress.DATABASE_STARTED
+    assert progress[-1] < ingestion_progress.COMPLETE
+
+
+def test_database_progress_skips_empty_passes_without_dividing_by_zero() -> None:
+    driver, _, _ = _mock_driver()
+
+    progress = _progress_values(driver, [_identified_file("src/empty.py")])
+
+    assert progress == [86, 90, 94, 97, 98, 99]
+
+
+def test_ingestion_progress_stages_are_ordered() -> None:
+    stage_bounds = [
+        ingestion_progress.DOWNLOAD_STARTED,
+        ingestion_progress.DOWNLOADED,
+        ingestion_progress.PARSING.start,
+        ingestion_progress.PARSING.end,
+        ingestion_progress.DATABASE_STARTED,
+        ingestion_progress.FILES_STARTED,
+        ingestion_progress.FUNCTIONS.start,
+        ingestion_progress.FUNCTIONS.end,
+        ingestion_progress.DEPENDENCIES.start,
+        ingestion_progress.DEPENDENCIES.end,
+        ingestion_progress.COMMUNITY_DETECTION_STARTED,
+        ingestion_progress.COMMUNITY_LABELING_STARTED,
+        ingestion_progress.COMMITTING,
+        ingestion_progress.COMPLETE,
+    ]
+
+    assert stage_bounds == sorted(stage_bounds)
+    assert stage_bounds[-1] == 100
+    assert ingestion_progress.PARSING.at(1, 3) == 40
+    assert ingestion_progress.PARSING.at(0, 0) == ingestion_progress.PARSING.end

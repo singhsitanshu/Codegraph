@@ -4,6 +4,8 @@ import asyncio
 import io
 import tempfile
 import zipfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
@@ -19,11 +21,6 @@ GITHUB_HEADERS = {
     "User-Agent": "code-knowledge-graph-agent",
     "X-GitHub-Api-Version": "2022-11-28",
 }
-
-# ``download_and_extract_repo`` returns a string as required by the service
-# boundary, so retain ownership of each TemporaryDirectory until the API's
-# finally block explicitly releases it with ``cleanup_downloaded_repo``.
-_temporary_repositories: dict[str, tempfile.TemporaryDirectory[str]] = {}
 
 
 def _github_headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
@@ -56,23 +53,23 @@ def _extract_zip_safely(archive_bytes: bytes, destination: Path) -> Path:
     return roots[0]
 
 
+@asynccontextmanager
 async def download_and_extract_repo(
     repo_owner: str,
     repo_name: str,
-) -> str:
-    """Download and extract a GitHub repository into temporary storage.
+) -> AsyncIterator[Path]:
+    """Download and extract a GitHub repository for the duration of a block.
 
-    The returned extracted-root path remains valid until
-    :func:`cleanup_downloaded_repo` is called. Callers should always release it
-    in a ``finally`` block. Omitting a Git reference from GitHub's zipball URL
-    makes GitHub serve the repository's configured default branch.
+    Yields the extracted root. The temporary storage behind it is deleted when
+    the ``async with`` block exits, whether it completes or raises. Omitting a
+    Git reference from GitHub's zipball URL makes GitHub serve the repository's
+    configured default branch.
     """
 
     encoded_owner = quote(repo_owner, safe="")
     encoded_repo = quote(repo_name, safe="")
-    temporary_directory = tempfile.TemporaryDirectory(prefix="github-repo-")
 
-    try:
+    with tempfile.TemporaryDirectory(prefix="github-repo-") as temporary_directory:
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(60.0),
@@ -85,25 +82,11 @@ async def download_and_extract_repo(
             response = await client.get(archive_url)
             response.raise_for_status()
 
-        extracted_root = await asyncio.to_thread(
+        yield await asyncio.to_thread(
             _extract_zip_safely,
             response.content,
-            Path(temporary_directory.name),
+            Path(temporary_directory),
         )
-        extracted_root_path = str(extracted_root)
-        _temporary_repositories[extracted_root_path] = temporary_directory
-        return extracted_root_path
-    except Exception:
-        temporary_directory.cleanup()
-        raise
-
-
-def cleanup_downloaded_repo(extracted_root: str) -> None:
-    """Delete temporary storage previously returned by the download service."""
-
-    temporary_directory = _temporary_repositories.pop(extracted_root, None)
-    if temporary_directory is not None:
-        temporary_directory.cleanup()
 
 
 async def fetch_raw_file_content(

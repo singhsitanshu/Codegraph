@@ -9,14 +9,16 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from neo4j import Driver
 
 from app.agent.graph import (
     CodeAgentAnswer,
     GraphRagMetrics,
-    query_graph_blast_radius,
+    build_repository_tools,
 )
-from app.db import close_neo4j_driver, neo4j_client
+from app.db import close_neo4j_driver
 from app.db.graph_ops import delete_repository_graph, save_parsed_ast_to_neo4j
+from app.db.neo4j_client import initialize_database
 from app.main import app
 from app.services.parser_service import (
     CodeParser,
@@ -73,27 +75,21 @@ DETACH DELETE function
 """
 
 
-def _cleanup_test_nodes() -> None:
+def _cleanup_test_nodes(driver: Driver) -> None:
     """Delete mock graph data so every database test is isolated."""
-    if neo4j_client.driver is None:
-        neo4j_client.driver = neo4j_client._initialize_driver()
-    if neo4j_client.driver is None:
-        pytest.skip("Neo4j is unavailable; integration tests require a live database")
-
-    with neo4j_client.driver.session() as session:
+    with driver.session() as session:
         session.run(TEST_NODE_CLEANUP_QUERY).consume()
         session.run(ORPHAN_EXTERNAL_CLEANUP_QUERY).consume()
 
 
 @pytest.fixture
-def db_cleanup() -> Iterator[None]:
+def db_cleanup(live_neo4j: Driver) -> Iterator[Driver]:
     """Clean test nodes before and after each Neo4j integration test."""
-    _cleanup_test_nodes()
+    _cleanup_test_nodes(live_neo4j)
     try:
-        yield
+        yield live_neo4j
     finally:
-        _cleanup_test_nodes()
-        neo4j_client.close_driver()
+        _cleanup_test_nodes(live_neo4j)
 
 
 def _save_mock_ast() -> None:
@@ -118,12 +114,11 @@ def _save_mock_ast() -> None:
         asyncio.run(save())
 
 
-def test_neo4j_ast_write(db_cleanup: None) -> None:
+def test_neo4j_ast_write(db_cleanup: Driver) -> None:
     """Persist mock AST data through explicit transactions and verify the graph."""
     _save_mock_ast()
-    assert neo4j_client.driver is not None
 
-    with neo4j_client.driver.session() as session:
+    with db_cleanup.session() as session:
         file_count = session.run(
             "MATCH (file:File {path: $path, repo_name: $repo_name}) "
             "RETURN count(file) AS count",
@@ -173,7 +168,7 @@ def test_neo4j_ast_write(db_cleanup: None) -> None:
     assert stored_source == MOCK_FUNC_A_SOURCE
 
 
-def test_api_graph_endpoint(db_cleanup: None) -> None:
+def test_api_graph_endpoint(db_cleanup: Driver) -> None:
     """Expose persisted mock AST data in the React Flow graph response."""
     _save_mock_ast()
     with patch("app.main.delete_all_repository_graphs", new=AsyncMock()):
@@ -210,7 +205,7 @@ def test_api_graph_endpoint(db_cleanup: None) -> None:
 
 
 def test_delete_repository_graph_removes_only_scoped_nodes(
-    db_cleanup: None,
+    db_cleanup: Driver,
 ) -> None:
     """Delete the live test repository graph without touching other scopes."""
 
@@ -223,8 +218,7 @@ def test_delete_repository_graph_removes_only_scoped_nodes(
             await close_neo4j_driver()
 
     asyncio.run(delete())
-    assert neo4j_client.driver is not None
-    with neo4j_client.driver.session() as session:
+    with db_cleanup.session() as session:
         remaining_nodes = session.run(
             "MATCH (node {repo_name: $repo_name}) RETURN count(node) AS count",
             repo_name=TEST_REPO_NAME,
@@ -386,7 +380,7 @@ def test_api_chat_rejects_unscoped_frontend_payload() -> None:
 
 
 def test_blast_radius_does_not_cross_repository_boundaries(
-    db_cleanup: None,
+    db_cleanup: Driver,
 ) -> None:
     """Return callers from repository A without leaking repository B."""
 
@@ -409,17 +403,19 @@ def test_blast_radius_does_not_cross_repository_boundaries(
                 TEST_REPO_NAME,
                 replace_existing=True,
             )
-            result_a = await query_graph_blast_radius.ainvoke(
-                {
-                    "repo_name": TEST_REPO_NAME,
-                    "function_name": "shared_target",
-                }
+            blast_radius_a, blast_radius_b = (
+                next(
+                    graph_tool
+                    for graph_tool in build_repository_tools(repo_name)
+                    if graph_tool.name == "query_graph_blast_radius"
+                )
+                for repo_name in (TEST_REPO_NAME, OTHER_TEST_REPO_NAME)
             )
-            result_b = await query_graph_blast_radius.ainvoke(
-                {
-                    "repo_name": OTHER_TEST_REPO_NAME,
-                    "function_name": "shared_target",
-                }
+            result_a = await blast_radius_a.ainvoke(
+                {"function_name": "shared_target"}
+            )
+            result_b = await blast_radius_b.ainvoke(
+                {"function_name": "shared_target"}
             )
             return json.loads(result_a), json.loads(result_b)
         finally:
@@ -452,23 +448,24 @@ def test_blast_radius_does_not_cross_repository_boundaries(
     assert "caller_from_a" not in caller_names_b
 
 
-def test_initialize_database_creates_function_identity_constraint() -> None:
+def test_initialize_database_creates_function_identity_constraint(
+    live_neo4j: Driver,
+) -> None:
     """The entity_id uniqueness constraint is accepted by the live database."""
 
-    if neo4j_client.driver is None:
-        neo4j_client.driver = neo4j_client._initialize_driver()
-    if neo4j_client.driver is None:
-        pytest.skip("Neo4j is unavailable; integration tests require a live database")
+    async def initialize() -> None:
+        try:
+            await initialize_database()
+        finally:
+            await close_neo4j_driver()
 
-    with patch.object(neo4j_client, "_database_initialized", False):
-        neo4j_client.initialize_database()
-    with neo4j_client.driver.session() as session:
+    asyncio.run(initialize())
+    with live_neo4j.session() as session:
         constraint = session.run(
             "SHOW CONSTRAINTS YIELD name, type, labelsOrTypes, properties "
             "WHERE name = 'function_entity_id' "
             "RETURN type, labelsOrTypes, properties"
         ).single()
-    neo4j_client.close_driver()
 
     assert constraint is not None
     assert constraint["labelsOrTypes"] == ["Function"]
@@ -476,7 +473,7 @@ def test_initialize_database_creates_function_identity_constraint() -> None:
 
 
 def test_incremental_update_keeps_identity_and_incoming_edges(
-    db_cleanup: None,
+    db_cleanup: Driver,
 ) -> None:
     """A body edit keeps the node; removed definitions and files disappear."""
 
@@ -520,8 +517,7 @@ def test_incremental_update_keeps_identity_and_incoming_edges(
     ):
         asyncio.run(save())
 
-    assert neo4j_client.driver is not None
-    with neo4j_client.driver.session() as session:
+    with db_cleanup.session() as session:
         functions = session.run(
             "MATCH (function:Function {repo_name: $repo_name}) "
             "RETURN function.qualified_name AS name, "

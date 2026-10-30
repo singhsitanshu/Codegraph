@@ -1,11 +1,9 @@
-"""Synchronous Neo4j client used for startup index initialization."""
+"""Neo4j schema setup, run once by the application lifespan."""
 
 import logging
-from threading import Lock
 
-from neo4j import Driver, GraphDatabase
-
-from app.config import settings
+from app.db import get_neo4j_driver
+from app.utils.embeddings import EMBEDDING_DIMENSIONS, FUNCTION_EMBEDDING_INDEX
 
 
 logger = logging.getLogger(__name__)
@@ -27,84 +25,26 @@ DATABASE_INDEX_QUERIES = (
     "FOR (c:Community) ON (c.repo_name, c.community_id)",
     "CREATE INDEX func_repo_community IF NOT EXISTS "
     "FOR (fn:Function) ON (fn.repo_name, fn.leiden_community)",
-    "CREATE VECTOR INDEX `function_embeddings` IF NOT EXISTS "
+    f"CREATE VECTOR INDEX `{FUNCTION_EMBEDDING_INDEX}` IF NOT EXISTS "
     "FOR (fn:Function) ON (fn.embedding) "
     "OPTIONS {indexConfig: {"
-    "`vector.dimensions`: 1536, "
+    f"`vector.dimensions`: {EMBEDDING_DIMENSIONS}, "
     "`vector.similarity_function`: 'cosine'"
     "}}",
 )
 AWAIT_INDEXES_QUERY = "CALL db.awaitIndexes(300)"
-_database_initialized = False
-_database_initialization_lock = Lock()
 
 
-def _initialize_driver() -> Driver | None:
-    """Create a driver and verify that the configured database is reachable."""
+async def initialize_database() -> None:
+    """Create and await the indexes required by repository-scoped merges.
 
-    candidate: Driver | None = None
-    try:
-        candidate = GraphDatabase.driver(
-            settings.NEO4J_URI,
-            auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
-            connection_timeout=5.0,
-            connection_acquisition_timeout=5.0,
-        )
-        candidate.verify_connectivity()
-    except Exception as exc:
-        logger.error(
-            "Failed to connect to Neo4j at %s: %s", settings.NEO4J_URI, exc
-        )
-        if candidate is not None:
-            candidate.close()
-        return None
-
-    logger.info("Successfully connected to Neo4j at %s", settings.NEO4J_URI)
-    return candidate
-
-
-driver: Driver | None = _initialize_driver()
-
-
-def _require_driver() -> Driver:
-    """Return the global driver, retrying a failed import-time connection.
-
-    Raises:
-        RuntimeError: If Neo4j remains unreachable or rejects authentication.
+    Every statement is idempotent, so a repeated startup leaves the schema as
+    it is. An unreachable or misconfigured Neo4j raises here and fails startup.
     """
 
-    global driver
-    if driver is None:
-        driver = _initialize_driver()
-    if driver is None:
-        raise RuntimeError("Neo4j driver is not initialized")
-    return driver
+    async with get_neo4j_driver().session() as session:
+        for query in (*DATABASE_INDEX_QUERIES, AWAIT_INDEXES_QUERY):
+            result = await session.run(query)
+            await result.consume()
 
-
-def initialize_database() -> None:
-    """Create and await the indexes required by repository-scoped merges."""
-
-    global _database_initialized
-    if _database_initialized:
-        return
-
-    with _database_initialization_lock:
-        if _database_initialized:
-            return
-
-        with _require_driver().session() as session:
-            for query in DATABASE_INDEX_QUERIES:
-                session.run(query).consume()
-            session.run(AWAIT_INDEXES_QUERY).consume()
-
-        _database_initialized = True
-        logger.info("Neo4j repository indexes are online")
-
-
-def close_driver() -> None:
-    """Close the global synchronous driver during application shutdown."""
-
-    global driver
-    if driver is not None:
-        driver.close()
-        driver = None
+    logger.info("Neo4j repository indexes are online")

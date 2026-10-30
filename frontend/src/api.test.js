@@ -10,6 +10,7 @@ import {
   repositoryUrlFromInput,
   requestChat,
 } from "./api.js";
+import { DEFAULT_API_BASE, resolveApiBase } from "./apiBase.js";
 
 function jsonResponse(payload, status = 200) {
   return {
@@ -193,4 +194,13 @@ test("chat is blocked locally without an ingested repository", async () => {
     /Ingest a repository/,
   );
   assert.equal(called, false);
+});
+
+test("API base defaults to the local backend and accepts VITE_API_BASE", () => {
+  assert.equal(resolveApiBase(undefined), DEFAULT_API_BASE);
+  assert.equal(resolveApiBase({ VITE_API_BASE: "  " }), DEFAULT_API_BASE);
+  assert.equal(
+    resolveApiBase({ VITE_API_BASE: " https://api.example.test/ " }),
+    "https://api.example.test",
+  );
 });
