@@ -193,23 +193,6 @@ class CodeParser:
     """
 
     _SUPPORTED_EXTENSIONS = frozenset(SUPPORTED_EXTENSIONS)
-    PYTHON_FUNCTION_DEFINITIONS_QUERY = PYTHON_FUNCTION_DEFINITIONS_QUERY
-    PYTHON_FUNCTION_CALLS_QUERY = PYTHON_FUNCTION_CALLS_QUERY
-    PYTHON_CLASS_DEFINITIONS_QUERY = PYTHON_CLASS_DEFINITIONS_QUERY
-    JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY = (
-        JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY
-    )
-    JAVASCRIPT_FUNCTION_CALLS_QUERY = JAVASCRIPT_FUNCTION_CALLS_QUERY
-    JAVASCRIPT_CLASS_DEFINITIONS_QUERY = JAVASCRIPT_CLASS_DEFINITIONS_QUERY
-    TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY = TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY
-    TYPESCRIPT_FUNCTION_CALLS_QUERY = TYPESCRIPT_FUNCTION_CALLS_QUERY
-    TYPESCRIPT_CLASS_DEFINITIONS_QUERY = TYPESCRIPT_CLASS_DEFINITIONS_QUERY
-    GO_FUNCTION_DEFINITIONS_QUERY = GO_FUNCTION_DEFINITIONS_QUERY
-    GO_FUNCTION_CALLS_QUERY = GO_FUNCTION_CALLS_QUERY
-    GO_CLASS_DEFINITIONS_QUERY = GO_CLASS_DEFINITIONS_QUERY
-    JAVA_FUNCTION_DEFINITIONS_QUERY = JAVA_FUNCTION_DEFINITIONS_QUERY
-    JAVA_FUNCTION_CALLS_QUERY = JAVA_FUNCTION_CALLS_QUERY
-    JAVA_CLASS_DEFINITIONS_QUERY = JAVA_CLASS_DEFINITIONS_QUERY
 
     def __init__(self) -> None:
         """Initialize parsers and compile extraction queries for all grammars."""
@@ -232,20 +215,15 @@ class CodeParser:
             ".go": go_language,
             ".java": java_language,
         }
-        self.python_parser = Parser(python_language)
-        self.javascript_parser = Parser(javascript_language)
-        self.typescript_parser = Parser(typescript_language)
-        self.tsx_parser = Parser(tsx_language)
-        self.go_parser = Parser(go_language)
-        self.java_parser = Parser(java_language)
+        javascript_parser = Parser(javascript_language)
         self._parsers: dict[str, Parser] = {
-            ".py": self.python_parser,
-            ".js": self.javascript_parser,
-            ".jsx": self.javascript_parser,
-            ".ts": self.typescript_parser,
-            ".tsx": self.tsx_parser,
-            ".go": self.go_parser,
-            ".java": self.java_parser,
+            ".py": Parser(python_language),
+            ".js": javascript_parser,
+            ".jsx": javascript_parser,
+            ".ts": Parser(typescript_language),
+            ".tsx": Parser(tsx_language),
+            ".go": Parser(go_language),
+            ".java": Parser(java_language),
         }
         language_locks = {
             language_name: asyncio.Lock()
@@ -343,18 +321,6 @@ class CodeParser:
                 f"Supported extensions: {supported}"
             )
         return normalized
-
-    def get_parser(self, file_extension: str) -> Parser:
-        """Return the initialized parser for any supported source extension.
-
-        Args:
-            file_extension: File suffix, with or without a leading period.
-
-        Raises:
-            ValueError: If the extension is not supported.
-        """
-
-        return self._parsers[self._normalize_extension(file_extension)]
 
     @staticmethod
     def _capture_text(
@@ -611,8 +577,7 @@ class CodeParser:
     ) -> dict[str, Any]:
         """Synchronously parse and query source code in a worker thread."""
 
-        parser = self.get_parser(extension)
-        tree = parser.parse(source_code)
+        tree = self._parsers[extension].parse(source_code)
         root_node = tree.root_node
         queries = self._queries[extension]
 

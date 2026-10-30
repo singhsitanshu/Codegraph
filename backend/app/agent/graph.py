@@ -423,13 +423,6 @@ async def _run_code_agent(
     return response, messages
 
 
-async def ask_code_agent(user_message: str, repo_name: str) -> str:
-    """Ask the code-graph agent a repository-scoped code question."""
-
-    response, _ = await _run_code_agent(user_message, repo_name)
-    return response
-
-
 async def ask_code_agent_with_metrics(
     user_message: str,
     repo_name: str,

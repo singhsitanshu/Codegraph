@@ -1,10 +1,9 @@
-"""Synchronous Neo4j client and FastAPI session dependency."""
+"""Synchronous Neo4j client used for startup index initialization."""
 
 import logging
-from collections.abc import Generator
 from threading import Lock
 
-from neo4j import Driver, GraphDatabase, Session
+from neo4j import Driver, GraphDatabase
 
 from app.config import settings
 
@@ -100,23 +99,6 @@ def initialize_database() -> None:
 
         _database_initialized = True
         logger.info("Neo4j repository indexes are online")
-
-
-def get_db_session() -> Generator[Session, None, None]:
-    """Yield a Neo4j session for FastAPI and close it after the request.
-
-    A failed import-time connection is retried when the dependency is first
-    requested, allowing the API and Neo4j containers to start concurrently.
-
-    Raises:
-        RuntimeError: If Neo4j remains unreachable or rejects authentication.
-    """
-
-    session = _require_driver().session()
-    try:
-        yield session
-    finally:
-        session.close()
 
 
 def close_driver() -> None:
