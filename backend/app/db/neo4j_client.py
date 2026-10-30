@@ -1,22 +1,15 @@
 """Synchronous Neo4j client and FastAPI session dependency."""
 
 import logging
-import os
 from collections.abc import Generator
-from pathlib import Path
 from threading import Lock
 
-from dotenv import load_dotenv
 from neo4j import Driver, GraphDatabase, Session
+
+from app.config import settings
 
 
 logger = logging.getLogger(__name__)
-BACKEND_DIR = Path(__file__).resolve().parents[2]
-load_dotenv(BACKEND_DIR / ".env", override=False)
-
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 DATABASE_INDEX_QUERIES = (
     # CG-002A entity IDs hash the repository name, so they are globally unique.
     "CREATE CONSTRAINT function_entity_id IF NOT EXISTS "
@@ -53,41 +46,54 @@ def _initialize_driver() -> Driver | None:
     candidate: Driver | None = None
     try:
         candidate = GraphDatabase.driver(
-            NEO4J_URI,
-            auth=(NEO4J_USER, NEO4J_PASSWORD),
+            settings.NEO4J_URI,
+            auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
             connection_timeout=5.0,
             connection_acquisition_timeout=5.0,
         )
         candidate.verify_connectivity()
     except Exception as exc:
-        logger.error("Failed to connect to Neo4j at %s: %s", NEO4J_URI, exc)
+        logger.error(
+            "Failed to connect to Neo4j at %s: %s", settings.NEO4J_URI, exc
+        )
         if candidate is not None:
             candidate.close()
         return None
 
-    logger.info("Successfully connected to Neo4j at %s", NEO4J_URI)
+    logger.info("Successfully connected to Neo4j at %s", settings.NEO4J_URI)
     return candidate
 
 
 driver: Driver | None = _initialize_driver()
 
 
+def _require_driver() -> Driver:
+    """Return the global driver, retrying a failed import-time connection.
+
+    Raises:
+        RuntimeError: If Neo4j remains unreachable or rejects authentication.
+    """
+
+    global driver
+    if driver is None:
+        driver = _initialize_driver()
+    if driver is None:
+        raise RuntimeError("Neo4j driver is not initialized")
+    return driver
+
+
 def initialize_database() -> None:
     """Create and await the indexes required by repository-scoped merges."""
 
-    global driver, _database_initialized
+    global _database_initialized
     if _database_initialized:
         return
 
     with _database_initialization_lock:
         if _database_initialized:
             return
-        if driver is None:
-            driver = _initialize_driver()
-        if driver is None:
-            raise RuntimeError("Neo4j driver is not initialized")
 
-        with driver.session() as session:
+        with _require_driver().session() as session:
             for query in DATABASE_INDEX_QUERIES:
                 session.run(query).consume()
             session.run(AWAIT_INDEXES_QUERY).consume()
@@ -106,13 +112,7 @@ def get_db_session() -> Generator[Session, None, None]:
         RuntimeError: If Neo4j remains unreachable or rejects authentication.
     """
 
-    global driver
-    if driver is None:
-        driver = _initialize_driver()
-    if driver is None:
-        raise RuntimeError("Neo4j driver is not initialized")
-
-    session = driver.session()
+    session = _require_driver().session()
     try:
         yield session
     finally:

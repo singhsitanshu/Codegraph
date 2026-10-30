@@ -991,6 +991,14 @@ function App() {
     const controller = new AbortController();
     abortRef.current = controller;
     let accumulated = "";
+    const showAccumulatedResponse = () =>
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === assistantId
+            ? { ...message, content: accumulated }
+            : message,
+        ),
+      );
 
     try {
       const response = await requestChat(prompt, activeRepo, {
@@ -1000,13 +1008,7 @@ function App() {
       if (contentType.includes("application/json")) {
         const payload = await response.json();
         accumulated = payload.response ?? "";
-        setMessages((current) =>
-          current.map((message) =>
-            message.id === assistantId
-              ? { ...message, content: accumulated }
-              : message,
-          ),
-        );
+        showAccumulatedResponse();
       } else {
         if (!response.body) throw new Error("This browser cannot stream the response");
 
@@ -1031,13 +1033,7 @@ function App() {
               throw new Error(extractSseError(data) || "Streaming failed");
             }
             accumulated += extractSseText(data);
-            setMessages((current) =>
-              current.map((message) =>
-                message.id === assistantId
-                  ? { ...message, content: accumulated }
-                  : message,
-              ),
-            );
+            showAccumulatedResponse();
           }
           if (done) break;
         }
@@ -1050,11 +1046,7 @@ function App() {
         setChatError(message);
         if (!accumulated) accumulated = `Agent request failed: ${message}`;
       }
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === assistantId ? { ...message, content: accumulated } : message,
-        ),
-      );
+      showAccumulatedResponse();
     } finally {
       abortRef.current = null;
       setStreaming(false);

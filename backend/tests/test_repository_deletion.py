@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.db.graph_ops import (
     DELETE_ALL_REPOSITORY_GRAPHS_QUERY,
-    DELETE_REPOSITORY_GRAPH_QUERY,
+    DELETE_REPOSITORY_QUERY,
     delete_all_repository_graphs,
     delete_repository_graph,
 )
@@ -34,7 +34,7 @@ def test_delete_repository_graph_uses_scoped_detach_delete() -> None:
         asyncio.run(delete_repository_graph(" owner/repository "))
 
     transaction.run.assert_awaited_once_with(
-        DELETE_REPOSITORY_GRAPH_QUERY,
+        DELETE_REPOSITORY_QUERY,
         repo_name="owner/repository",
     )
     transaction.run.return_value.consume.assert_awaited_once_with()

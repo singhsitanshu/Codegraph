@@ -114,8 +114,8 @@ def _serialize_node(
         )
     )
     file_path = properties.get("file_path") or properties.get("path")
-    data = {
-        **properties,
+    # The same fields appear at the top level and override ``data`` properties.
+    fields = {
         "id": node_id,
         "label": str(label),
         "labels": labels,
@@ -125,17 +125,7 @@ def _serialize_node(
         "community_description": community_description,
         "file_path": file_path,
     }
-    return {
-        "id": node_id,
-        "label": str(label),
-        "labels": labels,
-        "community": community_id,
-        "community_id": community_id,
-        "community_name": resolved_community_name,
-        "community_description": community_description,
-        "file_path": file_path,
-        "data": data,
-    }
+    return {**fields, "data": {**properties, **fields}}
 
 
 def _serialize_relationship(relationship: Relationship) -> dict[str, Any]:
@@ -146,20 +136,15 @@ def _serialize_relationship(relationship: Relationship) -> dict[str, Any]:
     target = relationship.end_node.element_id
     relationship_type = relationship.type
     properties = _json_value(dict(relationship))
-    data = {
-        **properties,
+    fields = {
         "id": edge_id,
         "source": source,
         "target": target,
         "label": relationship_type,
-        "type": relationship_type,
     }
     return {
-        "id": edge_id,
-        "source": source,
-        "target": target,
-        "label": relationship_type,
-        "data": data,
+        **fields,
+        "data": {**properties, **fields, "type": relationship_type},
     }
 
 

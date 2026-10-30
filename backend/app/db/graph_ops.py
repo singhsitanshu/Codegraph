@@ -42,11 +42,6 @@ WHERE (node:Repository OR node:File OR node:Function OR node:ExternalFunction
 DETACH DELETE node
 """
 
-DELETE_REPOSITORY_GRAPH_QUERY = """
-MATCH (n {repo_name: $repo_name})
-DETACH DELETE n
-"""
-
 DELETE_ALL_REPOSITORY_GRAPHS_QUERY = """
 MATCH (n)
 WHERE n.repo_name IS NOT NULL
@@ -682,7 +677,7 @@ async def delete_repository_graph(repo_name: str) -> None:
 
     async def delete(transaction: Any) -> None:
         result = await transaction.run(
-            DELETE_REPOSITORY_GRAPH_QUERY,
+            DELETE_REPOSITORY_QUERY,
             repo_name=normalized_repo_name,
         )
         await result.consume()

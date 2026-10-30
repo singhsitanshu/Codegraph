@@ -107,6 +107,20 @@ modules with a title, description, and function count. Use those stored labels
 to present a high-level architectural summary."""
 
 
+async def _read_records(query: str, **parameters: Any) -> list[dict[str, Any]]:
+    """Run one read query in a fresh session and return its records."""
+
+    async with get_neo4j_driver().session() as session:
+        result = await session.run(query, **parameters)
+        return await result.data()
+
+
+def _string_values(records: list[dict[str, Any]], key: str) -> list[str]:
+    """Return the string values of one column, skipping missing entries."""
+
+    return [record[key] for record in records if isinstance(record.get(key), str)]
+
+
 @tool
 async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
     """Find direct callers of a function within one ``owner/repository`` graph."""
@@ -123,13 +137,11 @@ async def query_graph_blast_radius(repo_name: str, function_name: str) -> str:
             }
         )
 
-    async with get_neo4j_driver().session() as session:
-        result = await session.run(
-            CALLERS_QUERY,
-            repo_name=normalized_repo_name,
-            func_name=normalized_name,
-        )
-        records = await result.data()
+    records = await _read_records(
+        CALLERS_QUERY,
+        repo_name=normalized_repo_name,
+        func_name=normalized_name,
+    )
 
     return json.dumps(
         {
@@ -152,18 +164,12 @@ async def list_codebase_structure(repo_name: str) -> str:
     if not normalized_repo_name:
         return ""
 
-    async with get_neo4j_driver().session() as session:
-        result = await session.run(
-            CODEBASE_STRUCTURE_QUERY,
-            repo_name=normalized_repo_name,
-        )
-        records = await result.data()
-
-    return "\n".join(
-        record["file_path"]
-        for record in records
-        if isinstance(record.get("file_path"), str)
+    records = await _read_records(
+        CODEBASE_STRUCTURE_QUERY,
+        repo_name=normalized_repo_name,
     )
+
+    return "\n".join(_string_values(records, "file_path"))
 
 
 @tool
@@ -175,19 +181,13 @@ async def list_functions_in_file(repo_name: str, file_path: str) -> str:
     if not normalized_repo_name or not normalized_file_path:
         return "No functions found."
 
-    async with get_neo4j_driver().session() as session:
-        result = await session.run(
-            FUNCTIONS_IN_FILE_QUERY,
-            repo_name=normalized_repo_name,
-            file_path=normalized_file_path,
-        )
-        records = await result.data()
+    records = await _read_records(
+        FUNCTIONS_IN_FILE_QUERY,
+        repo_name=normalized_repo_name,
+        file_path=normalized_file_path,
+    )
 
-    function_names = [
-        record["function_name"]
-        for record in records
-        if isinstance(record.get("function_name"), str)
-    ]
+    function_names = _string_values(records, "function_name")
     if not function_names:
         return f"No functions found in {normalized_file_path}."
     return "\n".join(
@@ -210,13 +210,11 @@ async def query_outgoing_dependencies(
     if not normalized_repo_name or not normalized_function_name:
         return "No outgoing dependencies found."
 
-    async with get_neo4j_driver().session() as session:
-        result = await session.run(
-            OUTGOING_DEPENDENCIES_QUERY,
-            repo_name=normalized_repo_name,
-            func_name=normalized_function_name,
-        )
-        records = await result.data()
+    records = await _read_records(
+        OUTGOING_DEPENDENCIES_QUERY,
+        repo_name=normalized_repo_name,
+        func_name=normalized_function_name,
+    )
 
     dependencies_by_caller: dict[tuple[object, object], list[str]] = {}
     for record in records:
@@ -261,18 +259,12 @@ async def list_external_dependencies(repo_name: str) -> str:
     if not normalized_repo_name:
         return "No external dependencies found."
 
-    async with get_neo4j_driver().session() as session:
-        result = await session.run(
-            EXTERNAL_DEPENDENCIES_QUERY,
-            repo_name=normalized_repo_name,
-        )
-        records = await result.data()
+    records = await _read_records(
+        EXTERNAL_DEPENDENCIES_QUERY,
+        repo_name=normalized_repo_name,
+    )
 
-    function_names = [
-        record["function_name"]
-        for record in records
-        if isinstance(record.get("function_name"), str)
-    ]
+    function_names = _string_values(records, "function_name")
     if not function_names:
         return "No external dependencies found."
     return "\n".join(
@@ -298,14 +290,12 @@ async def semantic_code_search(
 
     normalized_top_k = max(1, min(top_k, 20))
     query_vector = await generate_embedding(normalized_query)
-    async with get_neo4j_driver().session() as session:
-        result = await session.run(
-            SEMANTIC_CODE_SEARCH_QUERY,
-            query_vector=query_vector,
-            repo_name=normalized_repo_name,
-            top_k=normalized_top_k,
-        )
-        records = await result.data()
+    records = await _read_records(
+        SEMANTIC_CODE_SEARCH_QUERY,
+        query_vector=query_vector,
+        repo_name=normalized_repo_name,
+        top_k=normalized_top_k,
+    )
 
     matches: list[str] = []
     for record in records:
@@ -342,12 +332,10 @@ async def analyze_architectural_subsystems(repo_name: str) -> str:
     if not normalized_repo_name:
         return json.dumps([])
 
-    async with get_neo4j_driver().session() as session:
-        result = await session.run(
-            ARCHITECTURAL_SUBSYSTEMS_QUERY,
-            repo_name=normalized_repo_name,
-        )
-        records = await result.data()
+    records = await _read_records(
+        ARCHITECTURAL_SUBSYSTEMS_QUERY,
+        repo_name=normalized_repo_name,
+    )
 
     return json.dumps(records, default=str)
 

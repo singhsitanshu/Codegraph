@@ -211,7 +211,7 @@ If the container has not finished starting, retry the checks after a few seconds
 
 ### 3. Configure and install the backend
 
-The active backend reads `backend/.env`, not the root `.env` used by older prototype files.
+The backend reads `backend/.env`.
 
 ```bash
 python3 -m venv .venv
@@ -220,7 +220,7 @@ python -m pip install -r backend/requirements.txt
 cp backend/.env.example backend/.env
 ```
 
-`backend/requirements.txt` is the active backend's dependency list; the root `requirements.txt` belongs to earlier prototype code and is not sufficient for the current tests. Use the virtual environment's `python -m pip` and `python -m pytest` so installation and test collection use the same interpreter. The copied example already matches the local Compose credentials and leaves the optional GitHub token blank. Add model-provider keys to `backend/.env` for ingestion and chat:
+`backend/requirements.txt` is the backend's dependency list. Use the virtual environment's `python -m pip` and `python -m pytest` so installation and test collection use the same interpreter. The copied example already matches the local Compose credentials and leaves the optional GitHub token blank. Add model-provider keys to `backend/.env` for ingestion and chat:
 
 ```dotenv
 GITHUB_WEBHOOK_SECRET=replace-with-a-long-random-secret
@@ -234,7 +234,7 @@ ANTHROPIC_API_KEY=replace-with-your-anthropic-key
 OPENAI_API_KEY=replace-with-your-openai-key
 ```
 
-Start FastAPI **from the backend directory** so Python resolves the current `app` package:
+Start FastAPI **from the backend directory** so Python resolves the `app` package:
 
 ```bash
 cd backend
@@ -403,8 +403,6 @@ pnpm build
 
 The Node test suite covers repository input normalization, chunked NDJSON parsing, error propagation, graph/chat scoping, source lookup, explicit and unload cleanup, deterministic community colors, and cluster selection. The production Vite build is also part of the recommended validation pass.
 
-The root-level `tests/` directory exercises the older webhook prototype. Run active-backend tests from `backend/` to avoid importing the legacy root `app` package by mistake.
-
 ## Configuration
 
 The active settings class loads `backend/.env`, is case-insensitive, ignores unknown keys, and provides development defaults.
@@ -419,7 +417,7 @@ The active settings class loads `backend/.env`, is case-insensitive, ignores unk
 | `ANTHROPIC_API_KEY` | Chat | empty | The active model is currently hard-coded to `claude-sonnet-5`. |
 | `OPENAI_API_KEY` | Ingestion and semantic search | empty | Used by `text-embedding-3-small` and `gpt-4o-mini`. |
 
-The older root `.env.example` includes `ANTHROPIC_MODEL` and `NEO4J_DATABASE`, but the active `backend/app` does not read those options. The frontend also hard-codes `http://localhost:8000` as its API base; Vite proxies relative `/api` requests to the same backend during development.
+The frontend hard-codes `http://localhost:8000` as its API base; Vite proxies relative `/api` requests to the same backend during development.
 
 ## Repository structure
 
@@ -432,9 +430,9 @@ Codegraph/
 │   │   ├── db/             # Neo4j serialization, ETL, indexes, and GDS
 │   │   ├── services/       # GitHub, parsing, embedding, labeling, and pipeline code
 │   │   ├── utils/          # Token counting
-│   │   ├── config.py       # Active backend settings
+│   │   ├── config.py       # Backend settings
 │   │   └── main.py         # FastAPI routes and ingestion lifecycle
-│   ├── tests/              # Active backend unit/API/integration tests
+│   ├── tests/              # Backend unit/API/integration tests
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
@@ -444,15 +442,10 @@ Codegraph/
 │   │   └── api.js          # Backend client and NDJSON reader
 │   ├── package.json
 │   └── pnpm-lock.yaml
-├── app/                    # Earlier webhook/API prototype
-├── tests/                  # Tests for the earlier webhook prototype
-├── agent.py                # Earlier single-tool LangGraph prototype
-├── database.py             # Earlier Neo4j wrapper
-├── parse_python.py         # Earlier single-file Python parser CLI
 └── docker-compose.yml      # Local Neo4j + GDS service
 ```
 
-The `backend/` and `frontend/` directories form the current full application. Root-level Python modules remain useful as development history and focused prototypes, but their endpoints, environment file, and behavior differ from the active backend.
+The `backend/` and `frontend/` directories form the full application.
 
 ## Security and data handling
 
