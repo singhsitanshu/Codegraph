@@ -8,20 +8,20 @@ import pytest
 
 from tree_sitter import Language
 
-from app.services.batch_parsing import (
+from app.parsing.batch_parsing import (
     parse_changed_files,
     parse_changed_files_with_progress,
 )
-from app.services.languages import LANGUAGES, SUPPORTED_EXTENSIONS, LanguageSpec
-from app.services.parse_results import ParsedSource
-from app.services.parser_service import CodeParser
+from app.parsing.languages import LANGUAGES, SUPPORTED_EXTENSIONS, LanguageSpec
+from app.parsing.parse_results import ParsedSource
+from app.parsing.parser import CodeParser
 
 
 @pytest.fixture(autouse=True)
 def deterministic_token_counter():
     """Keep parser tests offline while verifying token totals are propagated."""
 
-    with patch("app.services.batch_parsing.count_tokens", return_value=17):
+    with patch("app.parsing.batch_parsing.count_tokens", return_value=17):
         yield
 
 

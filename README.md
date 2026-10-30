@@ -100,7 +100,7 @@ This diagram represents the streamed request lifecycle; the backend does not per
 
 1. **Validate the repository.** `POST /api/ingest-repo` accepts only an HTTPS `github.com` repository URL. The UI also accepts `owner/repository` shorthand and converts it to that URL form.
 2. **Download the default branch.** The backend requests GitHub's repository zipball without a ref, follows redirects, checks every archive member against path traversal, and extracts into a managed temporary directory.
-3. **Discover source.** Files with an extension registered in [`backend/app/services/languages.py`](backend/app/services/languages.py) (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`, `.go`, and `.java`) are included; supporting another language means adding one `LanguageSpec` there plus its grammar package in `backend/requirements.txt`. `.git`, virtual environments, caches, `build`, `dist`, and `node_modules` directories are skipped, both here and for webhook pushes ([`backend/app/services/source_discovery.py`](backend/app/services/source_discovery.py)).
+3. **Discover source.** Files with an extension registered in [`backend/app/parsing/languages.py`](backend/app/parsing/languages.py) (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`, `.go`, and `.java`) are included; supporting another language means adding one `LanguageSpec` there plus its grammar package in `backend/requirements.txt`. `.git`, virtual environments, caches, `build`, `dist`, and `node_modules` directories are skipped, both here and for webhook pushes ([`backend/app/ingestion/source_discovery.py`](backend/app/ingestion/source_discovery.py)).
 4. **Parse concurrently.** File work is scheduled asynchronously with at most 32 file-read slots. CPU-bound Tree-sitter parsing runs in worker threads; a per-language lock prevents concurrent use of a shared parser instance. Failed files advance progress but are not persisted.
 5. **Create a token baseline.** Every readable discovered source file is counted with tiktoken's `gpt-4o` encoding, including files whose parse later fails. The total is stored on the repository node for context-efficiency reporting.
 6. **Normalize and flatten.** Temporary paths become stable repository-relative paths. Parsed files are flattened into file, function, and call records.
@@ -425,21 +425,30 @@ The frontend reads its API base from `VITE_API_BASE` (see `frontend/.env.example
 Codegraph/
 ├── backend/
 │   ├── app/
-│   │   ├── agent/          # LangGraph tools and agent orchestration
-│   │   ├── api/            # GitHub webhook route and signature dependency
-│   │   ├── db/             # Neo4j driver, queries, writes, indexes, and GDS
-│   │   ├── services/       # Ingestion, call resolution, graph view, GitHub, parsing, embedding, and labeling
-│   │   ├── utils/          # Token counting, progress scale, and shared helpers
+│   │   ├── agent/          # LangGraph tools, agent orchestration, and its graph queries
+│   │   ├── communities/    # Leiden clustering, community storage, and LLM labeling
+│   │   ├── database/       # Shared Neo4j driver and error mapping
+│   │   ├── embeddings/     # Embedding model constants, generation, and local cache
+│   │   ├── graph/          # Neo4j schema, graph writes and reads, dashboard graph view
+│   │   ├── ingestion/      # GitHub download, source discovery, call resolution, graph ingestion, progress
+│   │   ├── parsing/        # Language registry, tree-sitter parser, and function identity
+│   │   ├── repositories/   # Validated GitHub repository names and URLs
+│   │   ├── webhooks/       # GitHub webhook route, signature check, push events, and pipeline
 │   │   ├── config.py       # Backend settings
+│   │   ├── tokens.py       # Token counting shared by ingestion and agent metrics
 │   │   └── main.py         # FastAPI routes and NDJSON ingestion stream
 │   ├── tests/              # Backend unit/API/integration tests
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
-│   │   ├── components/     # Source drawer and community legend
-│   │   ├── utils/          # Community colors and filters
-│   │   ├── App.jsx         # Dashboard and graph interaction
-│   │   └── api.js          # Backend client and NDJSON reader
+│   │   ├── features/
+│   │   │   ├── chat/       # Chat panel, messages, composer, and streamed answers
+│   │   │   ├── code/       # Source drawer
+│   │   │   ├── graph/      # Graph canvas, legend, layout, highlighting, and community colors
+│   │   │   └── repository/ # Repository form and ingestion state
+│   │   ├── shared/         # Backend client, API base resolution, and icons
+│   │   ├── App.jsx         # Dashboard shell wiring the features together
+│   │   └── main.jsx        # React entrypoint
 │   ├── package.json
 │   └── pnpm-lock.yaml
 └── docker-compose.yml      # Local Neo4j + GDS service

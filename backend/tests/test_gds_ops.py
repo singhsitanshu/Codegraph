@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from app.db.gds_ops import (
+from app.communities.clustering import (
     COUNT_REPOSITORY_FUNCTIONS_QUERY,
     DROP_CODEBASE_GRAPH_QUERY,
     PROJECT_CODEBASE_GRAPH_QUERY,
@@ -48,7 +48,7 @@ def test_run_leiden_clustering_projects_writes_and_drops_graph() -> None:
     dropped = _consumable_result()
     driver, session = _mock_driver([count_result, projection, leiden, dropped])
 
-    with patch("app.db.gds_ops.get_neo4j_driver", return_value=driver):
+    with patch("app.communities.clustering.get_neo4j_driver", return_value=driver):
         result = asyncio.run(run_leiden_clustering("owner/repository"))
 
     assert result == {"communityCount": 3, "modularity": 0.42}
@@ -87,7 +87,7 @@ def test_run_leiden_clustering_drops_graph_when_algorithm_fails() -> None:
     driver, session = _mock_driver([count_result, projection, leiden, dropped])
 
     with (
-        patch("app.db.gds_ops.get_neo4j_driver", return_value=driver),
+        patch("app.communities.clustering.get_neo4j_driver", return_value=driver),
         pytest.raises(RuntimeError, match="GDS failed"),
     ):
         asyncio.run(run_leiden_clustering("owner/repository"))
@@ -104,7 +104,7 @@ def test_run_leiden_clustering_drops_graph_when_projection_consume_fails() -> No
     driver, session = _mock_driver([count_result, projection, dropped])
 
     with (
-        patch("app.db.gds_ops.get_neo4j_driver", return_value=driver),
+        patch("app.communities.clustering.get_neo4j_driver", return_value=driver),
         pytest.raises(RuntimeError, match="projection failed"),
     ):
         asyncio.run(run_leiden_clustering("owner/repository"))
@@ -131,7 +131,7 @@ def test_run_leiden_clustering_skips_empty_repository(caplog) -> None:
     count_result = _data_result([{"node_count": 0}])
     driver, session = _mock_driver([count_result])
 
-    with patch("app.db.gds_ops.get_neo4j_driver", return_value=driver):
+    with patch("app.communities.clustering.get_neo4j_driver", return_value=driver):
         result = asyncio.run(run_leiden_clustering("owner/empty"))
 
     assert result == {"communityCount": 0, "modularity": 0.0}
@@ -145,7 +145,7 @@ def test_run_leiden_clustering_skips_empty_repository(caplog) -> None:
 def test_run_leiden_clustering_warns_when_most_functions_are_singletons(
     caplog,
 ) -> None:
-    caplog.set_level(logging.INFO, logger="app.db.gds_ops")
+    caplog.set_level(logging.INFO, logger="app.communities.clustering")
     count_result = _data_result([{"node_count": 10}])
     projection = _consumable_result()
     leiden = _data_result(
@@ -163,7 +163,7 @@ def test_run_leiden_clustering_warns_when_most_functions_are_singletons(
     dropped = _consumable_result()
     driver, _ = _mock_driver([count_result, projection, leiden, dropped])
 
-    with patch("app.db.gds_ops.get_neo4j_driver", return_value=driver):
+    with patch("app.communities.clustering.get_neo4j_driver", return_value=driver):
         asyncio.run(run_leiden_clustering("owner/sparse"))
 
     assert "projectedRelationships=2" in caplog.text

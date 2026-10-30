@@ -5,15 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from app.services.parse_results import IdentifiedFile, ParsedSource
-from app.services.parser_service import CodeParser
-from app.services.source_identity import identify_parsed_source
-from app.services.graph_records import extract_graph_records
-from app.services.repository_ingestion import identify_repository_files
-from app.utils.entity_identity import (
+from app.ingestion.graph_records import extract_graph_records
+from app.ingestion.repository_ingestion import identify_repository_files
+from app.parsing.entity_identity import (
     generate_function_entity_id,
     normalize_repository_path,
 )
+from app.parsing.parse_results import IdentifiedFile, ParsedSource
+from app.parsing.parser import CodeParser
+from app.parsing.source_identity import identify_parsed_source
 
 
 REPOSITORY = "example/backend"

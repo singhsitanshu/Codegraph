@@ -5,11 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.db.code_queries import (
+from app.agent.code_queries import (
     REPOSITORY_TOKEN_QUERY,
     fetch_repository_total_tokens,
 )
-from app.db.graph_ops import (
+from app.graph.queries import GRAPH_QUERY, NODE_CODE_QUERY
+from app.graph.writer import (
     DEFAULT_BATCH_SIZE,
     DELETE_FILES_QUERY,
     DELETE_ORPHAN_EXTERNAL_FUNCTIONS_QUERY,
@@ -23,17 +24,16 @@ from app.db.graph_ops import (
     MERGE_FUNCTIONS_QUERY,
     MERGE_REPOSITORY_TOKENS_QUERY,
 )
-from app.db.graph_queries import GRAPH_QUERY, NODE_CODE_QUERY
-from app.services.graph_ingestion import (
+from app.ingestion import ingestion_progress
+from app.ingestion.batching import chunk_data
+from app.ingestion.graph_ingestion import (
     ingest_identified_files,
     ingest_identified_files_with_progress,
 )
-from app.services.parse_results import IdentifiedFile, IdentifiedFunction
-from app.services.parser_service import CodeParser
-from app.services.source_identity import identify_parsed_source
-from app.utils import ingestion_progress
-from app.utils.batching import chunk_data
-from app.utils.entity_identity import generate_function_entity_id
+from app.parsing.entity_identity import generate_function_entity_id
+from app.parsing.parse_results import IdentifiedFile, IdentifiedFunction
+from app.parsing.parser import CodeParser
+from app.parsing.source_identity import identify_parsed_source
 
 
 REPO = "owner/repository-a"
@@ -113,17 +113,17 @@ def _identified_file(
 
 def _save(driver, parsed_data, repo_name=REPO, **kwargs):
     with (
-        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
+        patch("app.graph.writer.get_neo4j_driver", return_value=driver),
         patch(
-            "app.services.graph_ingestion.generate_embeddings",
+            "app.ingestion.graph_ingestion.generate_embeddings",
             side_effect=_fake_embeddings,
         ) as embed_batch,
         patch(
-            "app.services.graph_ingestion.run_leiden_clustering",
+            "app.ingestion.graph_ingestion.run_leiden_clustering",
             new=AsyncMock(),
         ) as cluster_graph,
         patch(
-            "app.services.graph_ingestion.label_and_store_communities",
+            "app.ingestion.graph_ingestion.label_and_store_communities",
             new=AsyncMock(),
         ) as label_communities,
     ):
@@ -535,7 +535,7 @@ def test_repository_token_baseline_read_is_scoped() -> None:
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.db.code_queries.get_neo4j_driver", return_value=driver):
+    with patch("app.agent.code_queries.get_neo4j_driver", return_value=driver):
         total = asyncio.run(
             fetch_repository_total_tokens("owner/repository")
         )
@@ -568,13 +568,13 @@ def _progress_values(driver, parsed_data, **kwargs) -> list[int]:
         ]
 
     with (
-        patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
+        patch("app.graph.writer.get_neo4j_driver", return_value=driver),
         patch(
-            "app.services.graph_ingestion.generate_embeddings",
+            "app.ingestion.graph_ingestion.generate_embeddings",
             side_effect=_fake_embeddings,
         ),
-        patch("app.services.graph_ingestion.run_leiden_clustering", new=AsyncMock()),
-        patch("app.services.graph_ingestion.label_and_store_communities", new=AsyncMock()),
+        patch("app.ingestion.graph_ingestion.run_leiden_clustering", new=AsyncMock()),
+        patch("app.ingestion.graph_ingestion.label_and_store_communities", new=AsyncMock()),
     ):
         return asyncio.run(collect())
 

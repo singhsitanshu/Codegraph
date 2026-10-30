@@ -11,9 +11,9 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
-from app.services.github_events import PushChangeSet, parse_push_change_set
-from app.services.pipeline import process_push_change_set
-from app.utils.repository import GitHubRepository
+from app.repositories.names import GitHubRepository
+from app.webhooks.github_events import PushChangeSet, parse_push_change_set
+from app.webhooks.pipeline import process_push_change_set
 
 
 REPOSITORY = GitHubRepository(owner="owner", name="repository")
@@ -98,7 +98,7 @@ def test_incomplete_or_unsafe_change_sets_are_rejected(changes):
 
 def test_webhook_hands_validated_change_set_to_background_task():
     process = AsyncMock()
-    with patch("app.api.webhooks.process_push_change_set", new=process):
+    with patch("app.webhooks.routes.process_push_change_set", new=process):
         response = post_webhook(payload([{"added": ["src/a.py"], "modified": [], "removed": []}]))
 
     assert response.status_code == 202
@@ -113,7 +113,7 @@ def test_webhook_hands_validated_change_set_to_background_task():
 ])
 def test_webhook_acknowledges_unsupported_events_without_processing(body, event):
     process = AsyncMock()
-    with patch("app.api.webhooks.process_push_change_set", new=process):
+    with patch("app.webhooks.routes.process_push_change_set", new=process):
         response = post_webhook(body, event=event)
 
     assert response.status_code == 202
@@ -139,8 +139,8 @@ def test_webhook_rejects_invalid_signature():
 def test_fetch_failure_does_not_update_graph():
     save = AsyncMock()
     with (
-        patch("app.services.pipeline.fetch_raw_file_content", new=AsyncMock(side_effect=RuntimeError("fetch failed"))),
-        patch("app.services.pipeline.ingest_identified_files", new=save),
+        patch("app.webhooks.pipeline.fetch_raw_file_content", new=AsyncMock(side_effect=RuntimeError("fetch failed"))),
+        patch("app.webhooks.pipeline.ingest_identified_files", new=save),
     ):
         asyncio.run(process_push_change_set(change_set(updated=["src/a.py"])))
     save.assert_not_awaited()
@@ -148,6 +148,6 @@ def test_fetch_failure_does_not_update_graph():
 
 def test_removed_file_is_passed_to_incremental_writer():
     save = AsyncMock()
-    with patch("app.services.pipeline.ingest_identified_files", new=save):
+    with patch("app.webhooks.pipeline.ingest_identified_files", new=save):
         asyncio.run(process_push_change_set(change_set(deleted=["src/old.py"])))
     save.assert_awaited_once_with([], repo_name="owner/repository", deleted_file_paths=["src/old.py"])

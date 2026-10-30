@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import ChatPanel from "./components/ChatPanel.jsx";
-import CodePanel from "./components/CodePanel.tsx";
-import GraphPanel from "./components/GraphPanel.jsx";
-import useChat from "./hooks/useChat.js";
-import useCodeGraph from "./hooks/useCodeGraph.js";
-import useRepository from "./hooks/useRepository.js";
+import ChatPanel from "./features/chat/ChatPanel.jsx";
+import CodePanel from "./features/code/CodePanel.tsx";
+import GraphPanel from "./features/graph/GraphPanel.jsx";
+import useChat from "./features/chat/useChat.js";
+import useCodeGraph from "./features/graph/useCodeGraph.js";
+import useRepository from "./features/repository/useRepository.js";
 
 function App() {
   // One in-flight request slot shared by ingestion and chat: starting or

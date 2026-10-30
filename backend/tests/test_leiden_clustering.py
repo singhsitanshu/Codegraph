@@ -9,11 +9,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from neo4j import Driver
 
-from app.db.driver import close_neo4j_driver
-from app.services.graph_ingestion import ingest_identified_files
-from app.services.parse_results import IdentifiedFile
-from app.services.parser_service import CodeParser
-from app.services.source_identity import identify_parsed_source
+from app.database.driver import close_neo4j_driver
+from app.ingestion.graph_ingestion import ingest_identified_files
+from app.parsing.parse_results import IdentifiedFile
+from app.parsing.parser import CodeParser
+from app.parsing.source_identity import identify_parsed_source
 
 TEST_REPO_NAME = "test/leiden-two-groups"
 CLEANUP_QUERY = "MATCH (n {repo_name: $repo_name}) DETACH DELETE n"
@@ -79,10 +79,10 @@ def test_two_connected_groups_produce_exactly_two_communities(
             await close_neo4j_driver()
 
     with patch(
-        "app.services.graph_ingestion.generate_embeddings",
+        "app.ingestion.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.services.graph_ingestion.label_and_store_communities",
+        "app.ingestion.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         asyncio.run(save())

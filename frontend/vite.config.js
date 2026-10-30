@@ -1,7 +1,7 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { resolveApiBase } from "./src/apiBase.js";
+import { resolveApiBase } from "./src/shared/apiBase.js";
 
 export default defineConfig(({ mode }) => ({
   plugins: [react(), tailwindcss()],

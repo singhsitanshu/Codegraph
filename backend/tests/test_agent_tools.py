@@ -8,6 +8,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
+from app.agent.code_queries import (
+    ARCHITECTURAL_SUBSYSTEMS_QUERY,
+    CALLERS_QUERY,
+    CODEBASE_STRUCTURE_QUERY,
+    EXTERNAL_DEPENDENCIES_QUERY,
+    FUNCTIONS_IN_FILE_QUERY,
+    OUTGOING_DEPENDENCIES_QUERY,
+    SEMANTIC_CODE_SEARCH_QUERY,
+)
 from app.agent.graph import (
     ARCHITECTURE_TOOL_NAME,
     CODE_AGENT_SYSTEM_PROMPT,
@@ -18,16 +27,7 @@ from app.agent.graph import (
     ask_code_agent_with_metrics,
     build_repository_tools,
 )
-from app.db.code_queries import (
-    ARCHITECTURAL_SUBSYSTEMS_QUERY,
-    CALLERS_QUERY,
-    CODEBASE_STRUCTURE_QUERY,
-    EXTERNAL_DEPENDENCIES_QUERY,
-    FUNCTIONS_IN_FILE_QUERY,
-    OUTGOING_DEPENDENCIES_QUERY,
-    SEMANTIC_CODE_SEARCH_QUERY,
-)
-from app.utils.embeddings import FUNCTION_EMBEDDING_INDEX
+from app.embeddings.constants import FUNCTION_EMBEDDING_INDEX
 
 
 REPO = "owner/repository"
@@ -63,7 +63,7 @@ def _invoke_tool(tool, arguments, records):
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.db.code_queries.get_neo4j_driver", return_value=driver):
+    with patch("app.agent.code_queries.get_neo4j_driver", return_value=driver):
         output = asyncio.run(tool.ainvoke(arguments))
     return output, session.run
 
@@ -240,7 +240,7 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
     embed_query = AsyncMock(return_value=embedding)
 
     with (
-        patch("app.db.code_queries.get_neo4j_driver", return_value=driver),
+        patch("app.agent.code_queries.get_neo4j_driver", return_value=driver),
         patch("app.agent.graph.generate_embedding", new=embed_query),
     ):
         output = asyncio.run(
@@ -309,7 +309,7 @@ def test_tools_reject_invalid_llm_arguments_before_querying(
 ) -> None:
     driver = MagicMock()
     with (
-        patch("app.db.code_queries.get_neo4j_driver", return_value=driver),
+        patch("app.agent.code_queries.get_neo4j_driver", return_value=driver),
         pytest.raises(ValidationError),
     ):
         asyncio.run(TOOLS[tool_name].ainvoke(arguments))
@@ -396,7 +396,7 @@ def test_code_agent_reports_graph_context_efficiency() -> None:
             new=AsyncMock(return_value=("Structured answer", messages)),
         ),
         patch(
-            "app.db.code_queries.fetch_repository_total_tokens",
+            "app.agent.code_queries.fetch_repository_total_tokens",
             new=AsyncMock(return_value=1_000),
         ) as fetch_total,
         patch("app.agent.graph.count_tokens", return_value=125) as count,

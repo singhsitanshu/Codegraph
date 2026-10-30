@@ -1,7 +1,7 @@
 """Tests for graph API node aliases consumed by React Flow."""
 
-from app.db.graph_queries import GraphNode
-from app.services.graph_view import serialize_node
+from app.graph.queries import GraphNode
+from app.graph.view import serialize_node
 
 
 def _node(

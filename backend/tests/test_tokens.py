@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.utils import tokens
+from app import tokens
 
 
 def test_count_tokens_uses_requested_model_encoding() -> None:

@@ -4,7 +4,7 @@ This is the parser contract for function identity. Since CG-002B the Neo4j write
 
 ## Parsed output
 
-`CodeParser.parse_file(path, source)` returns a frozen `ParsedSource` (`app/services/parse_results.py`) with the file's `file_path` (as given, possibly a temporary absolute path), `language`, `defined_classes`, `functions`, `declarations`, `unattributed_calls`, and the file-wide `outgoing_calls`. It has no repository identity yet.
+`CodeParser.parse_file(path, source)` returns a frozen `ParsedSource` (`app/parsing/parse_results.py`) with the file's `file_path` (as given, possibly a temporary absolute path), `language`, `defined_classes`, `functions`, `declarations`, `unattributed_calls`, and the file-wide `outgoing_calls`. It has no repository identity yet.
 
 - `functions` holds `ParsedFunction` records: executable definitions with a body. Each has `name`, `qualified_name`, `signature`, `definition_discriminator`, source span, `raw_code`, and the `calls` attributed to its body.
 - `declarations` holds `FunctionDeclaration` records with the same metadata but no body and no calls. These are declaration-only TypeScript overload and interface method signatures; their `raw_code` is the declaration.
@@ -44,7 +44,7 @@ Full GitHub ingest identifies files after converting their temporary paths to re
 
 ## Canonical key
 
-`generate_function_entity_id` in `app/utils/entity_identity.py` computes `fn:v1:` plus SHA-256 over a compact UTF-8 JSON array of:
+`generate_function_entity_id` in `app/parsing/entity_identity.py` computes `fn:v1:` plus SHA-256 over a compact UTF-8 JSON array of:
 
 1. Trimmed repository string, preserving case.
 2. Repository-relative POSIX file path; backslashes and dot segments are normalized, and absolute/escaping paths are rejected.
@@ -70,7 +70,7 @@ Calls are attributed to the innermost captured definition **only when the call e
 
 ## Graph persistence (CG-002B)
 
-`app/services/graph_ingestion.py` writes the parsed functions to Neo4j; `app/services/graph_records.py` builds the records and resolves calls, and `app/db/graph_ops.py` runs the writes:
+`app/ingestion/graph_ingestion.py` writes the parsed functions to Neo4j; `app/ingestion/graph_records.py` builds the records and resolves calls, and `app/graph/writer.py` runs the writes:
 
 | Entity | Identity | Notes |
 | --- | --- | --- |
@@ -93,6 +93,6 @@ Calls are attributed to the innermost captured definition **only when the call e
   - It rebuilds outgoing `CALLS` from the changed files and drops orphaned `ExternalFunction` nodes.
   - Surviving IDs keep their incoming edges, for example after a body-only edit.
   - Limitation: calls in unchanged files are not re-resolved. A newly added definition does not take over an existing external or ambiguous call until the next full ingest.
-- **Clustering.** Leiden (`app/db/gds_ops.py`) works on more than the resolved Function-to-Function calls. Those alone leave most functions isolated, which gives each its own community. The projection adds two kinds of undirected links: `File-[:DEFINES]->Function`, and calls to `ExternalFunction` nodes. The final community ID is written to `Function` nodes only. Each run logs function, projection and community counts plus the singleton ratio, and warns when the ratio is above 25%. Communities with fewer than 3 functions get no LLM label; they are pooled into one `Ungrouped` community (`community_id = -1`).
+- **Clustering.** Leiden (`app/communities/clustering.py`) works on more than the resolved Function-to-Function calls. Those alone leave most functions isolated, which gives each its own community. The projection adds two kinds of undirected links: `File-[:DEFINES]->Function`, and calls to `ExternalFunction` nodes. The final community ID is written to `Function` nodes only. Each run logs function, projection and community counts plus the singleton ratio, and warns when the ratio is above 25%. Communities with fewer than 3 functions get no LLM label; they are pooled into one `Ungrouped` community (`community_id = -1`).
 - **Reads.** The graph API still uses Neo4j `elementId` for React Flow node IDs and source lookup; `data.entity_id` carries the application identity. Agent tools match by simple or qualified name and report each matching definition separately.
 - **Open.** Durable references should also carry a graph revision so that deleted or re-ingested definitions can be detected. The parser ID alone cannot prove a function still exists in Neo4j. The stored graph has no Git revision either, so out-of-order or concurrent push events can apply an older change set. Run a full rebuild after a missed or out-of-order event.

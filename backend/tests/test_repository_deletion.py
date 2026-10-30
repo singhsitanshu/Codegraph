@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db.graph_ops import (
+from app.graph.writer import (
     DELETE_ALL_REPOSITORY_GRAPHS_QUERY,
     DELETE_REPOSITORY_QUERY,
     delete_all_repository_graphs,
@@ -31,7 +31,7 @@ def test_delete_repository_graph_uses_scoped_detach_delete() -> None:
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.db.graph_ops.get_neo4j_driver", return_value=driver):
+    with patch("app.graph.writer.get_neo4j_driver", return_value=driver):
         asyncio.run(delete_repository_graph("owner/repository"))
 
     transaction.run.assert_awaited_once_with(
@@ -58,7 +58,7 @@ def test_delete_all_repository_graphs_removes_only_scoped_nodes() -> None:
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.db.graph_ops.get_neo4j_driver", return_value=driver):
+    with patch("app.graph.writer.get_neo4j_driver", return_value=driver):
         asyncio.run(delete_all_repository_graphs())
 
     transaction.run.assert_awaited_once_with(

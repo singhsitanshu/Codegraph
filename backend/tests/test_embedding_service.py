@@ -6,13 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.services.embedding_service import (
+from app.config import settings
+from app.embeddings.generation import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
     generate_embedding,
     generate_embeddings,
 )
-from app.config import settings
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +36,7 @@ def test_generate_embeddings_batches_and_restores_response_order() -> None:
     )
 
     with patch(
-        "app.services.embedding_service._get_embedding_client",
+        "app.embeddings.generation._get_embedding_client",
         return_value=client,
     ):
         result = asyncio.run(generate_embeddings([" first ", "second"]))
@@ -52,7 +52,7 @@ def test_generate_embeddings_batches_and_restores_response_order() -> None:
 def test_generate_embedding_returns_the_single_vector() -> None:
     vector = _embedding(0.3)
     with patch(
-        "app.services.embedding_service.generate_embeddings",
+        "app.embeddings.generation.generate_embeddings",
         new=AsyncMock(return_value=[vector]),
     ) as generate_batch:
         result = asyncio.run(generate_embedding("payment processing"))
@@ -76,7 +76,7 @@ def _client_for_vectors(values):
 
 def test_identical_inputs_are_embedded_once_and_expanded_in_order():
     client = _client_for_vectors([0.1, 0.2])
-    with patch("app.services.embedding_service._get_embedding_client", return_value=client):
+    with patch("app.embeddings.generation._get_embedding_client", return_value=client):
         result = asyncio.run(generate_embeddings(["same", " other ", " same "]))
     assert [vector[0] for vector in result] == [0.1, 0.2, 0.1]
     client.embeddings.create.assert_awaited_once_with(input=["same", "other"], model=EMBEDDING_MODEL)
@@ -84,7 +84,7 @@ def test_identical_inputs_are_embedded_once_and_expanded_in_order():
 
 def test_cached_vectors_survive_new_event_loop_and_only_missing_inputs_are_requested():
     client = _client_for_vectors([0.1])
-    with patch("app.services.embedding_service._get_embedding_client", return_value=client):
+    with patch("app.embeddings.generation._get_embedding_client", return_value=client):
         first = asyncio.run(generate_embeddings(["existing"]))
         repeated = asyncio.run(generate_embeddings(["existing"]))
         assert repeated == first
@@ -97,9 +97,9 @@ def test_cached_vectors_survive_new_event_loop_and_only_missing_inputs_are_reque
 
 def test_model_change_does_not_reuse_old_model_vectors():
     client = _client_for_vectors([0.1])
-    with patch("app.services.embedding_service._get_embedding_client", return_value=client):
+    with patch("app.embeddings.generation._get_embedding_client", return_value=client):
         asyncio.run(generate_embeddings(["same"]))
-        with patch("app.services.embedding_service.EMBEDDING_MODEL", "other-model"):
+        with patch("app.embeddings.generation.EMBEDDING_MODEL", "other-model"):
             asyncio.run(generate_embeddings(["same"]))
     assert client.embeddings.create.await_count == 2
 
@@ -111,7 +111,7 @@ def test_model_change_does_not_reuse_old_model_vectors():
 def test_invalid_api_vectors_are_not_cached(data):
     client = _client_for_vectors([0.1])
     client.embeddings.create.return_value = SimpleNamespace(data=data)
-    with patch("app.services.embedding_service._get_embedding_client", return_value=client):
+    with patch("app.embeddings.generation._get_embedding_client", return_value=client):
         with pytest.raises(RuntimeError, match="unexpected embedding"):
             asyncio.run(generate_embeddings(["same"]))
         client.embeddings.create.return_value = SimpleNamespace(data=[SimpleNamespace(index=0, embedding=_embedding(0.1))])
@@ -122,6 +122,6 @@ def test_invalid_api_vectors_are_not_cached(data):
 def test_unavailable_cache_does_not_prevent_embedding_generation(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "EMBEDDING_CACHE_PATH", str(tmp_path))
     client = _client_for_vectors([0.1])
-    with patch("app.services.embedding_service._get_embedding_client", return_value=client):
+    with patch("app.embeddings.generation._get_embedding_client", return_value=client):
         result = asyncio.run(generate_embeddings(["same"]))
     assert result == [_embedding(0.1)]

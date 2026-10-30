@@ -12,16 +12,16 @@ import pytest
 from fastapi.testclient import TestClient
 from neo4j.exceptions import ServiceUnavailable
 
+from app.ingestion.github_download import download_and_extract_repo
+from app.ingestion.graph_ingestion import IngestionProgress
+from app.ingestion.source_discovery import discover_repository_source_files
 from app.main import app
-from app.services.github_service import download_and_extract_repo
-from app.services.graph_ingestion import IngestionProgress
-from app.services.parse_results import (
+from app.parsing.parse_results import (
     IdentifiedFile,
     ParsedFileProgress,
     ParsedSource,
 )
-from app.services.source_discovery import discover_repository_source_files
-from app.utils.repository import GitHubRepository
+from app.repositories.names import GitHubRepository
 
 
 def _fake_download(extracted_root: Path, released: list[tuple[str, str]]):
@@ -122,15 +122,15 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
 
     with (
         patch(
-            "app.services.repository_ingestion.download_and_extract_repo",
+            "app.ingestion.repository_ingestion.download_and_extract_repo",
             new=_fake_download(repository_root, released),
         ),
         patch(
-            "app.services.repository_ingestion.parse_changed_files_with_progress",
+            "app.ingestion.repository_ingestion.parse_changed_files_with_progress",
             new=parse_with_progress,
         ),
         patch(
-            "app.services.repository_ingestion.ingest_identified_files_with_progress",
+            "app.ingestion.repository_ingestion.ingest_identified_files_with_progress",
             new=save_with_progress,
         ),
     ):
@@ -187,7 +187,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
 
 def test_ingest_repository_rejects_non_github_url() -> None:
     download = AsyncMock()
-    with patch("app.services.repository_ingestion.download_and_extract_repo", new=download):
+    with patch("app.ingestion.repository_ingestion.download_and_extract_repo", new=download):
         response = TestClient(app).post(
             "/api/ingest-repo",
             json={"url": "https://example.com/psf/requests"},
@@ -210,9 +210,9 @@ def test_full_ingest_does_not_replace_graph_after_parse_failure(tmp_path: Path) 
     save = Mock()
     released: list[tuple[str, str]] = []
     with (
-        patch("app.services.repository_ingestion.download_and_extract_repo", new=_fake_download(tmp_path, released)),
-        patch("app.services.repository_ingestion.parse_changed_files_with_progress", new=failed_parse),
-        patch("app.services.repository_ingestion.ingest_identified_files_with_progress", new=save),
+        patch("app.ingestion.repository_ingestion.download_and_extract_repo", new=_fake_download(tmp_path, released)),
+        patch("app.ingestion.repository_ingestion.parse_changed_files_with_progress", new=failed_parse),
+        patch("app.ingestion.repository_ingestion.ingest_identified_files_with_progress", new=save),
     ):
         response = TestClient(app).post(
             "/api/ingest-repo", json={"url": "https://github.com/psf/requests"}
@@ -250,15 +250,15 @@ def test_neo4j_failure_ends_the_stream_with_a_failure_record(tmp_path: Path) -> 
     released: list[tuple[str, str]] = []
     with (
         patch(
-            "app.services.repository_ingestion.download_and_extract_repo",
+            "app.ingestion.repository_ingestion.download_and_extract_repo",
             new=_fake_download(tmp_path, released),
         ),
         patch(
-            "app.services.repository_ingestion.parse_changed_files_with_progress",
+            "app.ingestion.repository_ingestion.parse_changed_files_with_progress",
             new=parse,
         ),
         patch(
-            "app.services.repository_ingestion.ingest_identified_files_with_progress",
+            "app.ingestion.repository_ingestion.ingest_identified_files_with_progress",
             new=unavailable_database,
         ),
     ):
@@ -302,7 +302,7 @@ def test_downloaded_repository_lives_for_the_download_scope() -> None:
             return extracted_root
 
     with patch(
-        "app.services.github_service.httpx.AsyncClient",
+        "app.ingestion.github_download.httpx.AsyncClient",
         return_value=client_context,
     ):
         extracted_root = asyncio.run(download())
@@ -327,7 +327,7 @@ def test_downloaded_repository_is_removed_when_the_scope_fails() -> None:
 
     with (
         patch(
-            "app.services.github_service.httpx.AsyncClient",
+            "app.ingestion.github_download.httpx.AsyncClient",
             return_value=client_context,
         ),
         pytest.raises(RuntimeError),

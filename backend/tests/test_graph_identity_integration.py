@@ -10,9 +10,10 @@ from uuid import uuid4
 import pytest
 from neo4j import AsyncGraphDatabase, GraphDatabase
 
-from app.db import neo4j_client
-from app.db.graph_queries import fetch_node_code
-from app.db.graph_ops import (
+from app.graph import schema
+from app.graph.queries import fetch_node_code
+from app.graph.view import fetch_graph_view
+from app.graph.writer import (
     DELETE_FILES_QUERY,
     DELETE_ORPHAN_EXTERNAL_FUNCTIONS_QUERY,
     DELETE_OUTGOING_CALLS_QUERY,
@@ -23,10 +24,9 @@ from app.db.graph_ops import (
     MERGE_FILES_QUERY,
     MERGE_FUNCTIONS_QUERY,
 )
-from app.services.graph_ingestion import ingest_identified_files
-from app.services.graph_view import fetch_graph_view
-from app.services.parser_service import CodeParser
-from app.services.source_identity import identify_parsed_source
+from app.ingestion.graph_ingestion import ingest_identified_files
+from app.parsing.parser import CodeParser
+from app.parsing.source_identity import identify_parsed_source
 
 REPO = "integration/identity"
 PASSWORD = "integration-password"
@@ -64,7 +64,7 @@ def disposable_neo4j():
         try:
             with driver.session() as session:
                 # The application's real schema, so plans reflect production.
-                for query in neo4j_client.DATABASE_INDEX_QUERIES:
+                for query in schema.DATABASE_INDEX_QUERIES:
                     session.run(query).consume()
                 session.run("CALL db.awaitIndexes(60)").consume()
             yield uri, driver
@@ -129,11 +129,11 @@ def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
         payments = await parse("src/payments.py", b"def validate():\n return 'payments'\n")
         try:
             with (
-                patch("app.db.graph_ops.get_neo4j_driver", return_value=async_driver),
-                patch("app.db.graph_queries.get_neo4j_driver", return_value=async_driver),
-                patch("app.services.graph_ingestion.generate_embeddings", side_effect=_fake_embeddings),
-                patch("app.services.graph_ingestion.run_leiden_clustering", new=AsyncMock()),
-                patch("app.services.graph_ingestion.label_and_store_communities", new=AsyncMock()),
+                patch("app.graph.writer.get_neo4j_driver", return_value=async_driver),
+                patch("app.graph.queries.get_neo4j_driver", return_value=async_driver),
+                patch("app.ingestion.graph_ingestion.generate_embeddings", side_effect=_fake_embeddings),
+                patch("app.ingestion.graph_ingestion.run_leiden_clustering", new=AsyncMock()),
+                patch("app.ingestion.graph_ingestion.label_and_store_communities", new=AsyncMock()),
             ):
                 await ingest_identified_files([auth, payments], REPO, replace_existing=True)
                 graph = await fetch_graph_view(REPO)

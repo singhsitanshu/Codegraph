@@ -7,9 +7,9 @@ from pathlib import Path
 # Ensure backend root is on sys.path
 sys.path.append(os.path.abspath("."))
 
-from app.services.batch_parsing import parse_changed_files
-from app.services.source_identity import identify_parsed_source
-from app.services.graph_ingestion import ingest_identified_files
+from app.ingestion.graph_ingestion import ingest_identified_files
+from app.parsing.batch_parsing import parse_changed_files
+from app.parsing.source_identity import identify_parsed_source
 
 # UPDATE THIS: Use an absolute path to your cloned requests directory
 # Example: "/Users/yourname/projects/requests" or "C:/Users/yourname/projects/requests"

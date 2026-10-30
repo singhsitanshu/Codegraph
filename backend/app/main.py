@@ -9,27 +9,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StringConstraints, field_validator
 
-from app.api import webhooks
 from app.agent.graph import ask_code_agent_with_metrics
 from app.config import settings
-from app.db.driver import close_neo4j_driver
-from app.db.errors import NEO4J_ERRORS, Neo4jFailureDetails, is_neo4j_unavailable
-from app.db.graph_ops import delete_all_repository_graphs, delete_repository_graph
-from app.db.graph_queries import fetch_node_code
-from app.db.neo4j_client import initialize_database
-from app.services.graph_view import fetch_graph_view
-from app.services.repository_ingestion import (
+from app.database.driver import close_neo4j_driver
+from app.database.errors import NEO4J_ERRORS, Neo4jFailureDetails, is_neo4j_unavailable
+from app.graph.queries import fetch_node_code
+from app.graph.schema import initialize_database
+from app.graph.view import fetch_graph_view
+from app.graph.writer import delete_all_repository_graphs, delete_repository_graph
+from app.ingestion import ingestion_progress
+from app.ingestion.repository_ingestion import (
     IngestionComplete,
     IngestionFailed,
     RepositoryIngestionEvent,
     ingest_github_repository,
 )
-from app.utils import ingestion_progress
-from app.utils.repository import (
+from app.repositories.names import (
     GitHubRepository,
     GitHubRepositoryUrl,
     RepositoryName,
 )
+from app.webhooks import routes as webhook_routes
 
 
 logging.basicConfig(
@@ -130,7 +130,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.include_router(webhooks.router)
+app.include_router(webhook_routes.router)
 
 
 @app.get("/api/graph", tags=["graph"])

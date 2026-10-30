@@ -16,14 +16,14 @@ from app.agent.graph import (
     GraphRagMetrics,
     build_repository_tools,
 )
-from app.db.driver import close_neo4j_driver
-from app.db.graph_ops import delete_repository_graph
-from app.db.neo4j_client import initialize_database
+from app.database.driver import close_neo4j_driver
+from app.graph.schema import initialize_database
+from app.graph.writer import delete_repository_graph
+from app.ingestion.graph_ingestion import ingest_identified_files
 from app.main import app
-from app.services.graph_ingestion import ingest_identified_files
-from app.services.parse_results import IdentifiedFile
-from app.services.parser_service import CodeParser
-from app.services.source_identity import identify_parsed_source
+from app.parsing.parse_results import IdentifiedFile
+from app.parsing.parser import CodeParser
+from app.parsing.source_identity import identify_parsed_source
 
 TEST_FILE_PATH = "TEST_MOCK_FILE.py"
 TEST_REPO_NAME = "test/mock-repository"
@@ -101,13 +101,13 @@ def _save_mock_ast() -> None:
             await close_neo4j_driver()
 
     with patch(
-        "app.services.graph_ingestion.generate_embeddings",
+        "app.ingestion.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.services.graph_ingestion.run_leiden_clustering",
+        "app.ingestion.graph_ingestion.run_leiden_clustering",
         new=AsyncMock(),
     ), patch(
-        "app.services.graph_ingestion.label_and_store_communities",
+        "app.ingestion.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         asyncio.run(save())
@@ -421,13 +421,13 @@ def test_blast_radius_does_not_cross_repository_boundaries(
             await close_neo4j_driver()
 
     with patch(
-        "app.services.graph_ingestion.generate_embeddings",
+        "app.ingestion.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.services.graph_ingestion.run_leiden_clustering",
+        "app.ingestion.graph_ingestion.run_leiden_clustering",
         new=AsyncMock(),
     ), patch(
-        "app.services.graph_ingestion.label_and_store_communities",
+        "app.ingestion.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         payload_a, payload_b = asyncio.run(save_and_query())
@@ -505,13 +505,13 @@ def test_incremental_update_keeps_identity_and_incoming_edges(
             await close_neo4j_driver()
 
     with patch(
-        "app.services.graph_ingestion.generate_embeddings",
+        "app.ingestion.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.services.graph_ingestion.run_leiden_clustering",
+        "app.ingestion.graph_ingestion.run_leiden_clustering",
         new=AsyncMock(),
     ), patch(
-        "app.services.graph_ingestion.label_and_store_communities",
+        "app.ingestion.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         asyncio.run(save())

@@ -16,7 +16,7 @@ from time import perf_counter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.utils.repository import GitHubRepository  # noqa: E402
+from app.repositories.names import GitHubRepository  # noqa: E402
 
 
 def repository_argument(value):
@@ -32,12 +32,14 @@ async def benchmark(args):
         os.environ["EMBEDDING_CACHE_PATH"] = args.cache_path
 
     from app import main
+    from app.communities import summarizer as community_summarizer
     from app.config import settings
-    from app.db.driver import close_neo4j_driver, get_neo4j_driver
-    from app.db.graph_queries import fetch_node_code
-    from app.db.neo4j_client import initialize_database
-    from app.services import community_summarizer, embedding_service, repository_ingestion
-    from app.utils.embeddings import EMBEDDING_DIMENSIONS
+    from app.database.driver import close_neo4j_driver, get_neo4j_driver
+    from app.embeddings import generation as embedding_generation
+    from app.embeddings.constants import EMBEDDING_DIMENSIONS
+    from app.graph.queries import fetch_node_code
+    from app.graph.schema import initialize_database
+    from app.ingestion import repository_ingestion
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=str(args.output.with_suffix(".log")), level=logging.INFO, force=True)
@@ -50,7 +52,7 @@ async def benchmark(args):
         "embedding_input_tokens": 0, "label_requests": 0,
     }
     unique_inputs = set()
-    embedding_create = embedding_service._get_embedding_client().embeddings.create
+    embedding_create = embedding_generation._get_embedding_client().embeddings.create
 
     async def counted_embeddings(*call_args, **kwargs):
         stats["embedding_requests"] += 1
@@ -60,7 +62,7 @@ async def benchmark(args):
         stats["embedding_input_tokens"] += result.usage.total_tokens
         return result
 
-    embedding_service._get_embedding_client().embeddings.create = counted_embeddings
+    embedding_generation._get_embedding_client().embeddings.create = counted_embeddings
     label_generate = community_summarizer._generate_community_labels
 
     async def counted_labels(*call_args, **kwargs):

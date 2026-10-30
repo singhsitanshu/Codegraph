@@ -8,10 +8,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from app.db.driver import close_neo4j_driver, get_neo4j_driver
-from app.services.batch_parsing import parse_changed_files
-from app.services.graph_ingestion import ingest_identified_files
-from app.services.source_identity import identify_parsed_source
+from app.database.driver import close_neo4j_driver, get_neo4j_driver
+from app.ingestion.graph_ingestion import ingest_identified_files
+from app.parsing.batch_parsing import parse_changed_files
+from app.parsing.source_identity import identify_parsed_source
 
 
 TARGET_REPO_PATH = "/Users/sitanshusingh/Downloads/requests"

@@ -11,11 +11,11 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.prebuilt import create_react_agent
 from pydantic import Field, StringConstraints
 
+from app.agent import code_queries
 from app.config import settings
-from app.db import code_queries
-from app.services.embedding_service import generate_embedding
-from app.utils.repository import RepositoryName
-from app.utils.tokens import count_tokens
+from app.embeddings.generation import generate_embedding
+from app.repositories.names import RepositoryName
+from app.tokens import count_tokens
 
 
 logger = logging.getLogger(__name__)
