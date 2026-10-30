@@ -6,14 +6,16 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from app.services.community_summarizer import (
-    COMMUNITY_LABEL_BATCH_SIZE,
-    COMMUNITY_LABEL_MODEL,
-    MAX_CONCURRENT_COMMUNITY_LABELS,
+from app.db.community_ops import (
     DELETE_COMMUNITIES_QUERY,
     FETCH_COMMUNITIES_QUERY,
     STORE_COMMUNITIES_QUERY,
     UNGROUP_SMALL_COMMUNITIES_QUERY,
+)
+from app.services.community_summarizer import (
+    COMMUNITY_LABEL_BATCH_SIZE,
+    COMMUNITY_LABEL_MODEL,
+    MAX_CONCURRENT_COMMUNITY_LABELS,
     UNGROUPED_COMMUNITY_ID,
     CommunityLabel,
     _generate_community_labels,
@@ -57,7 +59,7 @@ def test_label_and_store_communities_replaces_repository_labels_atomically():
         dict(id=7, name="Cookie Handling", description="Extracts cookies."),
     ]
     with (
-        patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
+        patch("app.db.community_ops.get_neo4j_driver", return_value=driver),
         patch("app.services.community_summarizer._generate_community_labels", new=AsyncMock(return_value=labels)) as generate,
     ):
         communities = asyncio.run(label_and_store_communities("owner/repository"))
@@ -111,7 +113,7 @@ def test_small_communities_are_grouped_without_model_requests():
     driver, _, transaction = _driver_for_records(records)
     labels = [dict(id=1, name="Core", description="Core logic.")]
     with (
-        patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
+        patch("app.db.community_ops.get_neo4j_driver", return_value=driver),
         patch("app.services.community_summarizer._generate_community_labels", new=AsyncMock(return_value=labels)) as generate,
     ):
         communities = asyncio.run(label_and_store_communities("owner/repo"))
@@ -148,7 +150,7 @@ def test_community_requests_are_batched_bounded_and_keep_order():
         return [dict(id=r["comm_id"], name=str(r["comm_id"]), description="Community") for r in batch]
 
     with (
-        patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
+        patch("app.db.community_ops.get_neo4j_driver", return_value=driver),
         patch("app.services.community_summarizer._generate_community_labels", side_effect=generate) as generated,
     ):
         labels = asyncio.run(label_and_store_communities("owner/repo"))
@@ -175,7 +177,7 @@ def test_label_failure_cancels_other_requests_without_replacing_stored_labels():
             active -= 1
 
     with (
-        patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
+        patch("app.db.community_ops.get_neo4j_driver", return_value=driver),
         patch("app.services.community_summarizer._generate_community_labels", side_effect=generate),
     ):
         with pytest.raises(RuntimeError, match="label request failed"):

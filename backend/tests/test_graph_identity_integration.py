@@ -10,7 +10,8 @@ from uuid import uuid4
 import pytest
 from neo4j import AsyncGraphDatabase, GraphDatabase
 
-from app.db import fetch_graph_data, fetch_node_code, neo4j_client
+from app.db import neo4j_client
+from app.db.graph_queries import fetch_node_code
 from app.db.graph_ops import (
     DELETE_FILES_QUERY,
     DELETE_ORPHAN_EXTERNAL_FUNCTIONS_QUERY,
@@ -21,8 +22,9 @@ from app.db.graph_ops import (
     MERGE_EXTERNAL_CALLS_QUERY,
     MERGE_FILES_QUERY,
     MERGE_FUNCTIONS_QUERY,
-    save_parsed_ast_to_neo4j,
 )
+from app.services.graph_ingestion import ingest_identified_files
+from app.services.graph_view import fetch_graph_view
 from app.services.parser_service import CodeParser, identify_parsed_source
 
 REPO = "integration/identity"
@@ -127,13 +129,13 @@ def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
         try:
             with (
                 patch("app.db.graph_ops.get_neo4j_driver", return_value=async_driver),
-                patch("app.db.get_neo4j_driver", return_value=async_driver),
-                patch("app.db.graph_ops.generate_embeddings", side_effect=_fake_embeddings),
-                patch("app.db.graph_ops.run_leiden_clustering", new=AsyncMock()),
-                patch("app.db.graph_ops.label_and_store_communities", new=AsyncMock()),
+                patch("app.db.graph_queries.get_neo4j_driver", return_value=async_driver),
+                patch("app.services.graph_ingestion.generate_embeddings", side_effect=_fake_embeddings),
+                patch("app.services.graph_ingestion.run_leiden_clustering", new=AsyncMock()),
+                patch("app.services.graph_ingestion.label_and_store_communities", new=AsyncMock()),
             ):
-                await save_parsed_ast_to_neo4j([auth, payments], REPO, replace_existing=True)
-                graph = await fetch_graph_data(REPO)
+                await ingest_identified_files([auth, payments], REPO, replace_existing=True)
+                graph = await fetch_graph_view(REPO)
                 validates = [n for n in graph["nodes"] if n["data"].get("name") == "validate"]
                 assert len(validates) == 2
                 assert len({n["data"]["entity_id"] for n in validates}) == 2
@@ -150,7 +152,7 @@ def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
                 assert [n["data"]["name"] for n in externals] == ["remote"]
                 assert "Function" not in externals[0]["labels"]
 
-                await save_parsed_ast_to_neo4j([auth, payments], REPO, replace_existing=True)
+                await ingest_identified_files([auth, payments], REPO, replace_existing=True)
                 with sync_driver.session() as session:
                     record = session.run("MATCH (f:Function {repo_name: $repo}) RETURN count(f) AS n, count(DISTINCT f.entity_id) AS distinct_ids", repo=REPO).single()
                     assert (record["n"], record["distinct_ids"]) == (3, 3)
@@ -160,14 +162,14 @@ def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
                     assert session.run("MATCH (e:ExternalFunction {repo_name: $repo}) RETURN count(e) AS n", repo=REPO).single()["n"] == 1
 
                 changed = await parse("src/auth.py", b"def validate():\n return 'auth-v2'\ndef added(): pass\n")
-                await save_parsed_ast_to_neo4j([changed], REPO, deleted_file_paths=["src/payments.py"])
+                await ingest_identified_files([changed], REPO, deleted_file_paths=["src/payments.py"])
                 with sync_driver.session() as session:
                     names = session.run("MATCH (f:Function {repo_name: $repo}) RETURN collect(f.name) AS names", repo=REPO).single()["names"]
                     assert set(names) == {"validate", "added"}
                     assert session.run("MATCH (f:Function {repo_name: $repo})-[r:CALLS]->() RETURN count(r) AS n", repo=REPO).single()["n"] == 0
                     assert session.run("MATCH (e:ExternalFunction {repo_name: $repo}) RETURN count(e) AS n", repo=REPO).single()["n"] == 0
 
-                await save_parsed_ast_to_neo4j([payments], REPO, replace_existing=True)
+                await ingest_identified_files([payments], REPO, replace_existing=True)
                 with sync_driver.session() as session:
                     assert session.run("MATCH (f:Function {repo_name: $repo}) RETURN collect(f.file_path) AS paths", repo=REPO).single()["paths"] == ["src/payments.py"]
         finally:

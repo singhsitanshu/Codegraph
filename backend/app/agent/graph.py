@@ -12,9 +12,8 @@ from langgraph.prebuilt import create_react_agent
 from pydantic import Field, StringConstraints
 
 from app.config import settings
-from app.db import fetch_repository_total_tokens, get_neo4j_driver
+from app.db import code_queries
 from app.services.embedding_service import generate_embedding
-from app.utils.embeddings import FUNCTION_EMBEDDING_INDEX
 from app.utils.repository import RepositoryName
 from app.utils.tokens import count_tokens
 
@@ -27,76 +26,6 @@ logger = logging.getLogger(__name__)
 ToolText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 SearchResultLimit = Annotated[int, Field(ge=1, le=20)]
 
-
-# Function names are not unique, so name lookups may match several
-# definitions; each result row identifies the definition it came from.
-CALLERS_QUERY = """
-MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->(target)
-WHERE target.repo_name = $repo_name
-  AND (target:Function OR target:ExternalFunction)
-  AND (target.name = $func_name OR target.qualified_name = $func_name)
-RETURN coalesce(caller.qualified_name, caller.name) AS caller,
-       collect(DISTINCT caller.file_path) AS file_paths,
-       coalesce(target.qualified_name, target.name) AS target,
-       target.file_path AS target_file,
-       coalesce(target.is_external, false) AS target_is_external
-ORDER BY caller, target_file
-LIMIT 100
-"""
-
-CODEBASE_STRUCTURE_QUERY = """
-MATCH (f:File {repo_name: $repo_name})
-RETURN f.path AS file_path
-ORDER BY f.path
-"""
-
-FUNCTIONS_IN_FILE_QUERY = """
-MATCH (f:File {path: $file_path, repo_name: $repo_name})-[:DEFINES]->
-      (fn:Function)
-RETURN coalesce(fn.qualified_name, fn.name) AS function_name
-ORDER BY fn.start_line, function_name
-"""
-
-OUTGOING_DEPENDENCIES_QUERY = """
-MATCH (caller:Function {repo_name: $repo_name})-[:CALLS]->(target)
-WHERE caller.name = $func_name OR caller.qualified_name = $func_name
-RETURN coalesce(caller.qualified_name, caller.name) AS caller_name,
-       caller.file_path AS caller_file,
-       coalesce(target.qualified_name, target.name) AS target_name,
-       target.file_path AS target_file,
-       coalesce(target.is_external, false) AS is_external
-ORDER BY caller_file, caller_name, target_name, target_file
-"""
-
-EXTERNAL_DEPENDENCIES_QUERY = """
-MATCH (fn:ExternalFunction {repo_name: $repo_name})
-RETURN fn.name AS function_name
-ORDER BY fn.name
-"""
-
-SEMANTIC_CODE_SEARCH_QUERY = f"""
-MATCH (node:Function)
-  SEARCH node IN (
-    VECTOR INDEX {FUNCTION_EMBEDDING_INDEX}
-    FOR $query_vector
-    LIMIT $top_k
-  ) SCORE AS score
-WHERE node.repo_name = $repo_name
-RETURN coalesce(node.qualified_name, node.name) AS function_name,
-       node.file_path AS file_path,
-       score
-ORDER BY score DESC
-"""
-
-ARCHITECTURAL_SUBSYSTEMS_QUERY = """
-MATCH (c:Community {repo_name: $repo_name})
-OPTIONAL MATCH (f:Function {repo_name: $repo_name})-[:IN_COMMUNITY]->(c)
-RETURN c.community_id AS id,
-       c.name AS module_title,
-       c.description AS module_description,
-       count(f) AS function_count
-ORDER BY function_count DESC
-"""
 
 # The system prompt points Claude at this tool by name.
 ARCHITECTURE_TOOL_NAME = "analyze_architectural_subsystems"
@@ -119,14 +48,6 @@ modules with a title, description, and function count. Use those stored labels
 to present a high-level architectural summary."""
 
 
-async def _read_records(query: str, **parameters: Any) -> list[dict[str, Any]]:
-    """Run one read query in a fresh session and return its records."""
-
-    async with get_neo4j_driver().session() as session:
-        result = await session.run(query, **parameters)
-        return await result.data()
-
-
 def _string_values(records: list[dict[str, Any]], key: str) -> list[str]:
     """Return the string values of one column, skipping missing entries."""
 
@@ -140,20 +61,11 @@ def build_repository_tools(repo_name: RepositoryName) -> list[BaseTool]:
     model cannot choose which repository's graph a tool reads.
     """
 
-    async def read_repository_records(
-        query: str,
-        **parameters: Any,
-    ) -> list[dict[str, Any]]:
-        return await _read_records(query, repo_name=repo_name, **parameters)
-
     @tool
     async def query_graph_blast_radius(function_name: ToolText) -> str:
         """Find direct callers of a function in the repository graph."""
 
-        records = await read_repository_records(
-            CALLERS_QUERY,
-            func_name=function_name,
-        )
+        records = await code_queries.fetch_callers(repo_name, function_name)
 
         return json.dumps(
             {
@@ -172,7 +84,7 @@ def build_repository_tools(repo_name: RepositoryName) -> list[BaseTool]:
     async def list_codebase_structure() -> str:
         """List every source file path in the repository graph."""
 
-        records = await read_repository_records(CODEBASE_STRUCTURE_QUERY)
+        records = await code_queries.fetch_file_paths(repo_name)
 
         return "\n".join(_string_values(records, "file_path"))
 
@@ -180,10 +92,7 @@ def build_repository_tools(repo_name: RepositoryName) -> list[BaseTool]:
     async def list_functions_in_file(file_path: ToolText) -> str:
         """List functions defined in a file of the repository graph."""
 
-        records = await read_repository_records(
-            FUNCTIONS_IN_FILE_QUERY,
-            file_path=file_path,
-        )
+        records = await code_queries.fetch_functions_in_file(repo_name, file_path)
 
         function_names = _string_values(records, "function_name")
         if not function_names:
@@ -199,9 +108,9 @@ def build_repository_tools(repo_name: RepositoryName) -> list[BaseTool]:
     async def query_outgoing_dependencies(function_name: ToolText) -> str:
         """List functions called by a function in the repository graph."""
 
-        records = await read_repository_records(
-            OUTGOING_DEPENDENCIES_QUERY,
-            func_name=function_name,
+        records = await code_queries.fetch_outgoing_dependencies(
+            repo_name,
+            function_name,
         )
 
         dependencies_by_caller: dict[tuple[object, object], list[str]] = {}
@@ -246,7 +155,7 @@ def build_repository_tools(repo_name: RepositoryName) -> list[BaseTool]:
     async def list_external_dependencies() -> str:
         """List external, standard-library, or third-party repository calls."""
 
-        records = await read_repository_records(EXTERNAL_DEPENDENCIES_QUERY)
+        records = await code_queries.fetch_external_functions(repo_name)
 
         function_names = _string_values(records, "function_name")
         if not function_names:
@@ -266,10 +175,10 @@ def build_repository_tools(repo_name: RepositoryName) -> list[BaseTool]:
         """Find functions related to a natural-language query in the repository."""
 
         query_vector = await generate_embedding(query)
-        records = await read_repository_records(
-            SEMANTIC_CODE_SEARCH_QUERY,
-            query_vector=query_vector,
-            top_k=top_k,
+        records = await code_queries.search_functions_by_embedding(
+            repo_name,
+            query_vector,
+            top_k,
         )
 
         matches: list[str] = []
@@ -302,7 +211,7 @@ def build_repository_tools(repo_name: RepositoryName) -> list[BaseTool]:
     async def analyze_architectural_subsystems() -> str:
         """Return the largest Leiden communities in the repository graph."""
 
-        records = await read_repository_records(ARCHITECTURAL_SUBSYSTEMS_QUERY)
+        records = await code_queries.fetch_architectural_subsystems(repo_name)
 
         return json.dumps(records, default=str)
 
@@ -440,7 +349,9 @@ async def ask_code_agent_with_metrics(
     response, messages = await _run_code_agent(user_message, repo_name)
     context_tokens = count_tokens(_tool_context_text(messages))
     metrics = GraphRagMetrics(
-        full_repo_tokens=await fetch_repository_total_tokens(repo_name),
+        full_repo_tokens=await code_queries.fetch_repository_total_tokens(
+            repo_name
+        ),
         context_tokens=context_tokens,
     )
     logger.info(

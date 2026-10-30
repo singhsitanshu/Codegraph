@@ -62,6 +62,18 @@ def test_change_set_tracks_final_path_state_and_supported_extensions():
     )
 
 
+def test_change_set_skips_ignored_directories_like_full_ingestion():
+    parsed = parse_push_change_set(payload([
+        {
+            "added": ["node_modules/pkg/index.js", "src/dist.py"],
+            "modified": ["build/generated.py", "src/app.py"],
+            "removed": [".venv/lib/site.py"],
+        },
+    ]))
+    assert parsed.updated_paths == ["src/app.py", "src/dist.py"]
+    assert parsed.deleted_paths == []
+
+
 def test_change_set_falls_back_to_full_name_for_repository():
     event = payload([{"added": [], "modified": [], "removed": []}])
     event["repository"] = {"full_name": "owner/repository"}
@@ -128,7 +140,7 @@ def test_fetch_failure_does_not_update_graph():
     save = AsyncMock()
     with (
         patch("app.services.pipeline.fetch_raw_file_content", new=AsyncMock(side_effect=RuntimeError("fetch failed"))),
-        patch("app.services.pipeline.save_parsed_ast_to_neo4j", new=save),
+        patch("app.services.pipeline.ingest_identified_files", new=save),
     ):
         asyncio.run(process_push_change_set(change_set(updated=["src/a.py"])))
     save.assert_not_awaited()
@@ -136,6 +148,6 @@ def test_fetch_failure_does_not_update_graph():
 
 def test_removed_file_is_passed_to_incremental_writer():
     save = AsyncMock()
-    with patch("app.services.pipeline.save_parsed_ast_to_neo4j", new=save):
+    with patch("app.services.pipeline.ingest_identified_files", new=save):
         asyncio.run(process_push_change_set(change_set(deleted=["src/old.py"])))
     save.assert_awaited_once_with([], repo_name="owner/repository", deleted_file_paths=["src/old.py"])

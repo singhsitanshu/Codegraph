@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from neo4j import Driver
 
-from app.db import close_neo4j_driver
-from app.db.graph_ops import save_parsed_ast_to_neo4j
+from app.db.driver import close_neo4j_driver
+from app.services.graph_ingestion import ingest_identified_files
 from app.services.parser_service import (
     CodeParser,
     IdentifiedFile,
@@ -72,7 +72,7 @@ def test_two_connected_groups_produce_exactly_two_communities(
 
     async def save() -> None:
         try:
-            await save_parsed_ast_to_neo4j(
+            await ingest_identified_files(
                 parsed_data,
                 TEST_REPO_NAME,
                 replace_existing=True,
@@ -81,10 +81,10 @@ def test_two_connected_groups_produce_exactly_two_communities(
             await close_neo4j_driver()
 
     with patch(
-        "app.db.graph_ops.generate_embeddings",
+        "app.services.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.db.graph_ops.label_and_store_communities",
+        "app.services.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         asyncio.run(save())

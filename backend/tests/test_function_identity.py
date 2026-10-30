@@ -11,8 +11,8 @@ from app.services.parser_service import (
     ParsedSource,
     identify_parsed_source,
 )
-from app.db.graph_ops import _extract_etl_records
-from app.main import _identify_repository_files
+from app.services.graph_records import extract_graph_records
+from app.services.repository_ingestion import identify_repository_files
 from app.utils.entity_identity import (
     generate_function_entity_id,
     normalize_repository_path,
@@ -125,7 +125,7 @@ def test_typescript_overload_signatures_are_kept_apart_from_implementation() -> 
     assert [call.name for call in implementation.calls] == ["check"]
 
     identified = parse("src/validator.ts", source)
-    _, persisted_functions, _ = _extract_etl_records([identified], REPOSITORY)
+    _, persisted_functions, _ = extract_graph_records([identified], REPOSITORY)
     assert len(persisted_functions) == 1
     assert persisted_functions[0]["entity_id"] == identified.functions[0].entity_id
     assert "check(value)" in persisted_functions[0]["raw_code"]
@@ -178,7 +178,7 @@ def test_full_ingest_attaches_identity_after_temporary_path_is_relativized(
     parsed = parse_source(str(source_file), source_file.read_bytes())
     assert parsed.file_path == str(source_file)
 
-    (identified,) = _identify_repository_files(
+    (identified,) = identify_repository_files(
         [parsed], tmp_path, repository=REPOSITORY
     )
 

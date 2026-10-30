@@ -2,7 +2,7 @@
 
 import logging
 
-from app.db import get_neo4j_driver
+from app.db.driver import get_neo4j_driver
 from app.utils.embeddings import EMBEDDING_DIMENSIONS, FUNCTION_EMBEDDING_INDEX
 
 

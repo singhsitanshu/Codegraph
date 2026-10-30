@@ -6,7 +6,6 @@ processing then works only with the validated change set.
 """
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Annotated, Any, Self
 
 from pydantic import (
@@ -19,7 +18,7 @@ from pydantic import (
     model_validator,
 )
 
-from app.services.languages import SUPPORTED_EXTENSIONS
+from app.services.source_discovery import is_repository_source_path
 from app.utils.entity_identity import normalize_repository_path
 from app.utils.repository import GitHubRepository
 
@@ -119,10 +118,6 @@ class PushChangeSet:
     deleted_paths: list[str]
 
 
-def _is_supported_source(path: str) -> bool:
-    return Path(path).suffix.lower() in SUPPORTED_EXTENSIONS
-
-
 def parse_push_change_set(payload: dict[str, Any]) -> PushChangeSet:
     """Validate a push payload and reduce its commits to final file states.
 
@@ -136,11 +131,11 @@ def parse_push_change_set(payload: dict[str, Any]) -> PushChangeSet:
     deleted: set[str] = set()
     for commit in event.commits:
         for path in (*commit.added, *commit.modified):
-            if _is_supported_source(path):
+            if is_repository_source_path(path):
                 updated.add(path)
                 deleted.discard(path)
         for path in commit.removed:
-            if _is_supported_source(path):
+            if is_repository_source_path(path):
                 deleted.add(path)
                 updated.discard(path)
     return PushChangeSet(

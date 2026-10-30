@@ -5,13 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.db import (
-    GRAPH_QUERY,
-    NODE_CODE_QUERY,
+from app.db.code_queries import (
     REPOSITORY_TOKEN_QUERY,
     fetch_repository_total_tokens,
 )
 from app.db.graph_ops import (
+    DEFAULT_BATCH_SIZE,
     DELETE_FILES_QUERY,
     DELETE_ORPHAN_EXTERNAL_FUNCTIONS_QUERY,
     DELETE_OUTGOING_CALLS_QUERY,
@@ -23,9 +22,11 @@ from app.db.graph_ops import (
     MERGE_FILES_QUERY,
     MERGE_FUNCTIONS_QUERY,
     MERGE_REPOSITORY_TOKENS_QUERY,
-    chunk_data,
-    save_parsed_ast_to_neo4j,
-    save_parsed_ast_to_neo4j_with_progress,
+)
+from app.db.graph_queries import GRAPH_QUERY, NODE_CODE_QUERY
+from app.services.graph_ingestion import (
+    ingest_identified_files,
+    ingest_identified_files_with_progress,
 )
 from app.services.parser_service import (
     CodeParser,
@@ -34,6 +35,7 @@ from app.services.parser_service import (
     identify_parsed_source,
 )
 from app.utils import ingestion_progress
+from app.utils.batching import chunk_data
 from app.utils.entity_identity import generate_function_entity_id
 
 
@@ -116,19 +118,19 @@ def _save(driver, parsed_data, repo_name=REPO, **kwargs):
     with (
         patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
         patch(
-            "app.db.graph_ops.generate_embeddings",
+            "app.services.graph_ingestion.generate_embeddings",
             side_effect=_fake_embeddings,
         ) as embed_batch,
         patch(
-            "app.db.graph_ops.run_leiden_clustering",
+            "app.services.graph_ingestion.run_leiden_clustering",
             new=AsyncMock(),
         ) as cluster_graph,
         patch(
-            "app.db.graph_ops.label_and_store_communities",
+            "app.services.graph_ingestion.label_and_store_communities",
             new=AsyncMock(),
         ) as label_communities,
     ):
-        asyncio.run(save_parsed_ast_to_neo4j(parsed_data, repo_name, **kwargs))
+        asyncio.run(ingest_identified_files(parsed_data, repo_name, **kwargs))
     return embed_batch, cluster_graph, label_communities
 
 
@@ -177,7 +179,7 @@ def test_node_code_read_uses_graph_id_and_repository_scope() -> None:
 
 
 def test_chunk_data_uses_bounded_slices() -> None:
-    chunks = list(chunk_data(list(range(205))))
+    chunks = list(chunk_data(list(range(205)), DEFAULT_BATCH_SIZE))
 
     assert [len(chunk) for chunk in chunks] == [100, 100, 5]
     assert [item for chunk in chunks for item in chunk] == list(range(205))
@@ -536,7 +538,7 @@ def test_repository_token_baseline_read_is_scoped() -> None:
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.db.get_neo4j_driver", return_value=driver):
+    with patch("app.db.code_queries.get_neo4j_driver", return_value=driver):
         total = asyncio.run(
             fetch_repository_total_tokens("owner/repository")
         )
@@ -563,7 +565,7 @@ def _progress_values(driver, parsed_data, **kwargs) -> list[int]:
     async def collect() -> list[int]:
         return [
             update.progress
-            async for update in save_parsed_ast_to_neo4j_with_progress(
+            async for update in ingest_identified_files_with_progress(
                 parsed_data, REPO, **kwargs
             )
         ]
@@ -571,11 +573,11 @@ def _progress_values(driver, parsed_data, **kwargs) -> list[int]:
     with (
         patch("app.db.graph_ops.get_neo4j_driver", return_value=driver),
         patch(
-            "app.db.graph_ops.generate_embeddings",
+            "app.services.graph_ingestion.generate_embeddings",
             side_effect=_fake_embeddings,
         ),
-        patch("app.db.graph_ops.run_leiden_clustering", new=AsyncMock()),
-        patch("app.db.graph_ops.label_and_store_communities", new=AsyncMock()),
+        patch("app.services.graph_ingestion.run_leiden_clustering", new=AsyncMock()),
+        patch("app.services.graph_ingestion.label_and_store_communities", new=AsyncMock()),
     ):
         return asyncio.run(collect())
 

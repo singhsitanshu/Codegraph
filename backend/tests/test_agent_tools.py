@@ -9,21 +9,23 @@ import pytest
 from pydantic import ValidationError
 
 from app.agent.graph import (
-    ARCHITECTURAL_SUBSYSTEMS_QUERY,
     ARCHITECTURE_TOOL_NAME,
-    CALLERS_QUERY,
     CODE_AGENT_SYSTEM_PROMPT,
-    CODEBASE_STRUCTURE_QUERY,
-    EXTERNAL_DEPENDENCIES_QUERY,
-    FUNCTIONS_IN_FILE_QUERY,
-    OUTGOING_DEPENDENCIES_QUERY,
-    SEMANTIC_CODE_SEARCH_QUERY,
     CodeAgentAnswer,
     GraphRagMetrics,
     _run_code_agent,
     _tool_context_text,
     ask_code_agent_with_metrics,
     build_repository_tools,
+)
+from app.db.code_queries import (
+    ARCHITECTURAL_SUBSYSTEMS_QUERY,
+    CALLERS_QUERY,
+    CODEBASE_STRUCTURE_QUERY,
+    EXTERNAL_DEPENDENCIES_QUERY,
+    FUNCTIONS_IN_FILE_QUERY,
+    OUTGOING_DEPENDENCIES_QUERY,
+    SEMANTIC_CODE_SEARCH_QUERY,
 )
 from app.utils.embeddings import FUNCTION_EMBEDDING_INDEX
 
@@ -61,7 +63,7 @@ def _invoke_tool(tool, arguments, records):
     driver = MagicMock()
     driver.session.return_value = session_context
 
-    with patch("app.agent.graph.get_neo4j_driver", return_value=driver):
+    with patch("app.db.code_queries.get_neo4j_driver", return_value=driver):
         output = asyncio.run(tool.ainvoke(arguments))
     return output, session.run
 
@@ -238,7 +240,7 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
     embed_query = AsyncMock(return_value=embedding)
 
     with (
-        patch("app.agent.graph.get_neo4j_driver", return_value=driver),
+        patch("app.db.code_queries.get_neo4j_driver", return_value=driver),
         patch("app.agent.graph.generate_embedding", new=embed_query),
     ):
         output = asyncio.run(
@@ -307,7 +309,7 @@ def test_tools_reject_invalid_llm_arguments_before_querying(
 ) -> None:
     driver = MagicMock()
     with (
-        patch("app.agent.graph.get_neo4j_driver", return_value=driver),
+        patch("app.db.code_queries.get_neo4j_driver", return_value=driver),
         pytest.raises(ValidationError),
     ):
         asyncio.run(TOOLS[tool_name].ainvoke(arguments))
@@ -394,7 +396,7 @@ def test_code_agent_reports_graph_context_efficiency() -> None:
             new=AsyncMock(return_value=("Structured answer", messages)),
         ),
         patch(
-            "app.agent.graph.fetch_repository_total_tokens",
+            "app.db.code_queries.fetch_repository_total_tokens",
             new=AsyncMock(return_value=1_000),
         ) as fetch_total,
         patch("app.agent.graph.count_tokens", return_value=125) as count,

@@ -10,15 +10,17 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from neo4j.exceptions import ServiceUnavailable
 
-from app.main import _discover_repository_source_files, app
+from app.main import app
 from app.services.github_service import download_and_extract_repo
+from app.services.graph_ingestion import IngestionProgress
 from app.services.parser_service import (
     IdentifiedFile,
     ParsedFileProgress,
     ParsedSource,
 )
-from app.db.graph_ops import DatabaseWriteProgress
+from app.services.source_discovery import discover_repository_source_files
 from app.utils.repository import GitHubRepository
 
 
@@ -69,7 +71,7 @@ def test_repository_discovery_includes_every_supported_language(
     for file_name in [*supported_names, "README.md"]:
         (tmp_path / file_name).write_text("", encoding="utf-8")
 
-    discovered = _discover_repository_source_files(tmp_path)
+    discovered = discover_repository_source_files(tmp_path)
 
     assert {Path(file_path).name for file_path in discovered} == supported_names
 
@@ -105,30 +107,30 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
 
     async def save_with_progress(*args, **kwargs):
         save_calls.append((args, kwargs))
-        yield DatabaseWriteProgress("Pass 1: Creating Files...", 86)
-        yield DatabaseWriteProgress("Pass 2: Creating Functions...", 90)
-        yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
-        yield DatabaseWriteProgress(
+        yield IngestionProgress("Pass 1: Creating Files...", 86)
+        yield IngestionProgress("Pass 2: Creating Functions...", 90)
+        yield IngestionProgress("Pass 3: Mapping Dependencies...", 94)
+        yield IngestionProgress(
             "Detecting architectural communities...",
             97,
         )
-        yield DatabaseWriteProgress(
+        yield IngestionProgress(
             "Labeling architectural communities...",
             98,
         )
-        yield DatabaseWriteProgress("Completing transaction...", 99)
+        yield IngestionProgress("Completing transaction...", 99)
 
     with (
         patch(
-            "app.main.download_and_extract_repo",
+            "app.services.repository_ingestion.download_and_extract_repo",
             new=_fake_download(repository_root, released),
         ),
         patch(
-            "app.main.parse_changed_files_with_progress",
+            "app.services.repository_ingestion.parse_changed_files_with_progress",
             new=parse_with_progress,
         ),
         patch(
-            "app.main.save_parsed_ast_to_neo4j_with_progress",
+            "app.services.repository_ingestion.ingest_identified_files_with_progress",
             new=save_with_progress,
         ),
     ):
@@ -185,7 +187,7 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
 
 def test_ingest_repository_rejects_non_github_url() -> None:
     download = AsyncMock()
-    with patch("app.main.download_and_extract_repo", new=download):
+    with patch("app.services.repository_ingestion.download_and_extract_repo", new=download):
         response = TestClient(app).post(
             "/api/ingest-repo",
             json={"url": "https://example.com/psf/requests"},
@@ -208,9 +210,9 @@ def test_full_ingest_does_not_replace_graph_after_parse_failure(tmp_path: Path) 
     save = Mock()
     released: list[tuple[str, str]] = []
     with (
-        patch("app.main.download_and_extract_repo", new=_fake_download(tmp_path, released)),
-        patch("app.main.parse_changed_files_with_progress", new=failed_parse),
-        patch("app.main.save_parsed_ast_to_neo4j_with_progress", new=save),
+        patch("app.services.repository_ingestion.download_and_extract_repo", new=_fake_download(tmp_path, released)),
+        patch("app.services.repository_ingestion.parse_changed_files_with_progress", new=failed_parse),
+        patch("app.services.repository_ingestion.ingest_identified_files_with_progress", new=save),
     ):
         response = TestClient(app).post(
             "/api/ingest-repo", json={"url": "https://github.com/psf/requests"}
@@ -220,6 +222,56 @@ def test_full_ingest_does_not_replace_graph_after_parse_failure(tmp_path: Path) 
     assert records[-1]["status"] == "Repository ingestion failed."
     assert "could not be parsed" in records[-1]["error"]
     save.assert_not_called()
+    assert released == [("psf", "requests")]
+
+
+def test_neo4j_failure_ends_the_stream_with_a_failure_record(tmp_path: Path) -> None:
+    source_path = tmp_path / "app.py"
+    source_path.write_text("def f():\n    pass\n", encoding="utf-8")
+    parsed_source = ParsedSource(
+        file_path=str(source_path),
+        language="python",
+        defined_classes=(),
+        functions=(),
+        declarations=(),
+        unattributed_calls=(),
+        outgoing_calls=(),
+    )
+
+    async def parse(_paths: list[str]):
+        yield ParsedFileProgress(
+            index=0, processed=1, total=1, source_tokens=4, result=parsed_source
+        )
+
+    async def unavailable_database(*_args, **_kwargs):
+        yield IngestionProgress("Pass 1: Creating Files...", 86)
+        raise ServiceUnavailable("connection refused")
+
+    released: list[tuple[str, str]] = []
+    with (
+        patch(
+            "app.services.repository_ingestion.download_and_extract_repo",
+            new=_fake_download(tmp_path, released),
+        ),
+        patch(
+            "app.services.repository_ingestion.parse_changed_files_with_progress",
+            new=parse,
+        ),
+        patch(
+            "app.services.repository_ingestion.ingest_identified_files_with_progress",
+            new=unavailable_database,
+        ),
+    ):
+        response = TestClient(app).post(
+            "/api/ingest-repo", json={"url": "https://github.com/psf/requests"}
+        )
+
+    records = [json.loads(line) for line in response.text.splitlines()]
+    assert records[-1] == {
+        "status": "Repository ingestion failed.",
+        "progress": 86,
+        "error": "Neo4j is unavailable during repository ingestion",
+    }
     assert released == [("psf", "requests")]
 
 

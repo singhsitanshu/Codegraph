@@ -16,10 +16,11 @@ from app.agent.graph import (
     GraphRagMetrics,
     build_repository_tools,
 )
-from app.db import close_neo4j_driver
-from app.db.graph_ops import delete_repository_graph, save_parsed_ast_to_neo4j
+from app.db.driver import close_neo4j_driver
+from app.db.graph_ops import delete_repository_graph
 from app.db.neo4j_client import initialize_database
 from app.main import app
+from app.services.graph_ingestion import ingest_identified_files
 from app.services.parser_service import (
     CodeParser,
     IdentifiedFile,
@@ -97,18 +98,18 @@ def _save_mock_ast() -> None:
 
     async def save() -> None:
         try:
-            await save_parsed_ast_to_neo4j(MOCK_DATA, repo_name=TEST_REPO_NAME)
+            await ingest_identified_files(MOCK_DATA, repo_name=TEST_REPO_NAME)
         finally:
             await close_neo4j_driver()
 
     with patch(
-        "app.db.graph_ops.generate_embeddings",
+        "app.services.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.db.graph_ops.run_leiden_clustering",
+        "app.services.graph_ingestion.run_leiden_clustering",
         new=AsyncMock(),
     ), patch(
-        "app.db.graph_ops.label_and_store_communities",
+        "app.services.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         asyncio.run(save())
@@ -231,7 +232,7 @@ def test_api_graph_is_blank_without_repository_scope() -> None:
     """Do not query Neo4j or expose legacy nodes before repository selection."""
 
     graph_fetch = AsyncMock(return_value={"nodes": ["legacy"], "edges": []})
-    with patch("app.main.fetch_graph_data", new=graph_fetch):
+    with patch("app.main.fetch_graph_view", new=graph_fetch):
         response = TestClient(app).get("/api/graph")
 
     assert response.status_code == 200
@@ -244,7 +245,7 @@ def test_api_graph_passes_normalized_repository_scope() -> None:
 
     expected = {"nodes": [{"id": "scoped"}], "edges": []}
     graph_fetch = AsyncMock(return_value=expected)
-    with patch("app.main.fetch_graph_data", new=graph_fetch):
+    with patch("app.main.fetch_graph_view", new=graph_fetch):
         response = TestClient(app).get(
             "/api/graph",
             params={"repo_name": " test/mock-repository "},
@@ -261,7 +262,7 @@ def test_api_graph_passes_normalized_repository_scope() -> None:
 )
 def test_api_graph_rejects_invalid_repository_scope(repo_name: str) -> None:
     graph_fetch = AsyncMock()
-    with patch("app.main.fetch_graph_data", new=graph_fetch):
+    with patch("app.main.fetch_graph_view", new=graph_fetch):
         response = TestClient(app).get(
             "/api/graph",
             params={"repo_name": repo_name},
@@ -397,8 +398,8 @@ def test_blast_radius_does_not_cross_repository_boundaries(
 
     async def save_and_query() -> tuple[dict[str, object], dict[str, object]]:
         try:
-            await save_parsed_ast_to_neo4j(repository_b, OTHER_TEST_REPO_NAME)
-            await save_parsed_ast_to_neo4j(
+            await ingest_identified_files(repository_b, OTHER_TEST_REPO_NAME)
+            await ingest_identified_files(
                 repository_a,
                 TEST_REPO_NAME,
                 replace_existing=True,
@@ -422,13 +423,13 @@ def test_blast_radius_does_not_cross_repository_boundaries(
             await close_neo4j_driver()
 
     with patch(
-        "app.db.graph_ops.generate_embeddings",
+        "app.services.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.db.graph_ops.run_leiden_clustering",
+        "app.services.graph_ingestion.run_leiden_clustering",
         new=AsyncMock(),
     ), patch(
-        "app.db.graph_ops.label_and_store_communities",
+        "app.services.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         payload_a, payload_b = asyncio.run(save_and_query())
@@ -494,10 +495,10 @@ def test_incremental_update_keeps_identity_and_incoming_edges(
 
     async def save() -> None:
         try:
-            await save_parsed_ast_to_neo4j(
+            await ingest_identified_files(
                 first_version, TEST_REPO_NAME, replace_existing=True
             )
-            await save_parsed_ast_to_neo4j(
+            await ingest_identified_files(
                 second_version,
                 TEST_REPO_NAME,
                 deleted_file_paths=["src/obsolete.py"],
@@ -506,13 +507,13 @@ def test_incremental_update_keeps_identity_and_incoming_edges(
             await close_neo4j_driver()
 
     with patch(
-        "app.db.graph_ops.generate_embeddings",
+        "app.services.graph_ingestion.generate_embeddings",
         side_effect=_fake_embeddings,
     ), patch(
-        "app.db.graph_ops.run_leiden_clustering",
+        "app.services.graph_ingestion.run_leiden_clustering",
         new=AsyncMock(),
     ), patch(
-        "app.db.graph_ops.label_and_store_communities",
+        "app.services.graph_ingestion.label_and_store_communities",
         new=AsyncMock(),
     ):
         asyncio.run(save())

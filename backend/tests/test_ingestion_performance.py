@@ -5,7 +5,8 @@ from contextlib import aclosing
 from unittest.mock import patch
 
 from app.services.parser_service import CodeParser
-from app.db.graph_ops import _embedded_function_batches, _resolve_calls
+from app.services.graph_ingestion import _embedded_function_batches
+from app.services.graph_records import resolve_calls
 
 
 def test_call_resolution_does_not_rescan_definitions():
@@ -25,7 +26,7 @@ def test_call_resolution_does_not_rescan_definitions():
         dict(entity_id=f"caller:{i}", qualified_name="caller", file_path=f"src/{i % 1000}.py")
         for i in range(3000)
     ]
-    calls, external, ambiguous = _resolve_calls(
+    calls, external, ambiguous = resolve_calls(
         callers, {caller["entity_id"]: ["validate"] for caller in callers}, definitions
     )
     # Each definition is indexed once, however many calls are resolved.
@@ -68,9 +69,9 @@ def test_embedding_groups_keep_all_definitions_and_bound_parallel_requests():
         return [row async for batch in _embedded_function_batches(functions) for row in batch]
 
     with (
-        patch("app.db.graph_ops.EMBEDDING_REQUEST_BATCH_SIZE", 2),
-        patch("app.db.graph_ops.MAX_CONCURRENT_EMBEDDING_REQUESTS", 2),
-        patch("app.db.graph_ops.generate_embeddings", side_effect=generate),
+        patch("app.services.graph_ingestion.EMBEDDING_REQUEST_BATCH_SIZE", 2),
+        patch("app.services.graph_ingestion.MAX_CONCURRENT_EMBEDDING_REQUESTS", 2),
+        patch("app.services.graph_ingestion.generate_embeddings", side_effect=generate),
     ):
         embedded = asyncio.run(collect())
     assert peak == 2
@@ -101,8 +102,8 @@ def test_failed_consumer_cancels_embedding_prefetch():
                 raise RuntimeError("database write failed")
 
     with (
-        patch("app.db.graph_ops.EMBEDDING_REQUEST_BATCH_SIZE", 1),
-        patch("app.db.graph_ops.generate_embeddings", side_effect=generate),
+        patch("app.services.graph_ingestion.EMBEDDING_REQUEST_BATCH_SIZE", 1),
+        patch("app.services.graph_ingestion.generate_embeddings", side_effect=generate),
     ):
         try:
             asyncio.run(fail_write())

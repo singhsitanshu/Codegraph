@@ -10,7 +10,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, create_model, field_validator
 
 from app.config import settings
-from app.db import get_neo4j_driver
+from app.db.community_ops import fetch_community_samples, replace_communities
 
 
 logger = logging.getLogger(__name__)
@@ -30,41 +30,6 @@ COMMUNITY_LABEL_SYSTEM_PROMPT = (
     "infer the architectural purpose of this cluster. Return a concise module "
     "name and a one-sentence description."
 )
-
-FETCH_COMMUNITIES_QUERY = """
-MATCH (f:Function {repo_name: $repo_name})
-WHERE f.leiden_community IS NOT NULL
-WITH f.leiden_community AS comm_id,
-     count(f) AS function_count,
-     collect(coalesce(f.qualified_name, f.name))[..15] AS func_names,
-     collect(DISTINCT f.file_path)[..5] AS file_paths
-RETURN comm_id, function_count, func_names, file_paths
-ORDER BY comm_id
-"""
-
-UNGROUP_SMALL_COMMUNITIES_QUERY = """
-MATCH (f:Function {repo_name: $repo_name})
-WHERE f.leiden_community IN $community_ids
-SET f.leiden_community = $ungrouped_id
-"""
-
-DELETE_COMMUNITIES_QUERY = """
-MATCH (c:Community {repo_name: $repo_name})
-DETACH DELETE c
-"""
-
-STORE_COMMUNITIES_QUERY = """
-UNWIND $communities AS comm
-MERGE (c:Community {repo_name: $repo_name, community_id: comm.id})
-SET c.name = comm.name,
-    c.description = comm.description
-WITH c, comm
-MATCH (f:Function {
-    repo_name: $repo_name,
-    leiden_community: comm.id
-})
-MERGE (f)-[:IN_COMMUNITY]->(c)
-"""
 
 
 class CommunityLabel(BaseModel):
@@ -155,15 +120,11 @@ async def label_and_store_communities(
 ) -> list[dict[str, Any]]:
     """Generate and atomically persist labels for one repository's clusters."""
 
-    driver = get_neo4j_driver()
-    async with driver.session() as session:
-        result = await session.run(
-            FETCH_COMMUNITIES_QUERY,
-            repo_name=repo_name,
-        )
-        records = await result.data()
-
-    records = [record for record in records if isinstance(record.get("comm_id"), int)]
+    records = [
+        record
+        for record in await fetch_community_samples(repo_name)
+        if isinstance(record.get("comm_id"), int)
+    ]
     # Tiny clusters carry no architectural signal and would each cost model
     # tokens, so they are pooled into one unlabeled community.
     small_community_ids = [
@@ -202,31 +163,12 @@ async def label_and_store_communities(
             }
         )
 
-    async with driver.session() as session:
-
-        async def replace_communities(transaction: Any) -> None:
-            deleted = await transaction.run(
-                DELETE_COMMUNITIES_QUERY,
-                repo_name=repo_name,
-            )
-            await deleted.consume()
-            if small_community_ids:
-                ungrouped = await transaction.run(
-                    UNGROUP_SMALL_COMMUNITIES_QUERY,
-                    repo_name=repo_name,
-                    community_ids=small_community_ids,
-                    ungrouped_id=UNGROUPED_COMMUNITY_ID,
-                )
-                await ungrouped.consume()
-            if communities:
-                stored = await transaction.run(
-                    STORE_COMMUNITIES_QUERY,
-                    repo_name=repo_name,
-                    communities=communities,
-                )
-                await stored.consume()
-
-        await session.execute_write(replace_communities)
+    await replace_communities(
+        repo_name,
+        communities,
+        ungrouped_community_ids=small_community_ids,
+        ungrouped_id=UNGROUPED_COMMUNITY_ID,
+    )
 
     logger.info(
         "Stored %d architectural community label(s) for %s with %s; "

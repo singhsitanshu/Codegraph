@@ -1,9 +1,9 @@
 import asyncio
 import logging
 
-from app.db.graph_ops import save_parsed_ast_to_neo4j
 from app.services.github_events import PushChangeSet
 from app.services.github_service import fetch_raw_file_content
+from app.services.graph_ingestion import ingest_identified_files
 from app.services.parser_service import (
     CodeParser,
     IdentifiedFile,
@@ -55,7 +55,7 @@ async def process_push_change_set(change_set: PushChangeSet) -> None:
             len(modified_files),
         )
 
-        await save_parsed_ast_to_neo4j(
+        await ingest_identified_files(
             parsed_relationships,
             repo_name=repository.full_name,
             deleted_file_paths=change_set.deleted_paths,

@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from app.db import close_neo4j_driver, get_neo4j_driver
-from app.db.graph_ops import save_parsed_ast_to_neo4j
+from app.db.driver import close_neo4j_driver, get_neo4j_driver
+from app.services.graph_ingestion import ingest_identified_files
 from app.services.parser_service import (
     identify_parsed_source,
     parse_changed_files,
@@ -80,7 +80,7 @@ async def ingest_repository() -> None:
     if not identified_files:
         raise RuntimeError("Tree-sitter produced no parsed data; ingestion aborted")
 
-    await save_parsed_ast_to_neo4j(
+    await ingest_identified_files(
         identified_files,
         repo_name=TARGET_REPO_NAME,
         replace_existing=True,

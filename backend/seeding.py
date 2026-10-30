@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.append(os.path.abspath("."))
 
 from app.services.parser_service import identify_parsed_source, parse_changed_files
-from app.db.graph_ops import save_parsed_ast_to_neo4j
+from app.services.graph_ingestion import ingest_identified_files
 
 # UPDATE THIS: Use an absolute path to your cloned requests directory
 # Example: "/Users/yourname/projects/requests" or "C:/Users/yourname/projects/requests"
@@ -84,7 +84,7 @@ async def main():
     # Check 4: Save to Neo4j
     print("\n[CHECK 4] Saving AST records to Neo4j...")
     try:
-        await save_parsed_ast_to_neo4j(
+        await ingest_identified_files(
             identified_files,
             repo_name=REQUESTS_REPO_NAME,
             replace_existing=True,

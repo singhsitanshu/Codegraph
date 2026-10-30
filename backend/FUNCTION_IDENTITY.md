@@ -70,7 +70,7 @@ Calls are attributed to the innermost captured definition **only when the call e
 
 ## Graph persistence (CG-002B)
 
-`app/db/graph_ops.py` writes the parsed functions to Neo4j:
+`app/services/graph_ingestion.py` writes the parsed functions to Neo4j; `app/services/graph_records.py` builds the records and resolves calls, and `app/db/graph_ops.py` runs the writes:
 
 | Entity | Identity | Notes |
 | --- | --- | --- |

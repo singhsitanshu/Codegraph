@@ -3,7 +3,7 @@
 import logging
 from typing import Any
 
-from app.db import get_neo4j_driver
+from app.db.driver import get_neo4j_driver
 
 
 logger = logging.getLogger(__name__)

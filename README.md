@@ -100,7 +100,7 @@ This diagram represents the streamed request lifecycle; the backend does not per
 
 1. **Validate the repository.** `POST /api/ingest-repo` accepts only an HTTPS `github.com` repository URL. The UI also accepts `owner/repository` shorthand and converts it to that URL form.
 2. **Download the default branch.** The backend requests GitHub's repository zipball without a ref, follows redirects, checks every archive member against path traversal, and extracts into a managed temporary directory.
-3. **Discover source.** Files with an extension registered in [`backend/app/services/languages.py`](backend/app/services/languages.py) (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`, `.go`, and `.java`) are included; supporting another language means adding one `LanguageSpec` there plus its grammar package in `backend/requirements.txt`. `.git`, virtual environments, caches, `build`, `dist`, and `node_modules` directories are skipped.
+3. **Discover source.** Files with an extension registered in [`backend/app/services/languages.py`](backend/app/services/languages.py) (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`, `.go`, and `.java`) are included; supporting another language means adding one `LanguageSpec` there plus its grammar package in `backend/requirements.txt`. `.git`, virtual environments, caches, `build`, `dist`, and `node_modules` directories are skipped, both here and for webhook pushes ([`backend/app/services/source_discovery.py`](backend/app/services/source_discovery.py)).
 4. **Parse concurrently.** File work is scheduled asynchronously with at most 32 file-read slots. CPU-bound Tree-sitter parsing runs in worker threads; a per-language lock prevents concurrent use of a shared parser instance. Failed files advance progress but are not persisted.
 5. **Create a token baseline.** Every readable discovered source file is counted with tiktoken's `gpt-4o` encoding, including files whose parse later fails. The total is stored on the repository node for context-efficiency reporting.
 6. **Normalize and flatten.** Temporary paths become stable repository-relative paths. Parsed files are flattened into file, function, and call records.
@@ -427,11 +427,11 @@ Codegraph/
 │   ├── app/
 │   │   ├── agent/          # LangGraph tools and agent orchestration
 │   │   ├── api/            # GitHub webhook route and signature dependency
-│   │   ├── db/             # Neo4j serialization, ETL, indexes, and GDS
-│   │   ├── services/       # GitHub, parsing, embedding, labeling, and pipeline code
-│   │   ├── utils/          # Token counting
+│   │   ├── db/             # Neo4j driver, queries, writes, indexes, and GDS
+│   │   ├── services/       # Ingestion, call resolution, graph view, GitHub, parsing, embedding, and labeling
+│   │   ├── utils/          # Token counting, progress scale, and shared helpers
 │   │   ├── config.py       # Backend settings
-│   │   └── main.py         # FastAPI routes and ingestion lifecycle
+│   │   └── main.py         # FastAPI routes and NDJSON ingestion stream
 │   ├── tests/              # Backend unit/API/integration tests
 │   └── requirements.txt
 ├── frontend/

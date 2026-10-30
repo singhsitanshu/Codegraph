@@ -33,9 +33,10 @@ async def benchmark(args):
 
     from app import main
     from app.config import settings
-    from app.db import close_neo4j_driver, fetch_node_code, get_neo4j_driver
+    from app.db.driver import close_neo4j_driver, get_neo4j_driver
+    from app.db.graph_queries import fetch_node_code
     from app.db.neo4j_client import initialize_database
-    from app.services import community_summarizer, embedding_service
+    from app.services import community_summarizer, embedding_service, repository_ingestion
     from app.utils.embeddings import EMBEDDING_DIMENSIONS
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -67,7 +68,7 @@ async def benchmark(args):
         return await label_generate(*call_args, **kwargs)
 
     community_summarizer._generate_community_labels = counted_labels
-    download = main.download_and_extract_repo
+    download = repository_ingestion.download_and_extract_repo
 
     @asynccontextmanager
     async def measured_download(*call_args, **kwargs):
@@ -75,7 +76,7 @@ async def benchmark(args):
             stats["archive_root_name"] = root.name
             yield root
 
-    main.download_and_extract_repo = measured_download
+    repository_ingestion.download_and_extract_repo = measured_download
     started = perf_counter()
     stage = None
     last_print = 0
