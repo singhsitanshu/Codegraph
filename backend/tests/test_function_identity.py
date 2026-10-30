@@ -5,12 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from app.services.parser_service import (
-    CodeParser,
-    IdentifiedFile,
-    ParsedSource,
-    identify_parsed_source,
-)
+from app.services.parse_results import IdentifiedFile, ParsedSource
+from app.services.parser_service import CodeParser
+from app.services.source_identity import identify_parsed_source
 from app.services.graph_records import extract_graph_records
 from app.services.repository_ingestion import identify_repository_files
 from app.utils.entity_identity import (

@@ -4,7 +4,7 @@ This is the parser contract for function identity. Since CG-002B the Neo4j write
 
 ## Parsed output
 
-`CodeParser.parse_file(path, source)` returns a frozen `ParsedSource` (`app/services/parser_service.py`) with the file's `file_path` (as given, possibly a temporary absolute path), `language`, `defined_classes`, `functions`, `declarations`, `unattributed_calls`, and the file-wide `outgoing_calls`. It has no repository identity yet.
+`CodeParser.parse_file(path, source)` returns a frozen `ParsedSource` (`app/services/parse_results.py`) with the file's `file_path` (as given, possibly a temporary absolute path), `language`, `defined_classes`, `functions`, `declarations`, `unattributed_calls`, and the file-wide `outgoing_calls`. It has no repository identity yet.
 
 - `functions` holds `ParsedFunction` records: executable definitions with a body. Each has `name`, `qualified_name`, `signature`, `definition_discriminator`, source span, `raw_code`, and the `calls` attributed to its body.
 - `declarations` holds `FunctionDeclaration` records with the same metadata but no body and no calls. These are declaration-only TypeScript overload and interface method signatures; their `raw_code` is the declaration.

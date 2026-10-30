@@ -16,18 +16,15 @@ from pathlib import Path
 import httpx
 
 from app.db.errors import NEO4J_ERRORS, Neo4jFailureDetails
+from app.services.batch_parsing import parse_changed_files_with_progress
 from app.services.github_service import download_and_extract_repo
 from app.services.graph_ingestion import (
     IngestionProgress,
     ingest_identified_files_with_progress,
 )
-from app.services.parser_service import (
-    IdentifiedFile,
-    ParsedSource,
-    identify_parsed_source,
-    parse_changed_files_with_progress,
-)
+from app.services.parse_results import IdentifiedFile, ParsedSource
 from app.services.source_discovery import discover_repository_source_files
+from app.services.source_identity import identify_parsed_source
 from app.utils import ingestion_progress
 from app.utils.repository import GitHubRepository
 

@@ -23,7 +23,7 @@ from app.services.embedding_service import (
     generate_embeddings,
 )
 from app.services.graph_records import extract_graph_records, resolve_calls
-from app.services.parser_service import IdentifiedFile
+from app.services.parse_results import IdentifiedFile
 from app.utils import ingestion_progress
 from app.utils.batching import chunk_data
 from app.utils.entity_identity import normalize_repository_path

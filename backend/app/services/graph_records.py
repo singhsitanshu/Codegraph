@@ -10,7 +10,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-from app.services.parser_service import IdentifiedFile, IdentifiedFunction
+from app.services.parse_results import IdentifiedFile, IdentifiedFunction
 
 
 logger = logging.getLogger(__name__)

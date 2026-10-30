@@ -11,11 +11,9 @@ from neo4j import Driver
 
 from app.db.driver import close_neo4j_driver
 from app.services.graph_ingestion import ingest_identified_files
-from app.services.parser_service import (
-    CodeParser,
-    IdentifiedFile,
-    identify_parsed_source,
-)
+from app.services.parse_results import IdentifiedFile
+from app.services.parser_service import CodeParser
+from app.services.source_identity import identify_parsed_source
 
 TEST_REPO_NAME = "test/leiden-two-groups"
 CLEANUP_QUERY = "MATCH (n {repo_name: $repo_name}) DETACH DELETE n"

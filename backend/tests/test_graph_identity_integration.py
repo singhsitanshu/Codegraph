@@ -25,7 +25,8 @@ from app.db.graph_ops import (
 )
 from app.services.graph_ingestion import ingest_identified_files
 from app.services.graph_view import fetch_graph_view
-from app.services.parser_service import CodeParser, identify_parsed_source
+from app.services.parser_service import CodeParser
+from app.services.source_identity import identify_parsed_source
 
 REPO = "integration/identity"
 PASSWORD = "integration-password"

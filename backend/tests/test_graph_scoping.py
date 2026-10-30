@@ -28,12 +28,9 @@ from app.services.graph_ingestion import (
     ingest_identified_files,
     ingest_identified_files_with_progress,
 )
-from app.services.parser_service import (
-    CodeParser,
-    IdentifiedFile,
-    IdentifiedFunction,
-    identify_parsed_source,
-)
+from app.services.parse_results import IdentifiedFile, IdentifiedFunction
+from app.services.parser_service import CodeParser
+from app.services.source_identity import identify_parsed_source
 from app.utils import ingestion_progress
 from app.utils.batching import chunk_data
 from app.utils.entity_identity import generate_function_entity_id

@@ -15,7 +15,7 @@ from neo4j.exceptions import ServiceUnavailable
 from app.main import app
 from app.services.github_service import download_and_extract_repo
 from app.services.graph_ingestion import IngestionProgress
-from app.services.parser_service import (
+from app.services.parse_results import (
     IdentifiedFile,
     ParsedFileProgress,
     ParsedSource,

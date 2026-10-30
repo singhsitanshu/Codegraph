@@ -4,11 +4,9 @@ import logging
 from app.services.github_events import PushChangeSet
 from app.services.github_service import fetch_raw_file_content
 from app.services.graph_ingestion import ingest_identified_files
-from app.services.parser_service import (
-    CodeParser,
-    IdentifiedFile,
-    identify_parsed_source,
-)
+from app.services.parse_results import IdentifiedFile
+from app.services.parser_service import CodeParser
+from app.services.source_identity import identify_parsed_source
 
 
 logger = logging.getLogger(__name__)
