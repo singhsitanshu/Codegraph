@@ -15,6 +15,15 @@ from time import perf_counter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.utils.repository import GitHubRepository  # noqa: E402
+
+
+def repository_argument(value):
+    try:
+        return GitHubRepository.from_full_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
 
 async def benchmark(args):
     os.environ["NEO4J_URI"] = args.neo4j_uri
@@ -31,7 +40,7 @@ async def benchmark(args):
     logging.basicConfig(filename=str(args.output.with_suffix(".log")), level=logging.INFO, force=True)
     await asyncio.to_thread(initialize_database)
     stats = {
-        "repo_name": args.repo,
+        "repo_name": args.repo.full_name,
         "timing_scope": "download, parse, embeddings, graph writes, GDS, community labels, cleanup",
         "embedding_cache_was_empty": not Path(settings.EMBEDDING_CACHE_PATH).exists() if settings.EMBEDDING_CACHE_PATH else True,
         "embedding_requests": 0, "embedding_inputs": 0,
@@ -69,7 +78,7 @@ async def benchmark(args):
     last_print = 0
     stats["stages"] = []
     try:
-        async for line in main._stream_repository_ingestion(*args.repo.split("/")):
+        async for line in main._stream_repository_ingestion(args.repo):
             record = json.loads(line)
             elapsed = perf_counter() - started
             status = record["status"]
@@ -98,22 +107,22 @@ async def benchmark(args):
                 "sum(CASE WHEN file IS NULL OR file.path <> f.file_path THEN 1 ELSE 0 END) AS invalid_defines, "
                 "sum(CASE WHEN f.embedding IS NULL OR size(f.embedding) <> 1536 THEN 1 ELSE 0 END) AS invalid_vectors, "
                 "count(DISTINCT CASE WHEN f.has_body THEN [f.file_path, f.name] END) AS previous_embedding_inputs",
-                repo=args.repo,
+                repo=args.repo.full_name,
             )
             stats["persisted"] = dict(await result.single())
             result = await session.run(
                 "MATCH (f:Function {repo_name:$repo}) WHERE NOT (f)-[:IN_COMMUNITY]->(:Community) "
-                "RETURN count(f) AS missing_communities", repo=args.repo,
+                "RETURN count(f) AS missing_communities", repo=args.repo.full_name,
             )
             stats["missing_communities"] = (await result.single())["missing_communities"]
             result = await session.run(
                 "MATCH (f:Function {repo_name:$repo}) "
                 "RETURN elementId(f) AS node_id, f.raw_code AS code, f.file_path AS path LIMIT 2",
-                repo=args.repo,
+                repo=args.repo.full_name,
             )
             samples = await result.data()
         for sample in samples:
-            source = await fetch_node_code(sample["node_id"], args.repo)
+            source = await fetch_node_code(sample["node_id"], args.repo.full_name)
             assert source["code"] == sample["code"] and source["file_path"] == sample["path"]
         stats["source_samples_verified"] = len(samples)
         persisted = stats["persisted"]
@@ -131,12 +140,10 @@ async def benchmark(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", default="tiangolo/fastapi")
+    parser.add_argument("--repo", type=repository_argument, default="tiangolo/fastapi")
     parser.add_argument("--neo4j-uri", required=True)
     parser.add_argument("--cache-path")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-under", type=float)
     arguments = parser.parse_args()
-    if len(arguments.repo.split("/")) != 2 or not all(arguments.repo.split("/")):
-        parser.error("--repo must be owner/repository")
     asyncio.run(benchmark(arguments))

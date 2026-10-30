@@ -7,25 +7,36 @@ import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app.main import (
-    _discover_repository_source_files,
-    _parse_github_repository_url,
-    app,
-)
+from app.main import _discover_repository_source_files, app
 from app.services.github_service import (
     cleanup_downloaded_repo,
     download_and_extract_repo,
 )
 from app.services.parser_service import ParsedFileProgress
 from app.db.graph_ops import DatabaseWriteProgress
+from app.utils.repository import GitHubRepository
 
 
 def test_parse_github_repository_url() -> None:
-    assert _parse_github_repository_url(
-        "https://github.com/psf/requests.git/"
-    ) == ("psf", "requests")
+    assert GitHubRepository.from_url(
+        " https://github.com/psf/requests.git/ "
+    ) == GitHubRepository(owner="psf", name="requests")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://github.com/psf/requests",
+        "https://github.com/psf",
+        "https://github.com/psf/requests/tree/main",
+    ],
+)
+def test_parse_github_repository_url_rejects_non_repository_urls(url: str) -> None:
+    with pytest.raises(ValueError):
+        GitHubRepository.from_url(url)
 
 
 def test_repository_discovery_includes_every_supported_language(
@@ -149,12 +160,16 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
 
 
 def test_ingest_repository_rejects_non_github_url() -> None:
-    response = TestClient(app).post(
-        "/api/ingest-repo",
-        json={"url": "https://example.com/psf/requests"},
-    )
+    download = AsyncMock()
+    with patch("app.main.download_and_extract_repo", new=download):
+        response = TestClient(app).post(
+            "/api/ingest-repo",
+            json={"url": "https://example.com/psf/requests"},
+        )
 
     assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "url"]
+    download.assert_not_awaited()
 
 
 def test_full_ingest_does_not_replace_graph_after_parse_failure(tmp_path: Path) -> None:

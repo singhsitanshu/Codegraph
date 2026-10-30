@@ -252,6 +252,23 @@ def test_api_graph_passes_normalized_repository_scope() -> None:
     graph_fetch.assert_awaited_once_with(TEST_REPO_NAME)
 
 
+@pytest.mark.parametrize(
+    "repo_name",
+    ["not-a-repository", "owner/repository/extra", "owner/repo name"],
+)
+def test_api_graph_rejects_invalid_repository_scope(repo_name: str) -> None:
+    graph_fetch = AsyncMock()
+    with patch("app.main.fetch_graph_data", new=graph_fetch):
+        response = TestClient(app).get(
+            "/api/graph",
+            params={"repo_name": repo_name},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["query", "repo_name"]
+    graph_fetch.assert_not_awaited()
+
+
 def test_api_node_code_is_repository_scoped() -> None:
     """Fetch source by graph node ID without exposing another repository."""
 
@@ -292,6 +309,19 @@ def test_api_node_code_requires_repository_scope() -> None:
         response = TestClient(app).get("/api/node/function-id/code")
 
     assert response.status_code == 422
+    source_fetch.assert_not_awaited()
+
+
+def test_api_node_code_rejects_blank_node_id() -> None:
+    source_fetch = AsyncMock()
+    with patch("app.main.fetch_node_code", new=source_fetch):
+        response = TestClient(app).get(
+            "/api/node/%20/code",
+            params={"repo_name": TEST_REPO_NAME},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["path", "node_id"]
     source_fetch.assert_not_awaited()
 
 

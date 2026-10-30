@@ -92,30 +92,26 @@ RETURN graphName
 async def run_leiden_clustering(repo_name: str) -> dict[str, Any]:
     """Write Leiden community IDs for one repository's function-call graph."""
 
-    normalized_repo_name = repo_name.strip()
-    if not normalized_repo_name:
-        raise ValueError("repo_name must not be blank")
-
     async with get_neo4j_driver().session() as session:
         count_result = await session.run(
             COUNT_REPOSITORY_FUNCTIONS_QUERY,
-            repo_name=normalized_repo_name,
+            repo_name=repo_name,
         )
         count_records = await count_result.data()
         node_count = count_records[0]["node_count"] if count_records else 0
         if node_count == 0:
             logger.warning(
                 "Skipping clustering for %s: 0 nodes found",
-                normalized_repo_name,
+                repo_name,
             )
             return {"communityCount": 0, "modularity": 0.0}
 
-        graph_name = f"codebase_graph_{normalized_repo_name}"
+        graph_name = f"codebase_graph_{repo_name}"
         try:
             projection = await session.run(
                 PROJECT_CODEBASE_GRAPH_QUERY,
                 graph_name=graph_name,
-                repo_name=normalized_repo_name,
+                repo_name=repo_name,
             )
             await projection.consume()
 
@@ -138,7 +134,7 @@ async def run_leiden_clustering(repo_name: str) -> dict[str, Any]:
                 "projectedNodes=%s, projectedRelationships=%s, "
                 "communityCount=%s, singletons=%s, singletonRatio=%.3f, "
                 "modularity=%s",
-                normalized_repo_name,
+                repo_name,
                 function_count,
                 summary.get("projectedNodeCount"),
                 summary.get("projectedRelationshipCount"),
@@ -152,7 +148,7 @@ async def run_leiden_clustering(repo_name: str) -> dict[str, Any]:
                     "Leiden clustering for %s left %.0f%% of functions in "
                     "single-function communities; the projected graph is "
                     "too sparse to group them",
-                    normalized_repo_name,
+                    repo_name,
                     singleton_ratio * 100,
                 )
             return summary

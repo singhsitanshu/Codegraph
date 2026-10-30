@@ -2,21 +2,19 @@ import asyncio
 import json
 import logging
 import os
-import re
 import zipfile
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
-from urllib.parse import unquote, urlparse
+from typing import Annotated, Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 from app.api import webhooks
 from app.agent.graph import ask_code_agent_with_metrics
@@ -35,6 +33,11 @@ from app.services.parser_service import (
     SUPPORTED_EXTENSIONS,
     attach_function_entity_ids,
     parse_changed_files_with_progress,
+)
+from app.utils.repository import (
+    GitHubRepository,
+    GitHubRepositoryUrl,
+    RepositoryName,
 )
 
 
@@ -56,7 +59,6 @@ IGNORED_REPOSITORY_DIRECTORIES = frozenset(
         "venv",
     }
 )
-GITHUB_REPOSITORY_PART = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 @dataclass(frozen=True)
@@ -107,7 +109,7 @@ class ChatRequest(BaseModel):
     """Validated request body for the basic chat endpoint."""
 
     message: str = Field(min_length=1, max_length=10_000)
-    repo_name: str = Field(min_length=3, max_length=201)
+    repo_name: RepositoryName
 
     @field_validator("message")
     @classmethod
@@ -119,54 +121,21 @@ class ChatRequest(BaseModel):
             raise ValueError("message must not be blank")
         return stripped
 
-    @field_validator("repo_name")
-    @classmethod
-    def repo_name_must_be_canonical(cls, value: str) -> str:
-        """Require the same ``owner/repository`` key used by ingestion."""
-
-        return _normalize_repo_identifier(value)
-
 
 class IngestRepositoryRequest(BaseModel):
     """GitHub repository requested for on-demand graph ingestion."""
 
-    url: str = Field(min_length=1, max_length=2_048)
-
-    @field_validator("url")
-    @classmethod
-    def url_must_not_be_blank(cls, value: str) -> str:
-        """Trim the URL and reject whitespace-only input."""
-
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("url must not be blank")
-        return stripped
+    repository: GitHubRepositoryUrl = Field(alias="url")
 
 
 class RepositoryCleanupRequest(BaseModel):
     """Repository graph to remove during browser lifecycle cleanup."""
 
-    repo_name: str = Field(min_length=3, max_length=201)
-
-    @field_validator("repo_name")
-    @classmethod
-    def repo_name_must_be_canonical(cls, value: str) -> str:
-        """Normalize the cleanup scope before it reaches Neo4j."""
-
-        return _normalize_repo_identifier(value)
+    repo_name: RepositoryName
 
 
-def _normalize_repo_identifier(repo_name: str) -> str:
-    """Validate and normalize an ``owner/repository`` identifier."""
-
-    normalized = repo_name.strip().removesuffix(".git")
-    parts = normalized.split("/")
-    if (
-        len(parts) != 2
-        or not all(GITHUB_REPOSITORY_PART.fullmatch(part) for part in parts)
-    ):
-        raise ValueError("repo_name must use the 'owner/repository' format")
-    return normalized
+NodeId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+"""Neo4j element ID of a graph node, trimmed and required to be non-blank."""
 
 
 def _neo4j_failure(
@@ -194,34 +163,6 @@ def _neo4j_errors_as_http(details: Neo4jFailureDetails) -> Iterator[None]:
     except (Neo4jError, ServiceUnavailable) as exc:
         status_code, detail = _neo4j_failure(exc, details)
         raise HTTPException(status_code=status_code, detail=detail) from exc
-
-
-@contextmanager
-def _value_errors_as_422() -> Iterator[None]:
-    """Report request-identifier validation failures as HTTP 422."""
-
-    try:
-        yield
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-
-
-def _parse_github_repository_url(url: str) -> tuple[str, str]:
-    """Extract an owner and repository from a canonical GitHub HTTPS URL."""
-
-    parsed_url = urlparse(url)
-    if parsed_url.scheme.lower() != "https" or parsed_url.hostname not in {
-        "github.com",
-        "www.github.com",
-    }:
-        raise ValueError("url must be an HTTPS github.com repository URL")
-
-    decoded_path = unquote(parsed_url.path).strip("/")
-    owner, repo = _normalize_repo_identifier(decoded_path).split("/", 1)
-    return owner, repo
 
 
 def _discover_repository_source_files(extracted_root: str) -> list[str]:
@@ -281,41 +222,26 @@ app.include_router(webhooks.router)
 
 @app.get("/api/graph", tags=["graph"])
 async def get_graph(
-    repo_name: str | None = None,
+    repo_name: RepositoryName | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Return one repository graph, or an empty graph without a scope."""
 
     if repo_name is None:
         return {"nodes": [], "edges": []}
 
-    with _value_errors_as_422():
-        normalized_repo_name = _normalize_repo_identifier(repo_name)
-
     with _neo4j_errors_as_http(GRAPH_QUERY_FAILURES):
-        return await fetch_graph_data(normalized_repo_name)
+        return await fetch_graph_data(repo_name)
 
 
 @app.get("/api/node/{node_id}/code", tags=["graph"])
 async def get_node_code(
-    node_id: str,
-    repo_name: str,
+    node_id: NodeId,
+    repo_name: RepositoryName,
 ) -> dict[str, str]:
     """Return one repository-scoped function's source code on demand."""
 
-    normalized_node_id = node_id.strip()
-    if not normalized_node_id:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="node_id must not be blank",
-        )
-    with _value_errors_as_422():
-        normalized_repo_name = _normalize_repo_identifier(repo_name)
-
     with _neo4j_errors_as_http(NODE_SOURCE_FAILURES):
-        source = await fetch_node_code(
-            normalized_node_id,
-            normalized_repo_name,
-        )
+        source = await fetch_node_code(node_id, repo_name)
 
     if source is None:
         raise HTTPException(
@@ -325,12 +251,12 @@ async def get_node_code(
     return source
 
 
-async def _delete_repository_scope(normalized_repo_name: str) -> dict[str, str]:
+async def _delete_repository_scope(repo_name: str) -> dict[str, str]:
     """Delete one validated scope and map Neo4j failures to API errors."""
 
     with _neo4j_errors_as_http(REPOSITORY_DELETION_FAILURES):
-        await delete_repository_graph(normalized_repo_name)
-    return {"status": "success", "repo_name": normalized_repo_name}
+        await delete_repository_graph(repo_name)
+    return {"status": "success", "repo_name": repo_name}
 
 
 @app.delete("/api/repo", tags=["graph"])
@@ -341,12 +267,10 @@ async def cleanup_repository(request: RepositoryCleanupRequest) -> dict[str, str
 
 
 @app.delete("/api/repositories/{repo_name:path}", tags=["graph"])
-async def delete_repository(repo_name: str) -> dict[str, str]:
+async def delete_repository(repo_name: RepositoryName) -> dict[str, str]:
     """Permanently delete one repository-scoped graph from Neo4j."""
 
-    with _value_errors_as_422():
-        normalized_repo_name = _normalize_repo_identifier(repo_name)
-    return await _delete_repository_scope(normalized_repo_name)
+    return await _delete_repository_scope(repo_name)
 
 
 @app.post("/api/chat", tags=["chat"])
@@ -387,12 +311,11 @@ def _ingestion_failure_record(progress: int, error: str) -> str:
 
 
 async def _stream_repository_ingestion(
-    owner: str,
-    repository: str,
+    repository: GitHubRepository,
 ) -> AsyncIterator[str]:
     """Run repository ingestion while emitting NDJSON progress records."""
 
-    canonical_repo_name = f"{owner}/{repository}"
+    canonical_repo_name = repository.full_name
     extracted_root: str | None = None
     current_progress = 0
     total_repo_tokens = 0
@@ -402,7 +325,10 @@ async def _stream_repository_ingestion(
             status="Downloading repository...",
             progress=current_progress,
         )
-        extracted_root = await download_and_extract_repo(owner, repository)
+        extracted_root = await download_and_extract_repo(
+            repository.owner,
+            repository.name,
+        )
 
         current_progress = 20
         yield _ndjson_record(
@@ -524,11 +450,8 @@ async def ingest_repository(
 ) -> StreamingResponse:
     """Stream progress while ingesting a public GitHub repository."""
 
-    with _value_errors_as_422():
-        owner, repository = _parse_github_repository_url(request.url)
-
     return StreamingResponse(
-        _stream_repository_ingestion(owner, repository),
+        _stream_repository_ingestion(request.repository),
         media_type="application/x-ndjson",
         headers={
             "Cache-Control": "no-cache",

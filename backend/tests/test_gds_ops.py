@@ -49,7 +49,7 @@ def test_run_leiden_clustering_projects_writes_and_drops_graph() -> None:
     driver, session = _mock_driver([count_result, projection, leiden, dropped])
 
     with patch("app.db.gds_ops.get_neo4j_driver", return_value=driver):
-        result = asyncio.run(run_leiden_clustering(" owner/repository "))
+        result = asyncio.run(run_leiden_clustering("owner/repository"))
 
     assert result == {"communityCount": 3, "modularity": 0.42}
     graph_name = "codebase_graph_owner/repository"
@@ -140,11 +140,6 @@ def test_run_leiden_clustering_skips_empty_repository(caplog) -> None:
         repo_name="owner/empty",
     )
     assert "Skipping clustering for owner/empty: 0 nodes found" in caplog.text
-
-
-def test_run_leiden_clustering_rejects_blank_repository() -> None:
-    with pytest.raises(ValueError, match="repo_name must not be blank"):
-        asyncio.run(run_leiden_clustering("  "))
 
 
 def test_run_leiden_clustering_warns_when_most_functions_are_singletons(

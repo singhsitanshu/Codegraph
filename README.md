@@ -15,7 +15,7 @@ The resulting graph is both visual and conversational. The React dashboard expos
 - **Semantic retrieval:** OpenAI `text-embedding-3-small` vectors are stored in a 1,536-dimensional Neo4j vector index.
 - **Architectural discovery:** Neo4j GDS projects each repository's function-call graph as undirected, runs Leiden clustering, and releases the in-memory projection even when the algorithm fails.
 - **Interactive graph UI:** React Flow visualization with force-directed layout, dependency highlighting, module filtering, minimap navigation, and on-demand syntax-highlighted source.
-- **Incremental GitHub path:** HMAC-verified `push` and `pull_request` webhooks can process changed files in a FastAPI background task.
+- **Incremental GitHub path:** HMAC-verified `push` webhooks with a complete change set update changed files in a FastAPI background task.
 - **Focused correctness tests:** the test suite covers repository isolation, bounded database batches, source redaction from graph payloads, index creation, GDS cleanup, parser failure handling, API contracts, and frontend scoping.
 
 ## Architecture
@@ -346,12 +346,11 @@ Configure GitHub to send JSON events to:
 https://your-host.example/api/webhooks/github
 ```
 
-The endpoint requires GitHub's `X-Hub-Signature-256` HMAC header and compares it in constant time against `GITHUB_WEBHOOK_SECRET`. Valid JSON object payloads are acknowledged with HTTP `202`, then processed through a FastAPI background task.
+The endpoint requires GitHub's `X-Hub-Signature-256` HMAC header and compares it in constant time against `GITHUB_WEBHOOK_SECRET`. Bodies that are not JSON objects receive HTTP `400`. The route parses `push` payloads into a validated change set before responding: a processable push is acknowledged with HTTP `202` and `"status": "accepted"`, then applied in a FastAPI background task. Other signed events, incomplete pushes, and pushes without supported source changes are also acknowledged with `202` (so GitHub does not retry them), but with `"status": "ignored"` and a `reason`.
 
 Current event behavior:
 
 - `push` uses added and modified paths, fetches each file at the immutable `after` SHA, skips unsupported/deleted/unavailable files, parses successful responses, and merges them into the existing repository scope;
-- `pull_request` can process filenames only when they are embedded in the payload by a provider or fixture; GitHub's standard pull-request payload does not include the file list, and the current backend does not yet call the pull-request files API;
 - background exceptions are logged rather than returned to GitHub because acknowledgment has already occurred; and
 - the placeholder "blast radius" stage logs changed filenames but does not yet run a separate impact-analysis agent.
 

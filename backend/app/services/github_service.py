@@ -68,13 +68,8 @@ async def download_and_extract_repo(
     makes GitHub serve the repository's configured default branch.
     """
 
-    normalized_owner = repo_owner.strip()
-    normalized_repo = repo_name.strip()
-    if not normalized_owner or not normalized_repo:
-        raise ValueError("repo_owner and repo_name must not be blank")
-
-    encoded_owner = quote(normalized_owner, safe="")
-    encoded_repo = quote(normalized_repo, safe="")
+    encoded_owner = quote(repo_owner, safe="")
+    encoded_repo = quote(repo_name, safe="")
     temporary_directory = tempfile.TemporaryDirectory(prefix="github-repo-")
 
     try:
@@ -136,7 +131,7 @@ async def fetch_raw_file_content(
     encoded_owner = quote(owner, safe="")
     encoded_repo = quote(repo, safe="")
     encoded_sha = quote(commit_sha, safe="")
-    encoded_path = quote(file_path.lstrip("/"), safe="/")
+    encoded_path = quote(file_path, safe="/")
     url = (
         f"{RAW_GITHUB_BASE_URL}/{encoded_owner}/{encoded_repo}/"
         f"{encoded_sha}/{encoded_path}"

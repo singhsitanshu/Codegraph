@@ -5,6 +5,9 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from pydantic import ValidationError
+
 from app.agent.graph import (
     ARCHITECTURAL_SUBSYSTEMS_QUERY,
     CALLERS_QUERY,
@@ -63,7 +66,7 @@ def _invoke_tool(tool, arguments, records):
 def test_list_codebase_structure_returns_newline_separated_paths() -> None:
     output, run_query = _invoke_tool(
         list_codebase_structure,
-        {"repo_name": " owner/repository "},
+        {"repo_name": "owner/repository"},
         [
             {"file_path": "src/a.py"},
             {"file_path": "src/b.py"},
@@ -242,7 +245,7 @@ def test_semantic_code_search_embeds_and_formats_scoped_matches() -> None:
             semantic_code_search.ainvoke(
                 {
                     "query": "take a customer payment",
-                    "repo_name": " owner/repository ",
+                    "repo_name": "owner/repository",
                     "top_k": 5,
                 }
             )
@@ -276,7 +279,7 @@ def test_analyze_architectural_subsystems_returns_scoped_communities() -> None:
     ]
     output, run_query = _invoke_tool(
         analyze_architectural_subsystems,
-        {"repo_name": " owner/repository "},
+        {"repo_name": "owner/repository"},
         records,
     )
 
@@ -285,6 +288,31 @@ def test_analyze_architectural_subsystems_returns_scoped_communities() -> None:
         ARCHITECTURAL_SUBSYSTEMS_QUERY,
         repo_name="owner/repository",
     )
+
+
+@pytest.mark.parametrize(
+    ("graph_tool", "arguments"),
+    [
+        (query_graph_blast_radius, {"function_name": "  "}),
+        (list_functions_in_file, {"file_path": ""}),
+        (query_outgoing_dependencies, {"function_name": " "}),
+        (semantic_code_search, {"query": "  "}),
+        (semantic_code_search, {"query": "payments", "top_k": 0}),
+        (semantic_code_search, {"query": "payments", "top_k": 21}),
+    ],
+)
+def test_tools_reject_invalid_llm_arguments_before_querying(
+    graph_tool, arguments
+) -> None:
+    driver = MagicMock()
+    with (
+        patch("app.agent.graph.get_neo4j_driver", return_value=driver),
+        pytest.raises(ValidationError),
+    ):
+        asyncio.run(
+            graph_tool.ainvoke({"repo_name": "owner/repository", **arguments})
+        )
+    driver.session.assert_not_called()
 
 
 def test_code_agent_registers_all_repository_tools() -> None:
@@ -343,7 +371,7 @@ def test_code_agent_reports_graph_context_efficiency() -> None:
         result = asyncio.run(
             ask_code_agent_with_metrics(
                 "Explain the architecture",
-                " owner/repository ",
+                "owner/repository",
             )
         )
 

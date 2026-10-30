@@ -686,16 +686,13 @@ def attach_function_entity_ids(
     """
 
     normalized_path = normalize_repository_path(file_path)
-    normalized_repository = repository.strip()
-    if not normalized_repository:
-        raise ValueError("repository must not be blank")
     parsed_file["file_path"] = normalized_path
-    parsed_file["repository"] = normalized_repository
+    parsed_file["repository"] = repository
     for function in parsed_file.get("functions", []):
         function["file_path"] = normalized_path
-        function["repository"] = normalized_repository
+        function["repository"] = repository
         function["entity_id"] = generate_function_entity_id(
-            repository=normalized_repository,
+            repository=repository,
             file_path=normalized_path,
             language=function["language"],
             qualified_name=function["qualified_name"],

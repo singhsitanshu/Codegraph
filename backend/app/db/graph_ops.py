@@ -464,16 +464,13 @@ async def save_parsed_ast_to_neo4j_with_progress(
     the changed files are rebuilt.
     """
 
-    normalized_repo_name = repo_name.strip()
-    if not normalized_repo_name:
-        raise ValueError("repo_name must not be blank")
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
 
     stage_started = perf_counter()
     files, functions, function_calls = _extract_etl_records(
         parsed_data_list,
-        normalized_repo_name,
+        repo_name,
     )
     changed_paths = [file["path"] for file in files]
     deleted_paths = sorted(
@@ -498,9 +495,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
             extra_parameters: dict[str, Any] | None = None,
         ) -> None:
             async def execute(transaction: Any) -> None:
-                parameters: dict[str, Any] = {
-                    "repo_name": normalized_repo_name
-                }
+                parameters: dict[str, Any] = {"repo_name": repo_name}
                 if batch is not None:
                     parameters["batch"] = batch
                 if extra_parameters is not None:
@@ -516,7 +511,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
         elif affected_paths:
             result = await session.run(
                 FETCH_EXISTING_DEFINITIONS_QUERY,
-                repo_name=normalized_repo_name,
+                repo_name=repo_name,
                 paths=affected_paths,
             )
             existing_definitions = [
@@ -535,7 +530,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
         )
         logger.info(
             "Ingestion %s: prepared %d functions and %d call edges in %.2fs",
-            normalized_repo_name, len(functions), len(calls) + len(external_calls),
+            repo_name, len(functions), len(calls) + len(external_calls),
             perf_counter() - stage_started,
         )
 
@@ -600,7 +595,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
                     )
         logger.info(
             "Ingestion %s: embedded and stored functions in %.2fs",
-            normalized_repo_name, perf_counter() - stage_started,
+            repo_name, perf_counter() - stage_started,
         )
 
         yield DatabaseWriteProgress("Pass 3: Mapping Dependencies...", 94)
@@ -620,7 +615,7 @@ async def save_parsed_ast_to_neo4j_with_progress(
                 )
         logger.info(
             "Ingestion %s: stored dependencies in %.2fs",
-            normalized_repo_name, perf_counter() - stage_started,
+            repo_name, perf_counter() - stage_started,
         )
 
         if not replace_existing and affected_paths:
@@ -631,20 +626,20 @@ async def save_parsed_ast_to_neo4j_with_progress(
         97,
     )
     stage_started = perf_counter()
-    await run_leiden_clustering(normalized_repo_name)
+    await run_leiden_clustering(repo_name)
     logger.info(
         "Ingestion %s: clustered graph in %.2fs",
-        normalized_repo_name, perf_counter() - stage_started,
+        repo_name, perf_counter() - stage_started,
     )
     yield DatabaseWriteProgress(
         "Labeling architectural communities...",
         98,
     )
     stage_started = perf_counter()
-    await label_and_store_communities(normalized_repo_name)
+    await label_and_store_communities(repo_name)
     logger.info(
         "Ingestion %s: labeled communities in %.2fs",
-        normalized_repo_name, perf_counter() - stage_started,
+        repo_name, perf_counter() - stage_started,
     )
     yield DatabaseWriteProgress("Completing transaction...", 99)
 
@@ -671,14 +666,10 @@ async def save_parsed_ast_to_neo4j(
 async def delete_repository_graph(repo_name: str) -> None:
     """Delete every graph node scoped to one canonical repository name."""
 
-    normalized_repo_name = repo_name.strip()
-    if not normalized_repo_name:
-        raise ValueError("repo_name must not be blank")
-
     async def delete(transaction: Any) -> None:
         result = await transaction.run(
             DELETE_REPOSITORY_QUERY,
-            repo_name=normalized_repo_name,
+            repo_name=repo_name,
         )
         await result.consume()
 

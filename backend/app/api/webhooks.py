@@ -12,7 +12,8 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 
 from app.api.dependencies import verify_github_signature
-from app.services.pipeline import process_github_event
+from app.services.github_events import parse_push_change_set
+from app.services.pipeline import process_push_change_set
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ async def github_webhook(
     background_tasks: BackgroundTasks,
     signature_verified: Annotated[bool, Depends(verify_github_signature)],
 ) -> JSONResponse:
-    """Acknowledge a verified GitHub webhook and process it after the response."""
+    """Validate a signed GitHub push and apply its changes after the response."""
 
     # FastAPI resolves the dependency before entering this handler. Keeping the
     # value explicit makes that security boundary visible and type checked.
@@ -35,7 +36,7 @@ async def github_webhook(
             detail="GitHub signature verification failed",
         )
 
-    event_type = request.headers.get("X-GitHub-Event", "unknown")
+    event_type = request.headers.get("X-GitHub-Event", "unknown").strip().lower()
     try:
         payload: Any = await request.json()
     except ValueError as exc:
@@ -50,8 +51,23 @@ async def github_webhook(
             detail="Webhook JSON payload must be an object",
         )
 
-    background_tasks.add_task(process_github_event, payload, event_type)
-    logger.info("Accepted GitHub event '%s' for background processing", event_type)
+    # GitHub records non-2xx responses as failed deliveries, so signed events
+    # that cannot be processed are acknowledged as ignored, not rejected.
+    if event_type != "push":
+        return _ignored(f"'{event_type}' events are not processed")
+    try:
+        change_set = parse_push_change_set(payload)
+    except ValueError as exc:
+        logger.warning("Ignoring unsupported push payload: %s", exc)
+        return _ignored("push event does not contain a complete supported change set")
+    if not change_set.updated_paths and not change_set.deleted_paths:
+        return _ignored("no supported source files changed")
+
+    background_tasks.add_task(process_push_change_set, change_set)
+    logger.info(
+        "Accepted push to %s for background processing",
+        change_set.repository.full_name,
+    )
 
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
@@ -59,4 +75,14 @@ async def github_webhook(
             "status": "accepted",
             "message": "Webhook processing started in background",
         },
+    )
+
+
+def _ignored(reason: str) -> JSONResponse:
+    """Acknowledge a signed webhook that will not change any graph."""
+
+    logger.info("Ignoring GitHub webhook: %s", reason)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"status": "ignored", "reason": reason},
     )

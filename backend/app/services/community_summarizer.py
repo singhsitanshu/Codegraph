@@ -155,15 +155,11 @@ async def label_and_store_communities(
 ) -> list[dict[str, Any]]:
     """Generate and atomically persist labels for one repository's clusters."""
 
-    normalized_repo_name = repo_name.strip()
-    if not normalized_repo_name:
-        raise ValueError("repo_name must not be blank")
-
     driver = get_neo4j_driver()
     async with driver.session() as session:
         result = await session.run(
             FETCH_COMMUNITIES_QUERY,
-            repo_name=normalized_repo_name,
+            repo_name=repo_name,
         )
         records = await result.data()
 
@@ -211,13 +207,13 @@ async def label_and_store_communities(
         async def replace_communities(transaction: Any) -> None:
             deleted = await transaction.run(
                 DELETE_COMMUNITIES_QUERY,
-                repo_name=normalized_repo_name,
+                repo_name=repo_name,
             )
             await deleted.consume()
             if small_community_ids:
                 ungrouped = await transaction.run(
                     UNGROUP_SMALL_COMMUNITIES_QUERY,
-                    repo_name=normalized_repo_name,
+                    repo_name=repo_name,
                     community_ids=small_community_ids,
                     ungrouped_id=UNGROUPED_COMMUNITY_ID,
                 )
@@ -225,7 +221,7 @@ async def label_and_store_communities(
             if communities:
                 stored = await transaction.run(
                     STORE_COMMUNITIES_QUERY,
-                    repo_name=normalized_repo_name,
+                    repo_name=repo_name,
                     communities=communities,
                 )
                 await stored.consume()
@@ -236,7 +232,7 @@ async def label_and_store_communities(
         "Stored %d architectural community label(s) for %s with %s; "
         "%d community(ies) under %d functions grouped as %s",
         len(model_records),
-        normalized_repo_name,
+        repo_name,
         COMMUNITY_LABEL_MODEL,
         len(small_community_ids),
         MIN_LABELED_COMMUNITY_SIZE,

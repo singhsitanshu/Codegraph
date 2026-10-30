@@ -31,7 +31,7 @@ def test_delete_repository_graph_uses_scoped_detach_delete() -> None:
     driver.session.return_value = session_context
 
     with patch("app.db.graph_ops.get_neo4j_driver", return_value=driver):
-        asyncio.run(delete_repository_graph(" owner/repository "))
+        asyncio.run(delete_repository_graph("owner/repository"))
 
     transaction.run.assert_awaited_once_with(
         DELETE_REPOSITORY_QUERY,

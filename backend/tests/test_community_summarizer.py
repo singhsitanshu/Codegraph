@@ -60,7 +60,7 @@ def test_label_and_store_communities_replaces_repository_labels_atomically():
         patch("app.services.community_summarizer.get_neo4j_driver", return_value=driver),
         patch("app.services.community_summarizer._generate_community_labels", new=AsyncMock(return_value=labels)) as generate,
     ):
-        communities = asyncio.run(label_and_store_communities(" owner/repository "))
+        communities = asyncio.run(label_and_store_communities("owner/repository"))
     assert communities == labels
     generate.assert_awaited_once_with(records)
     session.run.assert_awaited_once_with(FETCH_COMMUNITIES_QUERY, repo_name="owner/repository")
@@ -100,11 +100,6 @@ def test_label_response_rejects_missing_duplicate_or_foreign_ids(ids):
     with patch("app.services.community_summarizer._get_community_label_client", return_value=client):
         with pytest.raises(RuntimeError, match="missing a required key"):
             asyncio.run(_generate_community_labels([dict(comm_id=2), dict(comm_id=7)]))
-
-
-def test_label_and_store_communities_rejects_blank_repository():
-    with pytest.raises(ValueError, match="repo_name must not be blank"):
-        asyncio.run(label_and_store_communities("  "))
 
 
 def test_small_communities_are_grouped_without_model_requests():
