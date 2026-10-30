@@ -38,7 +38,7 @@ The included development `docker-compose.yml` installs and allows the GDS
 procedures. Recreate the Neo4j service once after pulling this change:
 
 ```bash
-docker compose up -d --force-recreate neo4j
+docker compose --env-file backend/.env up -d --force-recreate neo4j
 ```
 
 ## Ingestion performance

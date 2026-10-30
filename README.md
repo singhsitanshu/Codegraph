@@ -194,20 +194,24 @@ cd Codegraph
 
 ### 2. Start Neo4j with GDS
 
+Create `backend/.env` and set `NEO4J_PASSWORD` to a password of your choice. Compose reads it from there; no credentials are checked in.
+
 ```bash
-docker compose up -d neo4j
+cp backend/.env.example backend/.env
+# edit backend/.env: NEO4J_PASSWORD=<your local password>
+docker compose --env-file backend/.env up -d neo4j
 ```
 
-The Compose service uses the tested Neo4j `2026.07.1` image, exposes Neo4j Browser on port `7474` and Bolt on `7687`, stores data in the `neo4j_data` volume, and installs the Graph Data Science (GDS) plugin. The checked-in development credentials are `neo4j` / `gladline`; change them before using the service outside an isolated local machine. Docker Desktop (or another Docker daemon) must be running first.
+The Compose service uses the tested Neo4j `2026.07.1` image, exposes Neo4j Browser on port `7474` and Bolt on `7687`, stores data in the `neo4j_data` volume, and installs the Graph Data Science (GDS) plugin. The Neo4j user is `neo4j` with the `NEO4J_PASSWORD` from `backend/.env`. Neo4j applies it only when the `neo4j_data` volume is first created; to change it later, run `ALTER CURRENT USER SET PASSWORD` in `cypher-shell` or recreate the volume with `docker compose down -v`. Docker Desktop (or another Docker daemon) must be running first.
 
 Confirm that Bolt accepts queries and GDS is loaded before starting the API:
 
 ```bash
-docker compose exec -T neo4j cypher-shell -u neo4j -p gladline 'RETURN 1 AS ready'
-docker compose exec -T neo4j cypher-shell -u neo4j -p gladline 'RETURN gds.version() AS gds_version'
+docker compose exec -T neo4j sh -c 'cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" "RETURN 1 AS ready"'
+docker compose exec -T neo4j sh -c 'cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" "RETURN gds.version() AS gds_version"'
 ```
 
-If the container has not finished starting, retry the checks after a few seconds. Codegraph needs GDS for Leiden community detection during ingestion; a responding Browser port alone is not enough. The development plugin install may need network access when the container first starts. Do not use the checked-in credentials for a public deployment.
+If the container has not finished starting, retry the checks after a few seconds. Codegraph needs GDS for Leiden community detection during ingestion; a responding Browser port alone is not enough. The development plugin install may need network access when the container first starts.
 
 ### 3. Configure and install the backend
 
@@ -217,18 +221,17 @@ The backend reads `backend/.env`.
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r backend/requirements.txt
-cp backend/.env.example backend/.env
 ```
 
-`backend/requirements.txt` is the backend's dependency list. Use the virtual environment's `python -m pip` and `python -m pytest` so installation and test collection use the same interpreter. The copied example already matches the local Compose credentials and leaves the optional GitHub token blank. Add model-provider keys to `backend/.env` for ingestion and chat:
+`backend/requirements.txt` is the backend's dependency list. Use the virtual environment's `python -m pip` and `python -m pytest` so installation and test collection use the same interpreter. `backend/.env` (created in step 2) also holds the webhook secret, the optional GitHub token, and the model-provider keys for ingestion and chat:
 
 ```dotenv
-GITHUB_WEBHOOK_SECRET=replace-with-a-long-random-secret
+GITHUB_WEBHOOK_SECRET=<long random secret, also set on the GitHub webhook>
 GITHUB_TOKEN=
 
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=gladline
+NEO4J_PASSWORD=<the password from step 2>
 
 ANTHROPIC_API_KEY=replace-with-your-anthropic-key
 OPENAI_API_KEY=replace-with-your-openai-key
@@ -404,15 +407,15 @@ The Node test suite covers repository input normalization, chunked NDJSON parsin
 
 ## Configuration
 
-The active settings class loads `backend/.env`, is case-insensitive, ignores unknown keys, and provides development defaults.
+The active settings class loads `backend/.env`, is case-insensitive, ignores unknown keys, and provides development defaults for everything except credentials.
 
 | Variable | Required for | Default | Notes |
 | --- | --- | --- | --- |
-| `GITHUB_WEBHOOK_SECRET` | Secure webhook verification | `development_secret` | Replace before accepting webhook traffic. |
+| `GITHUB_WEBHOOK_SECRET` | Webhooks | empty | Webhooks return `503` until it is set. |
 | `GITHUB_TOKEN` | Private repositories / higher GitHub limits | unset | Sent as a bearer token to GitHub API and raw-content requests. |
 | `NEO4J_URI` | All graph operations | `bolt://localhost:7687` | Matches local Compose networking from the host. |
 | `NEO4J_USER` | All graph operations | `neo4j` | Compose uses the same username. |
-| `NEO4J_PASSWORD` | All graph operations | `password` | The copied `backend/.env.example` sets `gladline` to match the checked-in local Compose configuration. |
+| `NEO4J_PASSWORD` | All graph operations | empty | `docker-compose.yml` reads the same value via `--env-file backend/.env`. |
 | `ANTHROPIC_API_KEY` | Chat | empty | The active model is currently hard-coded to `claude-sonnet-5`. |
 | `OPENAI_API_KEY` | Ingestion and semantic search | empty | Used by `text-embedding-3-small` and `gpt-4o-mini`. |
 | `CORS_ORIGINS` | Browser access from the dashboard | `["http://localhost:3000","http://localhost:5173"]` | JSON list of allowed dashboard origins. |

@@ -9,11 +9,12 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables and `.env`."""
 
-    GITHUB_WEBHOOK_SECRET: str = "development_secret"
+    # Credentials have no in-code fallbacks; set them in backend/.env.
+    GITHUB_WEBHOOK_SECRET: str = ""
     GITHUB_TOKEN: str | None = None
     NEO4J_URI: str = "bolt://localhost:7687"
     NEO4J_USER: str = "neo4j"
-    NEO4J_PASSWORD: str = "password"
+    NEO4J_PASSWORD: str = ""
     ANTHROPIC_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     EMBEDDING_CACHE_PATH: str = str(BACKEND_DIR / ".cache" / "embeddings.sqlite3")

@@ -19,6 +19,11 @@ from app.webhooks.pipeline import process_push_change_set
 REPOSITORY = GitHubRepository(owner="owner", name="repository")
 
 
+@pytest.fixture(autouse=True)
+def webhook_secret(monkeypatch):
+    monkeypatch.setattr(settings, "GITHUB_WEBHOOK_SECRET", "test-webhook-secret")
+
+
 def payload(commits, **overrides):
     return {
         "repository": {"full_name": "owner/repository", "name": "repository", "owner": {"login": "owner"}},
@@ -134,6 +139,11 @@ def test_webhook_rejects_invalid_signature():
         headers={"X-GitHub-Event": "push", "X-Hub-Signature-256": "sha256=invalid"},
     )
     assert response.status_code == 401
+
+
+def test_webhook_is_unavailable_without_a_configured_secret(monkeypatch):
+    monkeypatch.setattr(settings, "GITHUB_WEBHOOK_SECRET", "")
+    assert post_webhook({}).status_code == 503
 
 
 def test_fetch_failure_does_not_update_graph():

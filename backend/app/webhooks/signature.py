@@ -12,6 +12,11 @@ async def verify_github_signature(
 ) -> None:
     """Reject a request unless GitHub's HMAC SHA-256 signature matches its body."""
 
+    if not settings.GITHUB_WEBHOOK_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GITHUB_WEBHOOK_SECRET is not configured",
+        )
     if x_hub_signature_256 is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
