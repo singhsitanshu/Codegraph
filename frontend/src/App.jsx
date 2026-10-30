@@ -1,4 +1,12 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -56,6 +64,48 @@ const starterMessages = [
       "Ask me about the call graph — for example, “What calls verify_signature?”",
   },
 ];
+
+// The repository the chat and graph are scoped to moves through one phase at
+// a time, so a deletion cannot overlap an ingestion and progress or errors
+// cannot outlive the phase they describe:
+//   { phase: "idle" }
+//   { phase: "ingesting", progress, progressText }
+//   { phase: "failed", error }                  ingestion failed
+//   { phase: "ready", repoName, error }         error: last failed deletion
+//   { phase: "deleting", repoName }
+const NO_REPOSITORY = { phase: "idle" };
+
+function repositoryReducer(state, action) {
+  switch (action.type) {
+    case "ingestionStarted":
+      return {
+        phase: "ingesting",
+        progress: 0,
+        progressText: "Starting ingestion...",
+      };
+    case "ingestionProgressed":
+      if (state.phase !== "ingesting") return state;
+      return {
+        ...state,
+        progress: action.progress,
+        progressText: action.progressText,
+      };
+    case "ingestionSucceeded":
+      return { phase: "ready", repoName: action.repoName, error: "" };
+    case "ingestionFailed":
+      return { phase: "failed", error: action.error };
+    case "deletionStarted":
+      if (state.phase !== "ready") return state;
+      return { phase: "deleting", repoName: state.repoName };
+    case "deletionFailed":
+      if (state.phase !== "deleting") return state;
+      return { phase: "ready", repoName: state.repoName, error: action.error };
+    case "deleted":
+      return NO_REPOSITORY;
+    default:
+      throw new Error(`Unknown repository action: ${action.type}`);
+  }
+}
 
 function Icon({ name, className = "size-4" }) {
   const paths = {
@@ -589,19 +639,17 @@ function App() {
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [initialCenter, setInitialCenter] = useState(null);
   const [flowReady, setFlowReady] = useState(false);
-  const [graphStatus, setGraphStatus] = useState("idle");
-  const [graphError, setGraphError] = useState("");
+  // { status: "idle" | "loading" | "ready" } or { status: "error", error }
+  const [graphLoad, setGraphLoad] = useState({ status: "idle" });
   const [messages, setMessages] = useState(starterMessages);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [chatError, setChatError] = useState("");
   const [repositoryInput, setRepositoryInput] = useState("");
-  const [activeRepo, setActiveRepo] = useState(null);
-  const [ingestionStatus, setIngestionStatus] = useState("idle");
-  const [ingestionError, setIngestionError] = useState("");
-  const [isDeleting, setIsDeleting] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [progressText, setProgressText] = useState("Idle");
+  const [repository, dispatchRepository] = useReducer(
+    repositoryReducer,
+    NO_REPOSITORY,
+  );
   const [showClusters, setShowClusters] = useState(false);
   const [activeClusters, setActiveClusters] = useState(() => new Set());
   const [modulesOpen, setModulesOpen] = useState(false);
@@ -611,6 +659,15 @@ function App() {
   const flowInstanceRef = useRef(null);
   const modulesPopoverRef = useRef(null);
   const modulesButtonRef = useRef(null);
+  const isIngesting = repository.phase === "ingesting";
+  const isDeleting = repository.phase === "deleting";
+  const isRepositoryReady = repository.phase === "ready";
+  const activeRepo = isRepositoryReady || isDeleting ? repository.repoName : null;
+  const repositoryError =
+    repository.phase === "ready" || repository.phase === "failed"
+      ? repository.error
+      : "";
+  const graphStatus = graphLoad.status;
 
   useEffect(() => {
     if (!modulesOpen) return undefined;
@@ -812,23 +869,23 @@ function App() {
       setInitialCenter(null);
       setFocusedNodeId(null);
       setActiveClusters(new Set());
-      setGraphError("");
-      setGraphStatus("idle");
+      setGraphLoad({ status: "idle" });
       return;
     }
 
-    setGraphStatus("loading");
-    setGraphError("");
+    setGraphLoad({ status: "loading" });
     try {
       const graph = normalizeGraph(await fetchRepositoryGraph(repoName));
       setNodes(graph.nodes);
       setEdges(graph.edges);
       setInitialCenter(graph.initialCenter);
       setFocusedNodeId(null);
-      setGraphStatus("ready");
+      setGraphLoad({ status: "ready" });
     } catch (error) {
-      setGraphError(error instanceof Error ? error.message : "Could not load graph");
-      setGraphStatus("error");
+      setGraphLoad({
+        status: "error",
+        error: error instanceof Error ? error.message : "Could not load graph",
+      });
     }
   }, [setEdges, setNodes]);
 
@@ -876,77 +933,68 @@ function App() {
   const stopStreaming = () => abortRef.current?.abort();
 
   const deleteActiveRepository = async () => {
-    if (!activeRepo || isDeleting) return;
+    if (repository.phase !== "ready") return;
+    const { repoName } = repository;
     const confirmed = window.confirm(
-      `Delete ${activeRepo} and all of its graph data? This cannot be undone.`,
+      `Delete ${repoName} and all of its graph data? This cannot be undone.`,
     );
     if (!confirmed) return;
 
     abortRef.current?.abort();
-    setIsDeleting(true);
-    setIngestionError("");
+    dispatchRepository({ type: "deletionStarted" });
     try {
-      await deleteRepository(activeRepo);
-      setActiveRepo(null);
+      await deleteRepository(repoName);
+      dispatchRepository({ type: "deleted" });
       setNodes([]);
       setEdges([]);
       setInitialCenter(null);
       setFocusedNodeId(null);
-      setGraphError("");
-      setGraphStatus("idle");
-      setIngestionStatus("idle");
+      setGraphLoad({ status: "idle" });
       setRepositoryInput("");
       setMessages(starterMessages);
       setInput("");
       setChatError("");
-      setProgress(0);
-      setProgressText("Idle");
       setShowClusters(false);
       setActiveClusters(new Set());
     } catch (error) {
-      setIngestionError(
-        error instanceof Error ? error.message : "Repository deletion failed",
-      );
-    } finally {
-      setIsDeleting(false);
+      dispatchRepository({
+        type: "deletionFailed",
+        error: error instanceof Error ? error.message : "Repository deletion failed",
+      });
     }
   };
 
   const submitRepository = async (event) => {
     event.preventDefault();
-    const repository = repositoryInput.trim();
-    if (!repository || ingestionStatus === "ingesting" || isDeleting) return;
+    const requestedRepository = repositoryInput.trim();
+    if (!requestedRepository || isIngesting || isDeleting) return;
 
     abortRef.current?.abort();
-    setIngestionStatus("ingesting");
-    setIngestionError("");
-    setProgress(0);
-    setProgressText("Starting ingestion...");
+    dispatchRepository({ type: "ingestionStarted" });
     setChatError("");
-    setActiveRepo(null);
     setNodes([]);
     setEdges([]);
     setInitialCenter(null);
-    setGraphError("");
-    setGraphStatus("idle");
+    setGraphLoad({ status: "idle" });
     setShowClusters(false);
     setActiveClusters(new Set());
 
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      const result = await ingestRepository(repository, {
+      const result = await ingestRepository(requestedRepository, {
         signal: controller.signal,
-        onProgress: (update) => {
-          setProgress(update.progress);
-          setProgressText(update.status);
-          if (update.progress === 100 && update.repo_name) {
-            setActiveRepo(update.repo_name);
-          }
-        },
+        onProgress: (update) =>
+          dispatchRepository({
+            type: "ingestionProgressed",
+            progress: update.progress,
+            progressText: update.status,
+          }),
       });
-      setActiveRepo(result.repo_name);
-      setIngestionStatus("ready");
+      dispatchRepository({
+        type: "ingestionSucceeded",
+        repoName: result.repo_name,
+      });
       setMessages([
         starterMessages[0],
         {
@@ -958,11 +1006,10 @@ function App() {
       await loadGraph(result.repo_name);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
-      setIngestionStatus("error");
-      setProgressText("Ingestion failed");
-      setIngestionError(
-        error instanceof Error ? error.message : "Repository ingestion failed",
-      );
+      dispatchRepository({
+        type: "ingestionFailed",
+        error: error instanceof Error ? error.message : "Repository ingestion failed",
+      });
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
     }
@@ -972,7 +1019,7 @@ function App() {
     event.preventDefault();
     const prompt = input.trim();
     if (!prompt || streaming) return;
-    if (!activeRepo || ingestionStatus !== "ready") {
+    if (!isRepositoryReady) {
       setChatError("Ingest a repository before asking code-graph questions");
       return;
     }
@@ -1084,10 +1131,10 @@ function App() {
             <span className="inline-flex items-center gap-2 rounded-full border border-[#d8e2db] bg-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[#5d7069]">
               <i
                 className={`size-1.5 rounded-full ${
-                  ingestionStatus === "ready" ? "bg-[#65a56c]" : "bg-[#c6a34d]"
+                  activeRepo ? "bg-[#65a56c]" : "bg-[#c6a34d]"
                 }`}
               />
-              {ingestionStatus === "ingesting"
+              {isIngesting
                 ? "Indexing"
                 : isDeleting
                   ? "Deleting"
@@ -1120,7 +1167,7 @@ function App() {
                     id="repository"
                     type="text"
                     value={repositoryInput}
-                    disabled={ingestionStatus === "ingesting" || isDeleting}
+                    disabled={isIngesting || isDeleting}
                     onChange={(event) => setRepositoryInput(event.target.value)}
                     placeholder="https://github.com/psf/requests or psf/requests"
                     className="min-w-0 flex-1 rounded-xl border border-[#d7e0da] bg-white px-3 py-2 text-xs text-[#263a33] outline-none transition focus:border-[#92aa9f] disabled:opacity-60"
@@ -1128,20 +1175,18 @@ function App() {
                   <button
                     type="submit"
                     disabled={
-                      !repositoryInput.trim() ||
-                      ingestionStatus === "ingesting" ||
-                      isDeleting
+                      !repositoryInput.trim() || isIngesting || isDeleting
                     }
                     className="rounded-xl bg-[#174f3d] px-4 py-2 text-[10px] font-extrabold uppercase tracking-[0.1em] text-white transition hover:bg-[#0f3e2f] disabled:cursor-not-allowed disabled:opacity-40"
                   >
-                    {ingestionStatus === "ingesting" ? "Indexing…" : "Ingest"}
+                    {isIngesting ? "Indexing…" : "Ingest"}
                   </button>
                 </div>
-                {ingestionStatus === "ingesting" && (
+                {isIngesting && (
                   <div className="mt-3" aria-live="polite">
                     <div className="flex items-center justify-between gap-3 text-[10px] font-bold text-[#52645d]">
-                      <span>{progressText}</span>
-                      <span>{progress}%</span>
+                      <span>{repository.progressText}</span>
+                      <span>{repository.progress}%</span>
                     </div>
                     <div
                       className="mt-1.5 h-2 overflow-hidden rounded-full bg-[#e3e9e4]"
@@ -1149,29 +1194,29 @@ function App() {
                       aria-label="Repository ingestion progress"
                       aria-valuemin="0"
                       aria-valuemax="100"
-                      aria-valuenow={progress}
+                      aria-valuenow={repository.progress}
                     >
                       <div
                         className="h-full rounded-full bg-[#2f7d61] transition-[width] duration-300 ease-out"
-                        style={{ width: `${progress}%` }}
+                        style={{ width: `${repository.progress}%` }}
                       />
                     </div>
                   </div>
                 )}
-                {(ingestionError || activeRepo) && (
+                {(repositoryError || activeRepo) && (
                   <div className="mt-2 flex items-center justify-between gap-3">
                     <p
                       className={`min-w-0 truncate text-[10px] ${
-                        ingestionError ? "text-[#b45348]" : "text-[#39705e]"
+                        repositoryError ? "text-[#b45348]" : "text-[#39705e]"
                       }`}
                     >
-                      {ingestionError || `Active repository: ${activeRepo}`}
+                      {repositoryError || `Active repository: ${activeRepo}`}
                     </p>
                     {activeRepo && (
                       <button
                         type="button"
                         onClick={deleteActiveRepository}
-                        disabled={isDeleting || ingestionStatus === "ingesting"}
+                        disabled={isDeleting}
                         className="shrink-0 rounded-lg border border-[#e6c8c3] bg-[#fff8f6] px-2.5 py-1 text-[9px] font-extrabold uppercase tracking-[0.1em] text-[#a24f44] transition hover:bg-[#fbe9e5] disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {isDeleting ? "Deleting..." : "Delete"}
@@ -1194,9 +1239,7 @@ function App() {
             >
               <textarea
                 aria-label="Message"
-                disabled={
-                  !activeRepo || ingestionStatus !== "ready" || isDeleting
-                }
+                disabled={!isRepositoryReady}
                 className="max-h-32 min-h-12 w-full resize-none bg-transparent px-3 py-2 text-[13px] leading-5 text-[#263a33] outline-none placeholder:text-[#9ba7a2]"
                 placeholder={
                   activeRepo
@@ -1359,7 +1402,7 @@ function App() {
                     <Icon name="graph" className="size-5" />
                   </div>
                   <p className="mt-4 text-sm font-bold">Graph unavailable</p>
-                  <p className="mt-1 text-xs text-[#7d8b85]">{graphError}</p>
+                  <p className="mt-1 text-xs text-[#7d8b85]">{graphLoad.error}</p>
                   <button
                     onClick={() => loadGraph(activeRepo)}
                     className="mt-4 text-xs font-bold text-[#276d54] underline underline-offset-4"

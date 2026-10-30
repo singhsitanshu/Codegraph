@@ -5,9 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from app.services.parser_service import CodeParser
+from app.services.parser_service import (
+    CodeParser,
+    IdentifiedFile,
+    ParsedSource,
+    identify_parsed_source,
+)
 from app.db.graph_ops import _extract_etl_records
-from app.main import _use_repository_relative_paths
+from app.main import _identify_repository_files
 from app.utils.entity_identity import (
     generate_function_entity_id,
     normalize_repository_path,
@@ -17,21 +22,30 @@ from app.utils.entity_identity import (
 REPOSITORY = "example/backend"
 
 
-def parse(file_path: str, source: bytes) -> dict:
-    return asyncio.run(
-        CodeParser().parse_file(file_path, source, repository=REPOSITORY)
+def parse_source(file_path: str, source: bytes) -> ParsedSource:
+    return asyncio.run(CodeParser().parse_file(file_path, source))
+
+
+def parse(file_path: str, source: bytes) -> IdentifiedFile:
+    return identify_parsed_source(
+        parse_source(file_path, source),
+        repository=REPOSITORY,
+        file_path=file_path,
     )
 
 
 def test_same_name_in_different_files_has_different_entity_ids() -> None:
     source = b"def validate():\n    return True\n"
-    auth = parse("src/auth.py", source)["functions"][0]
-    payments = parse("src/payments.py", source)["functions"][0]
+    auth_file = parse("src/auth.py", source)
+    payments_file = parse("src/payments.py", source)
+    auth = auth_file.functions[0]
+    payments = payments_file.functions[0]
 
-    assert auth["qualified_name"] == payments["qualified_name"] == "validate"
-    assert auth["entity_id"] != payments["entity_id"]
-    assert auth["file_path"] == "src/auth.py"
-    assert payments["file_path"] == "src/payments.py"
+    assert auth.qualified_name == payments.qualified_name == "validate"
+    assert auth.entity_id != payments.entity_id
+    assert auth_file.file_path == "src/auth.py"
+    assert payments_file.file_path == "src/payments.py"
+    assert auth_file.repository == payments_file.repository == REPOSITORY
 
 
 def test_same_named_methods_in_different_classes_are_distinct() -> None:
@@ -42,13 +56,13 @@ def test_same_named_methods_in_different_classes_are_distinct() -> None:
         b"class AuthenticationService:\n"
         b"    def validate(self):\n        pass\n",
     )
-    methods = result["functions"]
+    methods = result.functions
 
-    assert [item["qualified_name"] for item in methods] == [
+    assert [item.qualified_name for item in methods] == [
         "PaymentService.validate",
         "AuthenticationService.validate",
     ]
-    assert len({item["entity_id"] for item in methods}) == 2
+    assert len({item.entity_id for item in methods}) == 2
 
 
 def test_repeated_python_definition_uses_occurrence_discriminator() -> None:
@@ -57,14 +71,14 @@ def test_repeated_python_definition_uses_occurrence_discriminator() -> None:
         b"def validate(value):\n    return value\n"
         b"def validate(value):\n    return not value\n",
     )
-    first, second = result["functions"]
+    first, second = result.functions
 
-    assert first["qualified_name"] == second["qualified_name"] == "validate"
-    assert first["definition_discriminator"] == "signature:(value);occurrence:1"
-    assert second["definition_discriminator"] == "signature:(value);occurrence:2"
-    assert first["entity_id"] != second["entity_id"]
-    assert (first["start_line"], first["end_line"]) == (1, 2)
-    assert (second["start_line"], second["end_line"]) == (3, 4)
+    assert first.qualified_name == second.qualified_name == "validate"
+    assert first.definition_discriminator == "signature:(value);occurrence:1"
+    assert second.definition_discriminator == "signature:(value);occurrence:2"
+    assert first.entity_id != second.entity_id
+    assert (first.start_line, first.end_line) == (1, 2)
+    assert (second.start_line, second.end_line) == (3, 4)
 
 
 def test_java_overloads_are_distinguished_by_signature() -> None:
@@ -76,68 +90,77 @@ def test_java_overloads_are_distinguished_by_signature() -> None:
         b"  void validate(int value) { check(value); }\n"
         b"}\n",
     )
-    constructor, first, second = result["functions"]
+    constructor, first, second = result.functions
 
-    assert constructor["qualified_name"] == "Validator.Validator"
-    assert first["qualified_name"] == second["qualified_name"] == "Validator.validate"
-    assert first["signature"] == "(String value)"
-    assert second["signature"] == "(int value)"
-    assert first["entity_id"] != second["entity_id"]
+    assert constructor.qualified_name == "Validator.Validator"
+    assert first.qualified_name == second.qualified_name == "Validator.validate"
+    assert first.signature == "(String value)"
+    assert second.signature == "(int value)"
+    assert first.entity_id != second.entity_id
 
 
-def test_typescript_overload_signatures_and_implementation_are_distinct() -> None:
-    result = parse(
-        "src/validator.ts",
+def test_typescript_overload_signatures_are_kept_apart_from_implementation() -> None:
+    source = (
         b"class Validator {\n"
         b"  validate(value: string): void;\n"
         b"  validate(value: number): void;\n"
         b"  validate(value: any): void { check(value); }\n"
-        b"}\n",
+        b"}\n"
     )
-    functions = result["functions"]
+    parsed = parse_source("src/validator.ts", source)
 
-    assert len(functions) == 3
-    assert {function["qualified_name"] for function in functions} == {
-        "Validator.validate"
-    }
-    assert len({function["entity_id"] for function in functions}) == 3
-    assert [function["has_body"] for function in functions] == [False, False, True]
-    assert result["defined_functions"] == ["validate"]
-    assert functions[0]["calls"] == functions[1]["calls"] == []
-    assert [call["name"] for call in functions[2]["calls"]] == ["check"]
-    _, persisted_functions, _ = _extract_etl_records([result], REPOSITORY)
+    assert [item.signature for item in parsed.declarations] == [
+        "(value: string)",
+        "(value: number)",
+    ]
+    assert [item.qualified_name for item in parsed.declarations] == [
+        "Validator.validate",
+        "Validator.validate",
+    ]
+    (implementation,) = parsed.functions
+    assert implementation.qualified_name == "Validator.validate"
+    assert implementation.definition_discriminator == (
+        "signature:(value: any);occurrence:1"
+    )
+    assert [call.name for call in implementation.calls] == ["check"]
+
+    identified = parse("src/validator.ts", source)
+    _, persisted_functions, _ = _extract_etl_records([identified], REPOSITORY)
     assert len(persisted_functions) == 1
-    assert persisted_functions[0]["entity_id"] == functions[2]["entity_id"]
+    assert persisted_functions[0]["entity_id"] == identified.functions[0].entity_id
     assert "check(value)" in persisted_functions[0]["raw_code"]
 
 
 def test_typescript_interface_methods_use_interface_scope() -> None:
-    result = parse(
+    result = parse_source(
         "src/contracts.ts",
         b"interface A { validate(x: string): void; }\n"
         b"interface B { validate(x: string): void; }\n",
     )
 
-    assert [item["qualified_name"] for item in result["functions"]] == [
+    assert result.functions == ()
+    assert [item.qualified_name for item in result.declarations] == [
         "A.validate", "B.validate"
     ]
-    assert len({item["entity_id"] for item in result["functions"]}) == 2
 
 
 def test_identity_is_deterministic_and_paths_are_normalized() -> None:
     source = b"def validate(value):\n    return value\n"
-    first = parse("src/./payments.py", source)["functions"][0]
-    second = parse("src/payments.py", source)["functions"][0]
-    third = parse("src\\payments.py", source)["functions"][0]
+    files = [
+        parse("src/./payments.py", source),
+        parse("src/payments.py", source),
+        parse("src\\payments.py", source),
+    ]
+    first, second, third = (file.functions[0] for file in files)
     body_edit = parse(
         "src/payments.py", b"def validate(value):\n    return not value\n"
-    )["functions"][0]
+    ).functions[0]
 
-    assert first["entity_id"] == second["entity_id"] == third["entity_id"]
-    assert body_edit["entity_id"] == first["entity_id"]
-    assert first["file_path"] == second["file_path"] == third["file_path"] == "src/payments.py"
-    assert first["entity_id"].startswith("fn:v1:")
-    assert first["entity_id"] == generate_function_entity_id(
+    assert first.entity_id == second.entity_id == third.entity_id
+    assert body_edit.entity_id == first.entity_id
+    assert {file.file_path for file in files} == {"src/payments.py"}
+    assert first.entity_id.startswith("fn:v1:")
+    assert first.entity_id == generate_function_entity_id(
         REPOSITORY,
         "src/payments.py",
         "python",
@@ -152,17 +175,18 @@ def test_full_ingest_attaches_identity_after_temporary_path_is_relativized(
     source_file = tmp_path / "src" / "payments.py"
     source_file.parent.mkdir()
     source_file.write_bytes(b"def validate():\n    return True\n")
-    parsed = asyncio.run(
-        CodeParser().parse_file(str(source_file), source_file.read_bytes())
+    parsed = parse_source(str(source_file), source_file.read_bytes())
+    assert parsed.file_path == str(source_file)
+
+    (identified,) = _identify_repository_files(
+        [parsed], str(tmp_path), repository=REPOSITORY
     )
 
-    _use_repository_relative_paths([parsed], str(tmp_path), repository=REPOSITORY)
-
-    assert parsed["file_path"] == "src/payments.py"
-    assert parsed["functions"][0]["file_path"] == "src/payments.py"
-    assert parsed["functions"][0]["entity_id"] == parse(
+    assert identified.file_path == "src/payments.py"
+    assert identified.repository == REPOSITORY
+    assert identified.functions[0].entity_id == parse(
         "src/payments.py", source_file.read_bytes()
-    )["functions"][0]["entity_id"]
+    ).functions[0].entity_id
 
 
 @pytest.mark.parametrize("path", ["/absolute/x.py", "../escape.py", "C:\\root\\x.py"])
@@ -171,8 +195,17 @@ def test_identity_rejects_non_relative_paths(path: str) -> None:
         normalize_repository_path(path)
 
 
+def test_files_cannot_be_identified_by_temporary_absolute_paths() -> None:
+    parsed = parse_source("/tmp/checkout/example.py", b"def example(): pass\n")
+
+    with pytest.raises(ValueError, match="repository-relative"):
+        identify_parsed_source(
+            parsed, repository=REPOSITORY, file_path=parsed.file_path
+        )
+
+
 def test_function_calls_are_attributed_to_the_enclosing_body() -> None:
-    result = parse(
+    result = parse_source(
         "src/calls.py",
         b"def first():\n"
         b"    api.validate()\n"
@@ -182,43 +215,38 @@ def test_function_calls_are_attributed_to_the_enclosing_body() -> None:
         b"    charge()\n"
         b"outside()\n",
     )
-    first, inner, second = result["functions"]
+    first, inner, second = result.functions
 
-    assert [function["qualified_name"] for function in result["functions"]] == [
+    assert [function.qualified_name for function in result.functions] == [
         "first", "first.inner", "second"
     ]
-    assert [call["name"] for call in first["calls"]] == ["validate"]
-    assert first["calls"][0]["syntax"] == "api.validate"
-    assert first["calls"][0]["resolution"] == "unresolved"
-    assert [call["name"] for call in inner["calls"]] == ["nested"]
-    assert [call["name"] for call in second["calls"]] == ["charge"]
-    assert [call["name"] for call in result["unattributed_calls"]] == ["outside"]
-    assert result["outgoing_calls"] == ["validate", "nested", "charge", "outside"]
+    assert [call.name for call in first.calls] == ["validate"]
+    assert first.calls[0].syntax == "api.validate"
+    assert [call.name for call in inner.calls] == ["nested"]
+    assert [call.name for call in second.calls] == ["charge"]
+    assert [call.name for call in result.unattributed_calls] == ["outside"]
+    assert result.outgoing_calls == ("validate", "nested", "charge", "outside")
 
 
 def test_anonymous_callback_call_is_not_assigned_to_outer_function() -> None:
-    result = parse(
+    result = parse_source(
         "src/callback.js",
         b"function outer() { run(() => hidden()); visible(); }\n",
     )
-    outer = result["functions"][0]
+    outer = result.functions[0]
 
-    assert [call["name"] for call in outer["calls"]] == ["run", "visible"]
-    assert [call["name"] for call in result["unattributed_calls"]] == ["hidden"]
+    assert [call.name for call in outer.calls] == ["run", "visible"]
+    assert [call.name for call in result.unattributed_calls] == ["hidden"]
 
 
 def test_go_function_literal_call_is_not_assigned_to_outer_function() -> None:
-    result = parse(
+    result = parse_source(
         "src/callback.go",
         b"package p\nfunc Outer() { f := func() { hidden() }; visible(); _ = f }\n",
     )
 
-    assert [call["name"] for call in result["functions"][0]["calls"]] == [
-        "visible"
-    ]
-    assert [call["name"] for call in result["unattributed_calls"]] == [
-        "hidden"
-    ]
+    assert [call.name for call in result.functions[0].calls] == ["visible"]
+    assert [call.name for call in result.unattributed_calls] == ["hidden"]
 
 
 @pytest.mark.parametrize(
@@ -235,11 +263,11 @@ def test_supported_languages_emit_identity_and_call_metadata(
     path: str, source: bytes, expected_qualified: str
 ) -> None:
     result = parse(path, source)
-    function = result["functions"][0]
+    function = result.functions[0]
 
-    assert function["qualified_name"] == expected_qualified
-    assert function["entity_id"].startswith("fn:v1:")
-    assert function["raw_code"]
-    assert function["start_line"] >= 1
-    assert function["end_line"] >= function["start_line"]
-    assert [call["name"] for call in function["calls"]] == ["g"]
+    assert function.qualified_name == expected_qualified
+    assert function.entity_id.startswith("fn:v1:")
+    assert function.raw_code
+    assert function.start_line >= 1
+    assert function.end_line >= function.start_line
+    assert [call.name for call in function.calls] == ["g"]

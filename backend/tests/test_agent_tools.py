@@ -17,6 +17,8 @@ from app.agent.graph import (
     FUNCTIONS_IN_FILE_QUERY,
     OUTGOING_DEPENDENCIES_QUERY,
     SEMANTIC_CODE_SEARCH_QUERY,
+    CodeAgentAnswer,
+    GraphRagMetrics,
     _get_code_agent,
     _tool_context_text,
     analyze_architectural_subsystems,
@@ -375,14 +377,26 @@ def test_code_agent_reports_graph_context_efficiency() -> None:
             )
         )
 
-    assert result == {
-        "answer": "Structured answer",
-        "metrics": {
-            "full_repo_tokens": 1_000,
-            "context_tokens": 125,
-            "tokens_saved": 875,
-            "efficiency_percentage": 87.5,
-        },
+    assert result == CodeAgentAnswer(
+        answer="Structured answer",
+        metrics=GraphRagMetrics(full_repo_tokens=1_000, context_tokens=125),
+    )
+    assert result.metrics.as_dict() == {
+        "full_repo_tokens": 1_000,
+        "context_tokens": 125,
+        "tokens_saved": 875,
+        "efficiency_percentage": 87.5,
     }
     count.assert_called_once_with("scoped context")
     fetch_total.assert_awaited_once_with("owner/repository")
+
+
+def test_metrics_without_a_repository_baseline_report_no_savings() -> None:
+    metrics = GraphRagMetrics(full_repo_tokens=0, context_tokens=125)
+
+    assert metrics.as_dict() == {
+        "full_repo_tokens": 0,
+        "context_tokens": 125,
+        "tokens_saved": 0,
+        "efficiency_percentage": 0.0,
+    }

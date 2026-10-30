@@ -2,6 +2,7 @@
 
 import json
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Annotated, Any
 
@@ -383,40 +384,67 @@ async def _run_code_agent(
     return response, messages
 
 
+@dataclass(frozen=True, slots=True)
+class GraphRagMetrics:
+    """Token cost of the graph context compared with the full repository.
+
+    The savings are derived, so they always agree with the two measured counts.
+    A repository without a stored baseline reports no savings.
+    """
+
+    full_repo_tokens: int
+    context_tokens: int
+
+    @property
+    def tokens_saved(self) -> int:
+        if self.full_repo_tokens <= 0:
+            return 0
+        return self.full_repo_tokens - self.context_tokens
+
+    @property
+    def efficiency_percentage(self) -> float:
+        if self.full_repo_tokens <= 0:
+            return 0.0
+        return round(self.tokens_saved / self.full_repo_tokens * 100, 2)
+
+    def as_dict(self) -> dict[str, int | float]:
+        """Serialize the counts and savings for the chat API response."""
+
+        return {
+            "full_repo_tokens": self.full_repo_tokens,
+            "context_tokens": self.context_tokens,
+            "tokens_saved": self.tokens_saved,
+            "efficiency_percentage": self.efficiency_percentage,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CodeAgentAnswer:
+    """The agent's answer and the Graph-RAG metrics for producing it."""
+
+    answer: str
+    metrics: GraphRagMetrics
+
+
 async def ask_code_agent_with_metrics(
     user_message: str,
     repo_name: str,
-) -> dict[str, Any]:
+) -> CodeAgentAnswer:
     """Answer a question and report Graph-RAG context token efficiency."""
 
     response, messages = await _run_code_agent(user_message, repo_name)
-    graph_context = _tool_context_text(messages)
-    context_tokens = count_tokens(graph_context)
-    total_repo_tokens = await fetch_repository_total_tokens(repo_name)
-
-    if total_repo_tokens > 0:
-        tokens_saved = total_repo_tokens - context_tokens
-        efficiency_percentage = round(
-            tokens_saved / total_repo_tokens * 100,
-            2,
-        )
-    else:
-        tokens_saved = 0
-        efficiency_percentage = 0.0
-
-    metrics: dict[str, int | float] = {
-        "full_repo_tokens": total_repo_tokens,
-        "context_tokens": context_tokens,
-        "tokens_saved": tokens_saved,
-        "efficiency_percentage": efficiency_percentage,
-    }
+    context_tokens = count_tokens(_tool_context_text(messages))
+    metrics = GraphRagMetrics(
+        full_repo_tokens=await fetch_repository_total_tokens(repo_name),
+        context_tokens=context_tokens,
+    )
     logger.info(
         "Graph-RAG efficiency for %s: full_repo_tokens=%d, "
         "context_tokens=%d, tokens_saved=%d, efficiency_percentage=%.2f",
         repo_name,
-        total_repo_tokens,
-        context_tokens,
-        tokens_saved,
-        efficiency_percentage,
+        metrics.full_repo_tokens,
+        metrics.context_tokens,
+        metrics.tokens_saved,
+        metrics.efficiency_percentage,
     )
-    return {"answer": response, "metrics": metrics}
+    return CodeAgentAnswer(answer=response, metrics=metrics)

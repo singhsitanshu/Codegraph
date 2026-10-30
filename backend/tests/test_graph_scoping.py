@@ -26,7 +26,12 @@ from app.db.graph_ops import (
     chunk_data,
     save_parsed_ast_to_neo4j,
 )
-from app.services.parser_service import CodeParser
+from app.services.parser_service import (
+    CodeParser,
+    IdentifiedFile,
+    IdentifiedFunction,
+    identify_parsed_source,
+)
 from app.utils.entity_identity import generate_function_entity_id
 
 
@@ -58,13 +63,50 @@ async def _fake_embeddings(texts: list[str]) -> list[list[float]]:
     return [[0.1, 0.2, 0.3] for _ in texts]
 
 
-def _parse(file_path: str, source: str, repository: str = REPO) -> dict:
-    return asyncio.run(
-        CodeParser().parse_file(
-            file_path,
-            source.encode("utf-8"),
-            repository=repository,
-        )
+def _parse(file_path: str, source: str, repository: str = REPO) -> IdentifiedFile:
+    parsed_source = asyncio.run(
+        CodeParser().parse_file(file_path, source.encode("utf-8"))
+    )
+    return identify_parsed_source(
+        parsed_source,
+        repository=repository,
+        file_path=file_path,
+    )
+
+
+def _identified_file(
+    file_path: str,
+    function_names: tuple[str, ...] = (),
+    repository: str = REPO,
+) -> IdentifiedFile:
+    """Build writer input directly, without running the parser."""
+
+    return IdentifiedFile(
+        repository=repository,
+        file_path=file_path,
+        language="python",
+        functions=tuple(
+            IdentifiedFunction(
+                name=name,
+                qualified_name=name,
+                signature="()",
+                definition_discriminator="signature:();occurrence:1",
+                start_line=1,
+                end_line=1,
+                start_column=0,
+                end_column=0,
+                raw_code="",
+                calls=(),
+                entity_id=generate_function_entity_id(
+                    repository,
+                    file_path,
+                    "python",
+                    name,
+                    "signature:();occurrence:1",
+                ),
+            )
+            for name in function_names
+        ),
     )
 
 
@@ -145,7 +187,7 @@ def test_three_pass_write_receives_repository_scope() -> None:
         "src/example.py",
         "def example():\n    external_call()\n",
     )
-    entity_id = parsed_file["functions"][0]["entity_id"]
+    entity_id = parsed_file.functions[0].entity_id
 
     embed_batch, cluster_graph, label_communities = _save(
         driver,
@@ -294,7 +336,7 @@ def test_typescript_declaration_only_overloads_are_not_persisted() -> None:
         "function format(value: number): string;\n"
         "function format(value: any): string { return String(value); }\n",
     )
-    assert len(parsed_file["functions"]) == 3
+    assert len(parsed_file.functions) == 1
 
     _save(driver, [parsed_file], replace_existing=True)
 
@@ -302,12 +344,9 @@ def test_typescript_declaration_only_overloads_are_not_persisted() -> None:
     assert [function["signature"] for function in persisted] == ["(value: any)"]
 
 
-def test_writer_generates_missing_entity_ids_with_the_cg002a_utility() -> None:
+def test_writer_persists_entity_ids_from_the_cg002a_utility() -> None:
     driver, _, transaction = _mock_driver()
-    parsed_file = asyncio.run(
-        CodeParser().parse_file("src/example.py", b"def example():\n    pass\n")
-    )
-    assert "entity_id" not in parsed_file["functions"][0]
+    parsed_file = _parse("src/example.py", "def example():\n    pass\n")
 
     _save(driver, [parsed_file], replace_existing=True)
 
@@ -330,56 +369,19 @@ def test_entity_id_scoped_to_another_repository_is_rejected() -> None:
         repository="someone/else",
     )
 
-    with pytest.raises(ValueError, match="entity_id"):
+    with pytest.raises(ValueError, match="identified for repository"):
         _save(driver, [parsed_file], replace_existing=True)
     session.execute_write.assert_not_awaited()
-
-
-def test_absolute_parsed_paths_are_rejected_before_writing() -> None:
-    driver, session, _ = _mock_driver()
-    parsed_file = asyncio.run(
-        CodeParser().parse_file("/tmp/checkout/example.py", b"def example(): pass\n")
-    )
-
-    with pytest.raises(ValueError, match="repository-relative"):
-        _save(driver, [parsed_file], replace_existing=True)
-    session.execute_write.assert_not_awaited()
-
-
-def test_functions_without_identity_metadata_are_skipped() -> None:
-    driver, _, transaction = _mock_driver()
-    parsed_data = [
-        {
-            "file_path": "src/legacy.py",
-            "defined_functions": ["legacy"],
-            "functions": [{"name": "legacy", "raw_code": "def legacy(): pass"}],
-            "outgoing_calls": ["other"],
-        }
-    ]
-
-    _save(driver, parsed_data, replace_existing=True)
-
-    assert [call.args[0] for call in transaction.run.await_args_list] == [
-        DELETE_REPOSITORY_QUERY,
-        MERGE_FILES_QUERY,
-    ]
 
 
 def test_large_repository_uses_one_transaction_per_micro_batch() -> None:
     driver, session, transaction = _mock_driver()
     parsed_data = [
-        {
-            "file_path": f"src/file_{index}.py",
-            "functions": [
-                {
-                    "name": f"function_{index}",
-                    "qualified_name": f"function_{index}",
-                    "language": "python",
-                    "definition_discriminator": "signature:();occurrence:1",
-                    "raw_code": "",
-                }
-            ],
-        }
+        _identified_file(
+            f"src/file_{index}.py",
+            (f"function_{index}",),
+            repository="owner/large-repository",
+        )
         for index in range(205)
     ]
 
@@ -428,7 +430,7 @@ def test_incremental_write_replaces_only_affected_files() -> None:
         ]
     )
     parsed_file = _parse("src/a.py", "def caller():\n    shared()\n")
-    caller_id = parsed_file["functions"][0]["entity_id"]
+    caller_id = parsed_file.functions[0].entity_id
 
     _save(
         driver,
@@ -496,19 +498,17 @@ def test_repository_replacement_includes_community_and_external_nodes() -> None:
 def test_full_ingestion_stores_repository_token_baseline() -> None:
     driver, _, transaction = _mock_driver()
     parsed_data = [
-        {
-            "file_path": "src/example.py",
-            "functions": [],
-            "source_tokens": 37,
-        },
-        {
-            "file_path": "src/helper.py",
-            "functions": [],
-            "source_tokens": 13,
-        },
+        _identified_file("src/example.py", repository="owner/repository"),
+        _identified_file("src/helper.py", repository="owner/repository"),
     ]
 
-    _save(driver, parsed_data, repo_name="owner/repository", replace_existing=True)
+    _save(
+        driver,
+        parsed_data,
+        repo_name="owner/repository",
+        replace_existing=True,
+        total_repo_tokens=50,
+    )
 
     metadata_call = next(
         call
@@ -549,7 +549,6 @@ def test_repository_token_baseline_read_is_scoped() -> None:
 def test_incremental_write_keeps_repository_token_baseline() -> None:
     driver, _, transaction = _mock_driver()
     parsed_file = _parse("src/a.py", "def a():\n    pass\n")
-    parsed_file["source_tokens"] = 9
 
     _save(driver, [parsed_file])
 

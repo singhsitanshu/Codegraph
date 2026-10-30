@@ -31,7 +31,9 @@ from app.services.github_service import (
 )
 from app.services.parser_service import (
     SUPPORTED_EXTENSIONS,
-    attach_function_entity_ids,
+    IdentifiedFile,
+    ParsedSource,
+    identify_parsed_source,
     parse_changed_files_with_progress,
 )
 from app.utils.repository import (
@@ -181,25 +183,27 @@ def _discover_repository_source_files(extracted_root: str) -> list[str]:
     return source_files
 
 
-def _use_repository_relative_paths(
-    parsed_data: list[dict[str, Any]],
+def _identify_repository_files(
+    parsed_sources: list[ParsedSource],
     extracted_root: str,
-    repository: str | None = None,
-) -> None:
-    """Replace random temporary paths with stable repository-relative paths."""
+    repository: str,
+) -> list[IdentifiedFile]:
+    """Identify files parsed from a temporary checkout by repository-relative paths."""
 
     repository_root = Path(extracted_root).resolve()
-    for parsed_file in parsed_data:
-        file_path = parsed_file.get("file_path")
-        if isinstance(file_path, str):
-            relative_path = (
-                Path(file_path).resolve().relative_to(repository_root).as_posix()
-            )
-            parsed_file["file_path"] = relative_path
-            if repository is not None:
-                attach_function_entity_ids(
-                    parsed_file, repository=repository, file_path=relative_path
-                )
+    return [
+        identify_parsed_source(
+            parsed_source,
+            repository=repository,
+            file_path=(
+                Path(parsed_source.file_path)
+                .resolve()
+                .relative_to(repository_root)
+                .as_posix()
+            ),
+        )
+        for parsed_source in parsed_sources
+    ]
 
 
 app = FastAPI(
@@ -289,8 +293,8 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
             detail="The code agent could not complete the request",
         ) from exc
     return {
-        "response": agent_result["answer"],
-        "metrics": agent_result["metrics"],
+        "response": agent_result.answer,
+        "metrics": agent_result.metrics.as_dict(),
     }
 
 
@@ -316,9 +320,7 @@ async def _stream_repository_ingestion(
     """Run repository ingestion while emitting NDJSON progress records."""
 
     canonical_repo_name = repository.full_name
-    extracted_root: str | None = None
     current_progress = 0
-    total_repo_tokens = 0
     try:
         current_progress = 10
         yield _ndjson_record(
@@ -329,93 +331,91 @@ async def _stream_repository_ingestion(
             repository.owner,
             repository.name,
         )
+        try:
+            current_progress = 20
+            yield _ndjson_record(
+                status="Repository downloaded and extracted.",
+                progress=current_progress,
+            )
+            source_files = await asyncio.to_thread(
+                _discover_repository_source_files,
+                extracted_root,
+            )
 
-        current_progress = 20
-        yield _ndjson_record(
-            status="Repository downloaded and extracted.",
-            progress=current_progress,
-        )
-        source_files = await asyncio.to_thread(
-            _discover_repository_source_files,
-            extracted_root,
-        )
-
-        parsed_data_by_index: list[dict[str, Any] | None] = [
-            None for _ in source_files
-        ]
-        if source_files:
-            async for file_progress in parse_changed_files_with_progress(
-                source_files
-            ):
-                total_repo_tokens += file_progress.source_tokens
-                if file_progress.result is not None:
-                    parsed_data_by_index[file_progress.index] = file_progress.result
-                current_progress = 20 + int(
-                    file_progress.processed / file_progress.total * 60
-                )
+            total_repo_tokens = 0
+            parsed_by_index: dict[int, ParsedSource] = {}
+            if source_files:
+                async for file_progress in parse_changed_files_with_progress(
+                    source_files
+                ):
+                    total_repo_tokens += file_progress.source_tokens
+                    if file_progress.result is not None:
+                        parsed_by_index[file_progress.index] = file_progress.result
+                    current_progress = 20 + int(
+                        file_progress.processed / file_progress.total * 60
+                    )
+                    yield _ndjson_record(
+                        status=(
+                            f"Parsing files ({file_progress.processed}/"
+                            f"{file_progress.total})..."
+                        ),
+                        progress=current_progress,
+                    )
+            else:
+                current_progress = 80
                 yield _ndjson_record(
-                    status=(
-                        f"Parsing files ({file_progress.processed}/"
-                        f"{file_progress.total})..."
-                    ),
+                    status="No supported source files found.",
                     progress=current_progress,
                 )
-        else:
-            current_progress = 80
-            yield _ndjson_record(
-                status="No supported source files found.",
-                progress=current_progress,
-            )
 
-        if any(parsed_file is None for parsed_file in parsed_data_by_index):
-            logger.warning(
-                "Aborting full ingest for %s because a supported source file "
-                "could not be parsed",
+            if len(parsed_by_index) != len(source_files):
+                logger.warning(
+                    "Aborting full ingest for %s because a supported source file "
+                    "could not be parsed",
+                    canonical_repo_name,
+                )
+                yield _ingestion_failure_record(
+                    current_progress,
+                    "A supported source file could not be parsed",
+                )
+                return
+
+            identified_files = _identify_repository_files(
+                [parsed_by_index[index] for index in range(len(source_files))],
+                extracted_root,
+                repository=canonical_repo_name,
+            )
+            logger.info(
+                "Full repository token baseline for %s: %d",
                 canonical_repo_name,
+                total_repo_tokens,
             )
-            yield _ingestion_failure_record(
-                current_progress,
-                "A supported source file could not be parsed",
-            )
-            return
 
-        parsed_data = [
-            parsed_file
-            for parsed_file in parsed_data_by_index
-            if parsed_file is not None
-        ]
-        _use_repository_relative_paths(
-            parsed_data, extracted_root, repository=canonical_repo_name
-        )
-        logger.info(
-            "Full repository token baseline for %s: %d",
-            canonical_repo_name,
-            total_repo_tokens,
-        )
-
-        current_progress = 85
-        yield _ndjson_record(
-            status="Batching data to Neo4j...",
-            progress=current_progress,
-        )
-        async for database_progress in save_parsed_ast_to_neo4j_with_progress(
-            parsed_data,
-            repo_name=canonical_repo_name,
-            replace_existing=True,
-            total_repo_tokens=total_repo_tokens,
-        ):
-            current_progress = database_progress.progress
+            current_progress = 85
             yield _ndjson_record(
-                status=database_progress.status,
+                status="Batching data to Neo4j...",
                 progress=current_progress,
             )
+            async for database_progress in save_parsed_ast_to_neo4j_with_progress(
+                identified_files,
+                repo_name=canonical_repo_name,
+                replace_existing=True,
+                total_repo_tokens=total_repo_tokens,
+            ):
+                current_progress = database_progress.progress
+                yield _ndjson_record(
+                    status=database_progress.status,
+                    progress=current_progress,
+                )
 
-        yield _ndjson_record(
-            status="Repository ingestion complete.",
-            progress=100,
-            repo_name=canonical_repo_name,
-            total_repo_tokens=total_repo_tokens,
-        )
+            yield _ndjson_record(
+                status="Repository ingestion complete.",
+                progress=100,
+                repo_name=canonical_repo_name,
+                total_repo_tokens=total_repo_tokens,
+            )
+        finally:
+            cleanup_downloaded_repo(extracted_root)
     except httpx.HTTPStatusError as exc:
         response_status = exc.response.status_code
         if response_status == status.HTTP_404_NOT_FOUND:
@@ -439,9 +439,6 @@ async def _stream_repository_ingestion(
             current_progress,
             "Unexpected repository ingestion failure",
         )
-    finally:
-        if extracted_root is not None:
-            cleanup_downloaded_repo(extracted_root)
 
 
 @app.post("/api/ingest-repo", tags=["ingestion"])

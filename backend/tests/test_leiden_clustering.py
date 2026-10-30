@@ -10,7 +10,11 @@ import pytest
 
 from app.db import close_neo4j_driver, neo4j_client
 from app.db.graph_ops import save_parsed_ast_to_neo4j
-from app.services.parser_service import CodeParser
+from app.services.parser_service import (
+    CodeParser,
+    IdentifiedFile,
+    identify_parsed_source,
+)
 
 TEST_REPO_NAME = "test/leiden-two-groups"
 CLEANUP_QUERY = "MATCH (n {repo_name: $repo_name}) DETACH DELETE n"
@@ -27,13 +31,14 @@ def _group_source(prefix: str) -> str:
     )
 
 
-def _parse(file_path: str, source: str) -> dict[str, object]:
-    return asyncio.run(
-        CodeParser().parse_file(
-            file_path,
-            source.encode("utf-8"),
-            repository=TEST_REPO_NAME,
-        )
+def _parse(file_path: str, source: str) -> IdentifiedFile:
+    parsed_source = asyncio.run(
+        CodeParser().parse_file(file_path, source.encode("utf-8"))
+    )
+    return identify_parsed_source(
+        parsed_source,
+        repository=TEST_REPO_NAME,
+        file_path=file_path,
     )
 
 

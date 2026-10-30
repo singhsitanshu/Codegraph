@@ -1,11 +1,14 @@
 import asyncio
 import logging
-from typing import Any
 
 from app.db.graph_ops import save_parsed_ast_to_neo4j
 from app.services.github_events import PushChangeSet
 from app.services.github_service import fetch_raw_file_content
-from app.services.parser_service import CodeParser, attach_function_entity_ids
+from app.services.parser_service import (
+    CodeParser,
+    IdentifiedFile,
+    identify_parsed_source,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -26,18 +29,18 @@ async def process_push_change_set(change_set: PushChangeSet) -> None:
     try:
         code_parser = CodeParser()
 
-        async def fetch_and_parse(file_path: str) -> dict[str, Any]:
+        async def fetch_and_parse(file_path: str) -> IdentifiedFile:
             source_code = await fetch_raw_file_content(
                 repository.owner,
                 repository.name,
                 file_path,
                 change_set.commit_sha,
             )
-            parsed_file = await code_parser.parse_file(
+            parsed_source = await code_parser.parse_file(
                 file_path, source_code.encode("utf-8")
             )
-            return attach_function_entity_ids(
-                parsed_file,
+            return identify_parsed_source(
+                parsed_source,
                 repository=repository.full_name,
                 file_path=file_path,
             )

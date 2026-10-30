@@ -9,6 +9,7 @@ import pytest
 from app.services.parser_service import (
     SUPPORTED_EXTENSIONS,
     CodeParser,
+    ParsedSource,
     parse_changed_files,
     parse_changed_files_with_progress,
 )
@@ -20,6 +21,18 @@ def deterministic_token_counter():
 
     with patch("app.services.parser_service.count_tokens", return_value=17):
         yield
+
+
+def _parsed_source(file_path: str) -> ParsedSource:
+    return ParsedSource(
+        file_path=file_path,
+        language="python",
+        defined_classes=(),
+        functions=(),
+        declarations=(),
+        unattributed_calls=(),
+        outgoing_calls=(),
+    )
 
 
 def test_supported_extension_mapping_covers_all_requested_languages() -> None:
@@ -117,15 +130,14 @@ def test_code_parser_normalizes_supported_languages(
 
     result = asyncio.run(parse())
 
-    assert result["file_path"] == file_path
-    assert result["defined_classes"] == classes
-    assert result["defined_functions"] == functions
-    assert result["outgoing_calls"] == calls
-    assert [function["name"] for function in result["functions"]] == functions
-    assert result.get("source_tokens") is None
+    assert result.file_path == file_path
+    assert result.language == SUPPORTED_EXTENSIONS[Path(file_path).suffix]
+    assert result.defined_classes == tuple(classes)
+    assert result.outgoing_calls == tuple(calls)
+    assert [function.name for function in result.functions] == functions
+    assert result.declarations == ()
     assert all(
-        function["name"] in function["raw_code"]
-        for function in result["functions"]
+        function.name in function.raw_code for function in result.functions
     )
 
 
@@ -139,7 +151,7 @@ def test_code_parser_extracts_exact_function_source() -> None:
 
     result = asyncio.run(CodeParser().parse_file("module.py", source))
 
-    assert [(function["name"], function["raw_code"]) for function in result["functions"]] == [
+    assert [(function.name, function.raw_code) for function in result.functions] == [
         ("first", "def first(value):\n    return value + 1"),
         ("second", "def second():\n    return first(2)"),
     ]
@@ -163,27 +175,24 @@ def test_parse_changed_files_skips_one_parser_failure(
     good_file.write_bytes(b"def good():\n    return 1\n")
     bad_file.write_bytes(b"def bad():\n    return 2\n")
 
-    good_result = {
-        "file_path": str(good_file),
-        "defined_classes": [],
-        "defined_functions": ["good"],
-        "outgoing_calls": [],
-    }
+    good_result = _parsed_source(str(good_file))
+
     async def parse_file(
         _parser: CodeParser,
         file_path: str,
         _source_code: bytes,
-    ) -> dict[str, str | list[str]]:
+    ) -> ParsedSource:
         if file_path == str(bad_file):
             raise file_error
         return good_result
 
     with patch.object(CodeParser, "parse_file", new=parse_file):
-        results = asyncio.run(
+        batch = asyncio.run(
             parse_changed_files([str(good_file), str(bad_file)])
         )
 
-    assert results == [good_result]
+    assert batch.files == [good_result]
+    assert batch.source_tokens == 34
 
 
 def test_failed_parse_still_contributes_to_repository_token_baseline(
@@ -198,16 +207,10 @@ def test_failed_parse_still_contributes_to_repository_token_baseline(
         _parser: CodeParser,
         file_path: str,
         _source_code: bytes,
-    ) -> dict[str, object]:
+    ) -> ParsedSource:
         if file_path == str(bad_file):
             raise RuntimeError("Tree-sitter failure")
-        return {
-            "file_path": file_path,
-            "defined_classes": [],
-            "defined_functions": ["good"],
-            "functions": [],
-            "outgoing_calls": [],
-        }
+        return _parsed_source(file_path)
 
     async def collect_progress():
         return [
@@ -231,13 +234,14 @@ def test_parse_changed_files_skips_unreadable_file(tmp_path: Path) -> None:
     good_file = tmp_path / "good.py"
     good_file.write_bytes(b"def good():\n    return 1\n")
 
-    results = asyncio.run(
+    batch = asyncio.run(
         parse_changed_files([str(missing_file), str(good_file)])
     )
 
-    assert len(results) == 1
-    assert results[0]["file_path"] == str(good_file)
-    assert results[0]["defined_functions"] == ["good"]
+    assert len(batch.files) == 1
+    assert batch.files[0].file_path == str(good_file)
+    assert [function.name for function in batch.files[0].functions] == ["good"]
+    assert batch.source_tokens == 17
 
 
 def test_parse_progress_advances_for_every_file(tmp_path: Path) -> None:
@@ -261,5 +265,9 @@ def test_parse_progress_advances_for_every_file(tmp_path: Path) -> None:
     assert all(update.total == 2 for update in updates)
     assert sum(update.result is not None for update in updates) == 1
     assert sum(update.source_tokens for update in updates) == 17
-    successful_update = next(update for update in updates if update.result)
-    assert successful_update.result["source_tokens"] == 17
+    successful_update = next(
+        update for update in updates if update.result is not None
+    )
+    assert successful_update.source_tokens == 17
+    failed_update = next(update for update in updates if update.result is None)
+    assert failed_update.source_tokens == 0

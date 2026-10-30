@@ -41,10 +41,10 @@ def test_parser_does_not_check_every_function_body_for_each_call():
         f"def f{i}():\n    target{i}()\n    other{i}()\n" for i in range(count)
     ).encode()
     with patch.object(CodeParser, "_definition_body", wraps=CodeParser._definition_body) as body:
-        parsed = asyncio.run(CodeParser().parse_file("src/large.py", source, repository="test/repo"))
+        parsed = asyncio.run(CodeParser().parse_file("src/large.py", source))
     assert body.call_count <= 3 * count
-    for i, function in enumerate(parsed["functions"]):
-        assert [call["name"] for call in function["calls"]] == [f"target{i}", f"other{i}"]
+    for i, function in enumerate(parsed.functions):
+        assert [call.name for call in function.calls] == [f"target{i}", f"other{i}"]
 
 
 def test_embedding_groups_keep_all_definitions_and_bound_parallel_requests():

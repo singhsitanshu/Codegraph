@@ -25,6 +25,14 @@ type CodePayload = {
   name: string;
 };
 
+type SourceRequest =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "loaded"; source: CodePayload }
+  | { status: "error"; error: string };
+
+const NO_SOURCE_REQUEST: SourceRequest = { status: "idle" };
+
 interface CodePanelProps {
   nodeId: string | null;
   repoName: string | null;
@@ -51,39 +59,39 @@ export default function CodePanel({
   repoName,
   onClose,
 }: CodePanelProps) {
-  const [source, setSource] = useState<CodePayload | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [request, setRequest] = useState<SourceRequest>(NO_SOURCE_REQUEST);
+  const source = request.status === "loaded" ? request.source : null;
+  const loading = request.status === "loading";
 
   useEffect(() => {
     if (!nodeId || !repoName) {
-      setSource(null);
-      setLoading(false);
-      setError("");
+      setRequest(NO_SOURCE_REQUEST);
       return undefined;
     }
 
     const controller = new AbortController();
-    setSource(null);
-    setLoading(true);
-    setError("");
+    setRequest({ status: "loading" });
     fetchNodeCode(nodeId, repoName, { signal: controller.signal })
-      .then((payload) => setSource(payload))
+      .then((payload) => {
+        if (!controller.signal.aborted) {
+          setRequest({ status: "loaded", source: payload });
+        }
+      })
       .catch((requestError: unknown) => {
         if (
-          requestError instanceof DOMException &&
-          requestError.name === "AbortError"
+          controller.signal.aborted ||
+          (requestError instanceof DOMException &&
+            requestError.name === "AbortError")
         ) {
           return;
         }
-        setError(
-          requestError instanceof Error
-            ? requestError.message
-            : "Could not load source code",
-        );
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        setRequest({
+          status: "error",
+          error:
+            requestError instanceof Error
+              ? requestError.message
+              : "Could not load source code",
+        });
       });
     return () => controller.abort();
   }, [nodeId, repoName]);
@@ -154,10 +162,12 @@ export default function CodePanel({
               />
             ))}
           </div>
-        ) : error ? (
+        ) : request.status === "error" ? (
           <div className="p-6" role="alert">
             <p className="text-sm font-bold text-rose-300">Source unavailable</p>
-            <p className="mt-2 text-xs leading-5 text-slate-400">{error}</p>
+            <p className="mt-2 text-xs leading-5 text-slate-400">
+              {request.error}
+            </p>
           </div>
         ) : source?.code ? (
           <SyntaxHighlighter

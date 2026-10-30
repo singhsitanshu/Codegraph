@@ -15,7 +15,11 @@ from app.services.github_service import (
     cleanup_downloaded_repo,
     download_and_extract_repo,
 )
-from app.services.parser_service import ParsedFileProgress
+from app.services.parser_service import (
+    IdentifiedFile,
+    ParsedFileProgress,
+    ParsedSource,
+)
 from app.db.graph_ops import DatabaseWriteProgress
 from app.utils.repository import GitHubRepository
 
@@ -67,13 +71,15 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
     source_path.parent.mkdir(parents=True)
     source_path.write_text("def example():\n    return 1\n", encoding="utf-8")
 
-    parsed_data = [
-        {
-            "file_path": str(source_path),
-            "defined_functions": ["example"],
-            "outgoing_calls": [],
-        }
-    ]
+    parsed_source = ParsedSource(
+        file_path=str(source_path),
+        language="python",
+        defined_classes=(),
+        functions=(),
+        declarations=(),
+        unattributed_calls=(),
+        outgoing_calls=(),
+    )
     cleanup = Mock()
     save_calls = []
 
@@ -82,8 +88,8 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
             index=0,
             processed=1,
             total=1,
-            result=parsed_data[0],
             source_tokens=23,
+            result=parsed_source,
         )
 
     async def save_with_progress(*args, **kwargs):
@@ -147,7 +153,16 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
     }
     assert save_calls == [
         (
-            (parsed_data,),
+            (
+                [
+                    IdentifiedFile(
+                        repository="psf/requests",
+                        file_path="src/example.py",
+                        language="python",
+                        functions=(),
+                    )
+                ],
+            ),
             {
                 "repo_name": "psf/requests",
                 "replace_existing": True,
@@ -155,7 +170,6 @@ def test_ingest_repository_uses_relative_paths_and_always_cleans_up(
             },
         )
     ]
-    assert parsed_data[0]["file_path"] == "src/example.py"
     cleanup.assert_called_once_with(str(repository_root))
 
 
@@ -177,7 +191,9 @@ def test_full_ingest_does_not_replace_graph_after_parse_failure(tmp_path: Path) 
     source_path.write_text("def f(): pass\n", encoding="utf-8")
 
     async def failed_parse(_paths: list[str]):
-        yield ParsedFileProgress(index=0, processed=1, total=1, result=None)
+        yield ParsedFileProgress(
+            index=0, processed=1, total=1, source_tokens=0, result=None
+        )
 
     save = Mock()
     with (

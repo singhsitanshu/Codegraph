@@ -12,7 +12,7 @@ from app.db import close_neo4j_driver
 from app.db.graph_ops import save_parsed_ast_to_neo4j
 from app.db.neo4j_client import driver
 from app.services.parser_service import (
-    attach_function_entity_ids,
+    identify_parsed_source,
     parse_changed_files,
 )
 
@@ -65,29 +65,34 @@ async def ingest_repository() -> None:
     if not files_to_parse:
         raise RuntimeError("No Python files were discovered; ingestion aborted")
 
-    parsed_data = await parse_changed_files(files_to_parse)
-    if len(parsed_data) != len(files_to_parse):
+    parsed_batch = await parse_changed_files(files_to_parse)
+    if len(parsed_batch.files) != len(files_to_parse):
         raise RuntimeError(
             "Full ingestion aborted because a discovered source file could not be parsed"
         )
     repository_root = Path(TARGET_REPO_PATH).resolve()
-    for parsed_file in parsed_data:
-        relative_path = Path(parsed_file["file_path"]).resolve().relative_to(
-            repository_root
-        ).as_posix()
-        attach_function_entity_ids(
-            parsed_file, repository=TARGET_REPO_NAME, file_path=relative_path
+    identified_files = [
+        identify_parsed_source(
+            parsed_source,
+            repository=TARGET_REPO_NAME,
+            file_path=Path(parsed_source.file_path)
+            .resolve()
+            .relative_to(repository_root)
+            .as_posix(),
         )
-    print(f"Successfully parsed {len(parsed_data)} Python files")
-    if not parsed_data:
+        for parsed_source in parsed_batch.files
+    ]
+    print(f"Successfully parsed {len(identified_files)} Python files")
+    if not identified_files:
         raise RuntimeError("Tree-sitter produced no parsed data; ingestion aborted")
 
     await save_parsed_ast_to_neo4j(
-        parsed_data,
+        identified_files,
         repo_name=TARGET_REPO_NAME,
         replace_existing=True,
+        total_repo_tokens=parsed_batch.source_tokens,
     )
-    print(f"Persisted AST data for {len(parsed_data)} files")
+    print(f"Persisted AST data for {len(identified_files)} files")
 
     counts = await asyncio.to_thread(verify_ingestion)
     print("Neo4j node counts:")

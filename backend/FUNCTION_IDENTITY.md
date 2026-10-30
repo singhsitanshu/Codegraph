@@ -4,41 +4,43 @@ This is the parser contract for function identity. Since CG-002B the Neo4j write
 
 ## Parsed output
 
-`CodeParser.parse_file(path, source, repository="owner/repo")` preserves the file-level `file_path`, `defined_classes`, `defined_functions`, and `outgoing_calls` fields. Each `functions[]` item preserves `name` and `raw_code` and adds:
+`CodeParser.parse_file(path, source)` returns a frozen `ParsedSource` (`app/services/parser_service.py`) with the file's `file_path` (as given, possibly a temporary absolute path), `language`, `defined_classes`, `functions`, `declarations`, `unattributed_calls`, and the file-wide `outgoing_calls`. It has no repository identity yet.
 
-```json
-{
-  "name": "validate",
-  "repository": "example/backend",
-  "qualified_name": "PaymentService.validate",
-  "file_path": "src/payments.py",
-  "language": "python",
-  "signature": "(self, value)",
-  "definition_discriminator": "signature:(self, value);occurrence:1",
-  "entity_id": "fn:v1:<64 lowercase SHA-256 hex characters>",
-  "has_body": true,
-  "start_line": 42,
-  "end_line": 58,
-  "start_column": 4,
-  "end_column": 21,
-  "raw_code": "def validate(self, value): ...",
-  "calls": [
-    {
-      "name": "check",
-      "syntax": "self.check",
-      "start_line": 45,
-      "end_line": 45,
-      "start_column": 8,
-      "end_column": 25,
-      "resolution": "unresolved"
-    }
-  ]
-}
+- `functions` holds `ParsedFunction` records: executable definitions with a body. Each has `name`, `qualified_name`, `signature`, `definition_discriminator`, source span, `raw_code`, and the `calls` attributed to its body.
+- `declarations` holds `FunctionDeclaration` records with the same metadata but no body and no calls. These are declaration-only TypeScript overload and interface method signatures; their `raw_code` is the declaration.
+- Each call is a `CallSite` with `name`, `syntax`, and its source span. The parser records the callee name only; it does not resolve the target.
+
+`identify_parsed_source(parsed, repository=..., file_path=<relative path>)` places a parsed file in a repository and returns an `IdentifiedFile`. This is the only input the graph writer accepts. Its `file_path` is normalized and repository-relative, and absolute or escaping paths raise `ValueError`. Each of its `functions` is an `IdentifiedFunction`, a `ParsedFunction` plus its `entity_id`:
+
+```python
+IdentifiedFile(
+    repository="example/backend",
+    file_path="src/payments.py",
+    language="python",
+    functions=(
+        IdentifiedFunction(
+            name="validate",
+            qualified_name="PaymentService.validate",
+            signature="(self, value)",
+            definition_discriminator="signature:(self, value);occurrence:1",
+            start_line=42,
+            end_line=58,
+            start_column=4,
+            end_column=21,
+            raw_code="def validate(self, value): ...",
+            calls=(
+                CallSite(name="check", syntax="self.check", start_line=45,
+                         end_line=45, start_column=8, end_column=25),
+            ),
+            entity_id="fn:v1:<64 lowercase SHA-256 hex characters>",
+        ),
+    ),
+)
 ```
 
-Lines are one-based and inclusive; columns are zero-based Tree-sitter byte columns. `signature` is the whitespace-normalized parameter syntax when exposed by the grammar. `has_body=false` identifies a declaration-only TypeScript overload signature; its `raw_code` is that declaration. Such signatures appear in `functions`, but remain excluded from legacy `defined_functions` and from Neo4j, which stores executable bodies only. `unattributed_calls` on the file has the same call-site shape for calls outside a captured function body or inside an anonymous boundary that cannot be assigned confidently. The legacy `outgoing_calls` remains a file-wide list of simple call names.
+Lines are one-based and inclusive; columns are zero-based Tree-sitter byte columns. `signature` is the whitespace-normalized parameter syntax when exposed by the grammar. Only executable definitions get an `entity_id` and reach Neo4j; declarations are still counted when assigning occurrence discriminators. `unattributed_calls` holds call sites outside a captured function body, or inside an anonymous boundary that cannot be assigned confidently. `outgoing_calls` is a file-wide list of simple call names.
 
-The repository is required to generate `entity_id`. When supplied, it is also stored on the parsed file and each function. For backward compatibility, `parse_file` without `repository` still returns the additional lexical metadata but omits `entity_id`; callers with temporary absolute paths can later call `attach_function_entity_ids(parsed_file, repository=..., file_path=<relative path>)`. Full GitHub ingest uses this after path relativization; the webhook pipeline attaches IDs using its repository-relative event path; the local helpers (`ingest_local_repo.py`, `seeding.py`) attach them after relativizing their absolute paths.
+Full GitHub ingest identifies files after converting their temporary paths to repository-relative ones. The webhook pipeline identifies them by their repository-relative event path. The local helpers (`ingest_local_repo.py`, `seeding.py`) identify them after relativizing their absolute paths.
 
 ## Canonical key
 
@@ -58,13 +60,13 @@ The key does not use source code body text, Python `hash()`, Neo4j `elementId`, 
 | --- | --- | --- |
 | Python | Existing `function_definition`, including top-level, class methods, and nested functions. Names are joined from enclosing named classes/functions, e.g. `PaymentService.validate` or `outer.inner`. | Parameter syntax plus occurrence. Decorators and runtime rebinding do not prove symbol identity. |
 | JavaScript/JSX | Existing named declarations, generators, class/object `method_definition`, and `variable_declarator` with arrow/function expression. Named lexical ancestors are joined. Anonymous expressions without a captured declarator remain unmodeled. | Parameter syntax plus occurrence. |
-| TypeScript/TSX | JavaScript forms plus `function_signature` and `method_signature` for overload and interface declarations. Class and interface scopes are included. Declarations and implementations each get an ID; declarations have no body. | Typed parameter syntax plus occurrence. Return type is not part of the key; identical parameter syntax uses occurrence. |
+| TypeScript/TSX | JavaScript forms plus `function_signature` and `method_signature` for overload and interface declarations. Class and interface scopes are included. Bodyless signatures are returned as `declarations` and get no ID; implementations are `functions`. | Typed parameter syntax plus occurrence. Return type is not part of the key; identical parameter syntax uses occurrence. |
 | Go | Existing functions and methods; method receiver type is prepended, e.g. `Client.Send`. | Parameter syntax plus occurrence. Pointer/value receiver spelling is not separately encoded when the receiver type name is the same. |
 | Java | Existing methods with bodies and constructors; enclosing classes are prepended, e.g. `Client.send`, `Client.Client`. | Parameter syntax plus occurrence, distinguishing ordinary overloads. Abstract declarations without bodies remain outside the current capture query. |
 
 ## Calls and uncertainty
 
-Calls are attributed to the innermost captured definition **only when the call expression is inside its Tree-sitter body**. Syntax such as `self.check`, `api.call`, and receiver-qualified method calls is retained as evidence, while `resolution` remains `unresolved`. A call inside a nested captured function belongs to that nested function. A call in a default argument, at file scope, or inside an uncaptured anonymous function/lambda is put in `unattributed_calls`. This does not resolve dynamic dispatch, imports, overload targets, cross-file calls, or the true callee node.
+Calls are attributed to the innermost captured definition **only when the call expression is inside its Tree-sitter body**. Syntax such as `self.check`, `api.call`, and receiver-qualified method calls is retained as evidence; the callee itself is left unresolved. A call inside a nested captured function belongs to that nested function. A call in a default argument, at file scope, or inside an uncaptured anonymous function/lambda is put in `unattributed_calls`. This does not resolve dynamic dispatch, imports, overload targets, cross-file calls, or the true callee node.
 
 ## Graph persistence (CG-002B)
 
@@ -76,8 +78,8 @@ Calls are attributed to the innermost captured definition **only when the call e
 | `ExternalFunction` | `(repo_name, name)` | A callee name with no matching definition in the repository. It carries `external`/`is_external = true` and **no** `Function` label, so it never merges with a definition or joins GDS clustering. |
 | `CALLS` | one edge per (caller, target) | `resolution`, `call_count`, `source_file`. |
 
-- **IDs.** The writer recomputes each ID with `generate_function_entity_id`. A supplied `entity_id` that was generated for a different repository or path is rejected. A missing ID is generated, and a function without identity metadata is skipped with a warning. Parsed paths must be repository-relative. Declaration-only TypeScript overloads (`has_body=false`) are not persisted.
-- **Calls.** Only the call sites in each function's `functions[].calls` are used. The file-wide `outgoing_calls` is no longer copied onto every function, and `unattributed_calls` are not persisted. Each callee name is resolved to exactly one definition, trying in order:
+- **IDs.** The writer accepts only `IdentifiedFile` records, so every path is repository-relative and every function has its `entity_id`. A file identified for a different repository than the one being written is rejected. Declaration-only TypeScript overloads are never identified, so they are not persisted.
+- **Calls.** Only the call sites in each function's `calls` are used. The file-wide `outgoing_calls` is no longer copied onto every function, and `unattributed_calls` are not persisted. Each callee name is resolved to exactly one definition, trying in order:
   1. the nearest enclosing lexical scope in the caller's file (`lexical_scope`);
   2. a unique same-file name (`same_file`);
   3. a unique repository-wide name (`repository_unique`).

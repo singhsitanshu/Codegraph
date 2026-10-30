@@ -10,11 +10,19 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.agent.graph import query_graph_blast_radius
+from app.agent.graph import (
+    CodeAgentAnswer,
+    GraphRagMetrics,
+    query_graph_blast_radius,
+)
 from app.db import close_neo4j_driver, neo4j_client
 from app.db.graph_ops import delete_repository_graph, save_parsed_ast_to_neo4j
 from app.main import app
-from app.services.parser_service import CodeParser
+from app.services.parser_service import (
+    CodeParser,
+    IdentifiedFile,
+    identify_parsed_source,
+)
 
 TEST_FILE_PATH = "TEST_MOCK_FILE.py"
 TEST_REPO_NAME = "test/mock-repository"
@@ -30,17 +38,18 @@ def _parse(
     source: str,
     repo_name: str = TEST_REPO_NAME,
     file_path: str = TEST_FILE_PATH,
-) -> dict[str, object]:
-    return asyncio.run(
-        CodeParser().parse_file(
-            file_path,
-            source.encode("utf-8"),
-            repository=repo_name,
-        )
+) -> IdentifiedFile:
+    parsed_source = asyncio.run(
+        CodeParser().parse_file(file_path, source.encode("utf-8"))
+    )
+    return identify_parsed_source(
+        parsed_source,
+        repository=repo_name,
+        file_path=file_path,
     )
 
 
-MOCK_DATA: list[dict[str, object]] = [
+MOCK_DATA: list[IdentifiedFile] = [
     _parse(MOCK_FUNC_A_SOURCE + "\n\ndef mock_func_B():\n    return True\n")
 ]
 
@@ -332,15 +341,13 @@ def test_api_chat_endpoint() -> None:
     with patch(
         "app.main.ask_code_agent_with_metrics",
         new=AsyncMock(
-            return_value={
-                "answer": "Mocked LangGraph response",
-                "metrics": {
-                    "full_repo_tokens": 1_000,
-                    "context_tokens": 100,
-                    "tokens_saved": 900,
-                    "efficiency_percentage": 90.0,
-                },
-            }
+            return_value=CodeAgentAnswer(
+                answer="Mocked LangGraph response",
+                metrics=GraphRagMetrics(
+                    full_repo_tokens=1_000,
+                    context_tokens=100,
+                ),
+            )
         ),
     ):
         response = client.post(
@@ -485,8 +492,8 @@ def test_incremental_update_keeps_identity_and_incoming_edges(
     second_version = [
         _parse("def target():\n    return 1\n", file_path=library_path)
     ]
-    target_id = second_version[0]["functions"][0]["entity_id"]
-    assert target_id == first_version[0]["functions"][0]["entity_id"]
+    target_id = second_version[0].functions[0].entity_id
+    assert target_id == first_version[0].functions[0].entity_id
 
     async def save() -> None:
         try:

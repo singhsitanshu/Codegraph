@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -173,14 +173,113 @@ class _LanguageQueries:
 
 
 @dataclass(frozen=True, slots=True)
+class CallSite:
+    """One call expression. The parser records the callee name, not its target."""
+
+    name: str
+    syntax: str
+    start_line: int
+    end_line: int
+    start_column: int
+    end_column: int
+
+
+@dataclass(frozen=True, slots=True)
+class FunctionDeclaration:
+    """A named definition's lexical identity metadata and source span.
+
+    Used on its own for declaration-only signatures without a body, such as
+    TypeScript overload or interface method signatures.
+    """
+
+    name: str
+    qualified_name: str
+    signature: str | None
+    definition_discriminator: str
+    start_line: int
+    end_line: int
+    start_column: int
+    end_column: int
+    raw_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedFunction(FunctionDeclaration):
+    """An executable definition and the calls attributed to its body."""
+
+    calls: tuple[CallSite, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class IdentifiedFunction(ParsedFunction):
+    """An executable definition with its repository-scoped ``entity_id``."""
+
+    entity_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedSource:
+    """Syntax extracted from one source file, before repository identity.
+
+    ``file_path`` is the path the parser was given, which may be a temporary
+    absolute path. Executable definitions and declaration-only signatures are
+    kept apart so consumers never have to filter one out of the other.
+    """
+
+    file_path: str
+    language: str
+    defined_classes: tuple[str, ...]
+    functions: tuple[ParsedFunction, ...]
+    declarations: tuple[FunctionDeclaration, ...]
+    unattributed_calls: tuple[CallSite, ...]
+    outgoing_calls: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class IdentifiedFile:
+    """A parsed file placed in a repository, ready for the graph writer.
+
+    Built only by :func:`identify_parsed_source`: ``file_path`` is a normalized
+    repository-relative path and every function's ``entity_id`` was generated
+    from ``repository``, ``file_path`` and ``language``.
+    """
+
+    repository: str
+    file_path: str
+    language: str
+    functions: tuple[IdentifiedFunction, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedFileProgress:
-    """One completed file from a concurrently parsed batch."""
+    """One completed file from a concurrently parsed batch.
+
+    ``result`` is ``None`` when the file could not be read or parsed.
+    ``source_tokens`` counts the file's source whenever it could be read.
+    """
 
     index: int
     processed: int
     total: int
-    result: dict[str, Any] | None
-    source_tokens: int = 0
+    source_tokens: int
+    result: ParsedSource | None
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedBatch:
+    """Files parsed by :func:`parse_changed_files`, in input order."""
+
+    files: list[ParsedSource]
+    source_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedDefinition:
+    """A definition node, its body (``None`` for a declaration) and metadata."""
+
+    node: Node
+    body: Node | None
+    declaration: FunctionDeclaration
 
 
 class CodeParser:
@@ -427,59 +526,57 @@ class CodeParser:
         return node.end_point.row + (1 if node.end_point.column else 0)
 
     @classmethod
-    def _capture_function_records(
+    def _capture_definitions(
         cls,
         query: Query,
         root_node: Node,
         source_code: bytes,
-        file_path: str,
-        language: str,
-    ) -> list[tuple[Node, dict[str, Any]]]:
-        """Pair each named definition with source and deterministic metadata."""
+    ) -> list[_CapturedDefinition]:
+        """Pair each named definition with its body and deterministic metadata."""
 
-        records: list[tuple[Node, dict[str, Any]]] = []
+        matches: list[tuple[Node, str, str | None]] = []
         for _, captures in QueryCursor(query).matches(root_node):
             name_nodes = captures.get("name", [])
             definition_nodes = captures.get("definition", [])
             if len(name_nodes) != 1 or len(definition_nodes) != 1:
                 continue
-            name_node = name_nodes[0]
             definition_node = definition_nodes[0]
-            name = cls._text(name_node, source_code)
-            raw_code = cls._text(definition_node, source_code)
-            signature = cls._signature(definition_node, source_code)
-            body = cls._definition_body(definition_node)
-            records.append(
+            matches.append(
                 (
                     definition_node,
-                    {
-                        "name": name,
-                        "qualified_name": cls._qualified_name(
-                            definition_node, name, source_code
-                        ),
-                        "file_path": file_path,
-                        "language": language,
-                        "signature": signature,
-                        "has_body": body is not None,
-                        "start_line": definition_node.start_point.row + 1,
-                        "end_line": cls._line_end(definition_node),
-                        "start_column": definition_node.start_point.column,
-                        "end_column": definition_node.end_point.column,
-                        "raw_code": raw_code,
-                        "calls": [],
-                    },
+                    cls._text(name_nodes[0], source_code),
+                    cls._signature(definition_node, source_code),
                 )
             )
-        records.sort(key=lambda item: (item[0].start_byte, item[0].end_byte))
+        matches.sort(key=lambda item: (item[0].start_byte, item[0].end_byte))
+
+        definitions: list[_CapturedDefinition] = []
         occurrences: dict[tuple[str, str | None], int] = {}
-        for _, record in records:
-            key = (record["qualified_name"], record["signature"])
+        for definition_node, name, signature in matches:
+            qualified_name = cls._qualified_name(definition_node, name, source_code)
+            key = (qualified_name, signature)
             occurrences[key] = occurrences.get(key, 0) + 1
-            signature_part = record["signature"] or "unknown"
-            record["definition_discriminator"] = (
-                f"signature:{signature_part};occurrence:{occurrences[key]}"
+            definitions.append(
+                _CapturedDefinition(
+                    node=definition_node,
+                    body=cls._definition_body(definition_node),
+                    declaration=FunctionDeclaration(
+                        name=name,
+                        qualified_name=qualified_name,
+                        signature=signature,
+                        definition_discriminator=(
+                            f"signature:{signature or 'unknown'};"
+                            f"occurrence:{occurrences[key]}"
+                        ),
+                        start_line=definition_node.start_point.row + 1,
+                        end_line=cls._line_end(definition_node),
+                        start_column=definition_node.start_point.column,
+                        end_column=definition_node.end_point.column,
+                        raw_code=cls._text(definition_node, source_code),
+                    ),
+                )
             )
-        return records
+        return definitions
 
     @classmethod
     def _capture_call_sites(
@@ -487,16 +584,20 @@ class CodeParser:
         query: Query,
         root_node: Node,
         source_code: bytes,
-        definitions: list[tuple[Node, dict[str, Any]]],
-    ) -> list[dict[str, Any]]:
-        """Attribute syntax to the innermost captured lexical function body."""
+        definitions: list[_CapturedDefinition],
+    ) -> tuple[dict[int, list[CallSite]], list[CallSite]]:
+        """Attribute syntax to the innermost captured lexical function body.
 
-        unattributed: list[dict[str, Any]] = []
-        owners_by_body: dict[int, tuple[Node, dict[str, Any]]] = {}
-        for definition, record in definitions:
-            body = cls._definition_body(definition)
-            if body is not None:
-                owners_by_body.setdefault(body.id, (definition, record))
+        Returns the calls owned by each definition, keyed by the definition
+        node's ID, and the calls no definition could confidently own.
+        """
+
+        owned: dict[int, list[CallSite]] = {}
+        unattributed: list[CallSite] = []
+        owners_by_body: dict[int, Node] = {}
+        for definition in definitions:
+            if definition.body is not None:
+                owners_by_body.setdefault(definition.body.id, definition.node)
         captures = QueryCursor(query).captures(root_node).get("call", [])
         for name_node in sorted(captures, key=lambda node: node.start_byte):
             call_node = name_node
@@ -524,26 +625,24 @@ class CodeParser:
                 )
             else:
                 syntax = cls._text(target, source_code)
-            call = {
-                "name": cls._text(name_node, source_code),
-                "syntax": syntax,
-                "start_line": call_node.start_point.row + 1,
-                "end_line": cls._line_end(call_node),
-                "start_column": call_node.start_point.column,
-                "end_column": call_node.end_point.column,
-                "resolution": "unresolved",
-            }
+            call = CallSite(
+                name=cls._text(name_node, source_code),
+                syntax=syntax,
+                start_line=call_node.start_point.row + 1,
+                end_line=cls._line_end(call_node),
+                start_column=call_node.start_point.column,
+                end_column=call_node.end_point.column,
+            )
             # The nearest enclosing body is the innermost lexical owner. Walking
             # ancestors avoids checking every definition for every call site.
             current = call_node
-            captured_owner = None
+            definition = None
             while current is not None:
-                captured_owner = owners_by_body.get(current.id)
-                if captured_owner is not None:
+                definition = owners_by_body.get(current.id)
+                if definition is not None:
                     break
                 current = current.parent
-            if captured_owner is not None:
-                definition, owner = captured_owner
+            if definition is not None:
                 current = call_node.parent
                 anonymous_boundary = False
                 while current is not None and current != definition:
@@ -564,17 +663,17 @@ class CodeParser:
                             break
                     current = current.parent
                 if not anonymous_boundary:
-                    owner["calls"].append(call)
+                    owned.setdefault(definition.id, []).append(call)
                     continue
             unattributed.append(call)
-        return unattributed
+        return owned, unattributed
 
     def _parse_source(
         self,
         file_path: str,
         extension: str,
         source_code: bytes,
-    ) -> dict[str, Any]:
+    ) -> ParsedSource:
         """Synchronously parse and query source code in a worker thread."""
 
         tree = self._parsers[extension].parse(source_code)
@@ -584,73 +683,70 @@ class CodeParser:
         if root_node.has_error:
             logger.warning("Tree-sitter found syntax errors while parsing %s", file_path)
 
-        language = SUPPORTED_EXTENSIONS[extension]
-        definitions = self._capture_function_records(
+        definitions = self._capture_definitions(
             queries.function_definitions,
             root_node,
             source_code,
-            file_path,
-            language,
         )
-        unattributed_calls = self._capture_call_sites(
+        owned_calls, unattributed_calls = self._capture_call_sites(
             queries.function_calls, root_node, source_code, definitions
         )
-        functions = [record for _, record in definitions]
 
-        return {
-            "file_path": file_path,
-            "defined_classes": self._capture_text(
-                queries.class_definitions,
-                "name",
-                root_node,
-                source_code,
+        return ParsedSource(
+            file_path=file_path,
+            language=SUPPORTED_EXTENSIONS[extension],
+            defined_classes=tuple(
+                self._capture_text(
+                    queries.class_definitions,
+                    "name",
+                    root_node,
+                    source_code,
+                )
             ),
-            "defined_functions": [
-                function["name"] for function in functions if function["has_body"]
-            ],
-            "functions": functions,
-            "unattributed_calls": unattributed_calls,
-            "outgoing_calls": self._capture_text(
-                queries.function_calls,
-                "call",
-                root_node,
-                source_code,
+            functions=tuple(
+                ParsedFunction(
+                    **_field_values(definition.declaration),
+                    calls=tuple(owned_calls.get(definition.node.id, ())),
+                )
+                for definition in definitions
+                if definition.body is not None
             ),
-        }
+            declarations=tuple(
+                definition.declaration
+                for definition in definitions
+                if definition.body is None
+            ),
+            unattributed_calls=tuple(unattributed_calls),
+            outgoing_calls=tuple(
+                self._capture_text(
+                    queries.function_calls,
+                    "call",
+                    root_node,
+                    source_code,
+                )
+            ),
+        )
 
     async def parse_file(
         self,
         file_path: str,
         source_code: bytes,
-        *,
-        repository: str | None = None,
-        repository_relative_path: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> ParsedSource:
         """Extract classes, functions, and outgoing calls from one source file.
 
         Parsing is CPU-bound and therefore runs in a worker thread so callers do
-        not block FastAPI's event loop. Results preserve source order and are
-        shaped for direct transformation into Neo4j nodes and relationships.
+        not block FastAPI's event loop. Results preserve source order. Pass the
+        result to :func:`identify_parsed_source` once its repository-relative
+        path is known to obtain the graph writer's input.
 
         Args:
             file_path: Logical or filesystem path used to select the grammar and
                 identify the resulting file record.
             source_code: UTF-8 encoded source bytes in a supported language.
-            repository: Optional repository scope. When supplied, function
-                entity IDs are generated from the repository and relative path.
-            repository_relative_path: Stable path to use when ``file_path`` is
-                a temporary absolute path. Required in that case if repository
-                identity is requested.
-
-        Returns:
-            A dictionary containing ``file_path``, ``defined_classes``,
-            ``defined_functions``, structured ``functions`` with raw code and
-            lexical metadata, ``outgoing_calls``, and ``unattributed_calls``.
 
         Raises:
             TypeError: If ``source_code`` is not bytes.
             ValueError: If ``file_path`` has an unsupported extension.
-                Also raised if a requested identity has an invalid relative path.
         """
 
         if not isinstance(source_code, bytes):
@@ -658,47 +754,54 @@ class CodeParser:
 
         extension = self._normalize_extension(Path(file_path).suffix)
         async with self._parse_locks[extension]:
-            result = await asyncio.to_thread(
+            return await asyncio.to_thread(
                 self._parse_source,
                 file_path,
                 extension,
                 source_code,
             )
-        if repository is not None:
-            attach_function_entity_ids(
-                result,
-                repository=repository,
-                file_path=repository_relative_path or file_path,
-            )
-        return result
 
 
-def attach_function_entity_ids(
-    parsed_file: dict[str, Any],
+def _field_values(record: Any) -> dict[str, Any]:
+    """Return a dataclass's own field values without converting nested records."""
+
+    return {field.name: getattr(record, field.name) for field in fields(record)}
+
+
+def identify_parsed_source(
+    parsed_source: ParsedSource,
     *,
     repository: str,
     file_path: str,
-) -> dict[str, Any]:
-    """Attach repository identity after a file has a repository-relative path.
+) -> IdentifiedFile:
+    """Place a parsed file in a repository and generate its function identities.
 
-    Kept separate so full ingest can parse temporary absolute paths and attach
-    keys only after converting them to stable repository-relative paths.
+    Kept separate from parsing so full ingest can parse temporary absolute paths
+    and identify files only after converting them to repository-relative paths.
+
+    Raises:
+        ValueError: If ``file_path`` is not repository-relative.
     """
 
     normalized_path = normalize_repository_path(file_path)
-    parsed_file["file_path"] = normalized_path
-    parsed_file["repository"] = repository
-    for function in parsed_file.get("functions", []):
-        function["file_path"] = normalized_path
-        function["repository"] = repository
-        function["entity_id"] = generate_function_entity_id(
-            repository=repository,
-            file_path=normalized_path,
-            language=function["language"],
-            qualified_name=function["qualified_name"],
-            discriminator=function["definition_discriminator"],
-        )
-    return parsed_file
+    return IdentifiedFile(
+        repository=repository,
+        file_path=normalized_path,
+        language=parsed_source.language,
+        functions=tuple(
+            IdentifiedFunction(
+                **_field_values(function),
+                entity_id=generate_function_entity_id(
+                    repository=repository,
+                    file_path=normalized_path,
+                    language=parsed_source.language,
+                    qualified_name=function.qualified_name,
+                    discriminator=function.definition_discriminator,
+                ),
+            )
+            for function in parsed_source.functions
+        ),
+    )
 
 
 async def parse_changed_files_with_progress(
@@ -722,7 +825,7 @@ async def parse_changed_files_with_progress(
     async def parse_path(
         index: int,
         file_path: str,
-    ) -> tuple[int, dict[str, Any] | None, int]:
+    ) -> tuple[int, ParsedSource | None, int]:
         path = Path(file_path)
         source_tokens = 0
         try:
@@ -734,7 +837,6 @@ async def parse_changed_files_with_progress(
                     source_text,
                 )
                 result = await code_parser.parse_file(file_path, source_code)
-            result["source_tokens"] = source_tokens
             return index, result, source_tokens
         except FileNotFoundError:
             logger.info("Skipping missing or deleted source file: %s", file_path)
@@ -767,8 +869,8 @@ async def parse_changed_files_with_progress(
                 index=index,
                 processed=processed,
                 total=total,
-                result=result,
                 source_tokens=source_tokens,
+                result=result,
             )
     finally:
         for task in tasks:
@@ -777,14 +879,16 @@ async def parse_changed_files_with_progress(
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def parse_changed_files(
-    file_paths: list[str],
-) -> list[dict[str, Any]]:
-    """Parse source files and return successful results in input order."""
+async def parse_changed_files(file_paths: list[str]) -> ParsedBatch:
+    """Parse source files, keeping successful results in input order."""
 
-    parsed_files: list[dict[str, Any] | None] = [
-        None for _ in file_paths
-    ]
+    parsed_by_index: dict[int, ParsedSource] = {}
+    source_tokens = 0
     async for progress in parse_changed_files_with_progress(file_paths):
-        parsed_files[progress.index] = progress.result
-    return [result for result in parsed_files if result is not None]
+        source_tokens += progress.source_tokens
+        if progress.result is not None:
+            parsed_by_index[progress.index] = progress.result
+    return ParsedBatch(
+        files=[parsed_by_index[index] for index in sorted(parsed_by_index)],
+        source_tokens=source_tokens,
+    )

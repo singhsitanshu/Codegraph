@@ -1,5 +1,5 @@
 import logging
-from typing import Annotated, Any
+from typing import Any
 
 from fastapi import (
     APIRouter,
@@ -20,21 +20,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
 
-@router.post("/github", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/github",
+    status_code=status.HTTP_202_ACCEPTED,
+    # The handler only runs once the signature dependency has accepted the body.
+    dependencies=[Depends(verify_github_signature)],
+)
 async def github_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-    signature_verified: Annotated[bool, Depends(verify_github_signature)],
 ) -> JSONResponse:
     """Validate a signed GitHub push and apply its changes after the response."""
-
-    # FastAPI resolves the dependency before entering this handler. Keeping the
-    # value explicit makes that security boundary visible and type checked.
-    if not signature_verified:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="GitHub signature verification failed",
-        )
 
     event_type = request.headers.get("X-GitHub-Event", "unknown").strip().lower()
     try:

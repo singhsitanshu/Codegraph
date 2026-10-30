@@ -7,7 +7,7 @@ from pathlib import Path
 # Ensure backend root is on sys.path
 sys.path.append(os.path.abspath("."))
 
-from app.services.parser_service import attach_function_entity_ids, parse_changed_files
+from app.services.parser_service import identify_parsed_source, parse_changed_files
 from app.db.graph_ops import save_parsed_ast_to_neo4j
 
 # UPDATE THIS: Use an absolute path to your cloned requests directory
@@ -44,47 +44,51 @@ async def main():
     # Check 3: Run Tree-sitter parser
     print("\n[CHECK 3] Running Tree-sitter parser on files...")
     try:
-        parsed_data = await parse_changed_files(files_to_parse)
-        if len(parsed_data) != len(files_to_parse):
+        parsed_batch = await parse_changed_files(files_to_parse)
+        parsed_sources = parsed_batch.files
+        if len(parsed_sources) != len(files_to_parse):
             raise RuntimeError(
                 "Full ingestion aborted because a discovered source file could not be parsed"
             )
         repository_root = Path(REQUESTS_REPO_PATH).resolve()
-        for parsed_file in parsed_data:
-            relative_path = Path(parsed_file["file_path"]).resolve().relative_to(
-                repository_root
-            ).as_posix()
-            attach_function_entity_ids(
-                parsed_file,
+        identified_files = [
+            identify_parsed_source(
+                parsed_source,
                 repository=REQUESTS_REPO_NAME,
-                file_path=relative_path,
+                file_path=Path(parsed_source.file_path)
+                .resolve()
+                .relative_to(repository_root)
+                .as_posix(),
             )
+            for parsed_source in parsed_sources
+        ]
     except Exception as e:
         print(f"❌ [CHECK 3 FAILED] Tree-sitter threw an exception: {e}")
         import traceback
         traceback.print_exc()
         return
 
-    print(f"Completed parsing. Returned {len(parsed_data) if parsed_data else 0} results.")
+    print(f"Completed parsing. Returned {len(parsed_sources)} results.")
     
-    if not parsed_data:
-        print("❌ [CHECK 3 FAILED] parse_changed_files returned an empty list []!")
+    if not parsed_sources:
+        print("❌ [CHECK 3 FAILED] parse_changed_files returned no parsed files!")
         return
     
     # Inspect first record
-    sample_record = parsed_data[0]
+    sample_record = parsed_sources[0]
     print("✅ [CHECK 3 PASSED] Sample parsed record:")
-    print(f"   - File: {sample_record.get('file_path')}")
-    print(f"   - Defined Functions: {sample_record.get('defined_functions')}")
-    print(f"   - Outgoing Calls: {sample_record.get('outgoing_calls')}")
+    print(f"   - File: {sample_record.file_path}")
+    print(f"   - Defined Functions: {[f.name for f in sample_record.functions]}")
+    print(f"   - Outgoing Calls: {list(sample_record.outgoing_calls)}")
 
     # Check 4: Save to Neo4j
     print("\n[CHECK 4] Saving AST records to Neo4j...")
     try:
         await save_parsed_ast_to_neo4j(
-            parsed_data,
+            identified_files,
             repo_name=REQUESTS_REPO_NAME,
             replace_existing=True,
+            total_repo_tokens=parsed_batch.source_tokens,
         )
         print("✅ [CHECK 4 PASSED] Database write finished!")
     except Exception as e:

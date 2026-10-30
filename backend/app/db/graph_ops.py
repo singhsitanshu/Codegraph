@@ -22,10 +22,8 @@ from app.services.embedding_service import (
     MAX_CONCURRENT_EMBEDDING_REQUESTS,
     generate_embeddings,
 )
-from app.utils.entity_identity import (
-    generate_function_entity_id,
-    normalize_repository_path,
-)
+from app.services.parser_service import IdentifiedFile, IdentifiedFunction
+from app.utils.entity_identity import normalize_repository_path
 from app.utils.tokens import DEFAULT_TOKEN_MODEL
 
 
@@ -168,100 +166,33 @@ def chunk_data(
         yield data_list[index : index + chunk_size]
 
 
-def _repository_relative_path(file_path: str) -> str:
-    """Normalize a parsed path, explaining why absolute paths are rejected."""
-
-    try:
-        return normalize_repository_path(file_path)
-    except ValueError as exc:
-        raise ValueError(
-            f"parsed file path {file_path!r} must be repository-relative "
-            "before it is persisted"
-        ) from exc
-
-
-def _optional_int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _call_names(value: object) -> list[str]:
-    """Return the callee names of a parser ``calls`` list in source order."""
-
-    if not isinstance(value, list):
-        return []
-    return [
-        call["name"]
-        for call in value
-        if isinstance(call, dict) and isinstance(call.get("name"), str) and call["name"]
-    ]
-
-
 def _function_record(
-    parsed_function: object,
-    repo_name: str,
-    file_path: str,
-) -> dict[str, Any] | None:
+    function: IdentifiedFunction,
+    parsed_file: IdentifiedFile,
+) -> dict[str, Any]:
     """Build one persisted Function record keyed by its CG-002A identity."""
 
-    if not isinstance(parsed_function, dict):
-        return None
-    # Declaration-only TypeScript overloads keep a parser identity, but the
-    # graph stores executable bodies only.
-    if parsed_function.get("has_body") is False:
-        return None
-
-    name = parsed_function.get("name")
-    qualified_name = parsed_function.get("qualified_name")
-    language = parsed_function.get("language")
-    discriminator = parsed_function.get("definition_discriminator")
-    if not all(
-        isinstance(value, str) and value.strip()
-        for value in (name, qualified_name, language, discriminator)
-    ):
-        logger.warning(
-            "Skipping function %r in %s: missing CG-002A identity metadata",
-            name,
-            file_path,
-        )
-        return None
-
-    entity_id = generate_function_entity_id(
-        repo_name,
-        file_path,
-        language,
-        qualified_name,
-        discriminator,
-    )
-    supplied_entity_id = parsed_function.get("entity_id")
-    if supplied_entity_id is not None and supplied_entity_id != entity_id:
-        raise ValueError(
-            f"function {qualified_name!r} in {file_path} has an entity_id "
-            f"that was not generated for repository {repo_name!r} and this path"
-        )
-
-    signature = parsed_function.get("signature")
-    raw_code = parsed_function.get("raw_code")
     return {
-        "entity_id": entity_id,
-        "name": name,
-        "qualified_name": qualified_name,
-        "file_path": file_path,
-        "language": language,
-        "signature": signature if isinstance(signature, str) else None,
-        "definition_discriminator": discriminator,
-        "start_line": _optional_int(parsed_function.get("start_line")),
-        "end_line": _optional_int(parsed_function.get("end_line")),
-        "start_column": _optional_int(parsed_function.get("start_column")),
-        "end_column": _optional_int(parsed_function.get("end_column")),
-        "raw_code": raw_code if isinstance(raw_code, str) else "",
+        "entity_id": function.entity_id,
+        "name": function.name,
+        "qualified_name": function.qualified_name,
+        "file_path": parsed_file.file_path,
+        "language": parsed_file.language,
+        "signature": function.signature,
+        "definition_discriminator": function.definition_discriminator,
+        "start_line": function.start_line,
+        "end_line": function.end_line,
+        "start_column": function.start_column,
+        "end_column": function.end_column,
+        "raw_code": function.raw_code,
     }
 
 
 def _extract_etl_records(
-    parsed_data_list: list[dict[str, Any]],
+    parsed_files: list[IdentifiedFile],
     repo_name: str,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]], dict[str, list[str]]]:
-    """Flatten parsed files into File records, Function records, and call names.
+    """Flatten identified files into File records, Function records, and call names.
 
     The third value maps each caller ``entity_id`` to the callee names the
     parser attributed to that function's body, in source order.
@@ -272,32 +203,28 @@ def _extract_etl_records(
     function_calls: dict[str, list[str]] = {}
     seen_files: set[str] = set()
 
-    for parsed_file in parsed_data_list:
-        raw_path = parsed_file.get("file_path")
-        if not isinstance(raw_path, str) or not raw_path:
-            continue
-        file_path = _repository_relative_path(raw_path)
-        if file_path not in seen_files:
-            seen_files.add(file_path)
-            files.append({"path": file_path})
+    for parsed_file in parsed_files:
+        if parsed_file.repository != repo_name:
+            raise ValueError(
+                f"{parsed_file.file_path} was identified for repository "
+                f"{parsed_file.repository!r}, not {repo_name!r}"
+            )
+        if parsed_file.file_path not in seen_files:
+            seen_files.add(parsed_file.file_path)
+            files.append({"path": parsed_file.file_path})
 
-        parsed_functions = parsed_file.get("functions")
-        if not isinstance(parsed_functions, list):
-            continue
-        for parsed_function in parsed_functions:
-            record = _function_record(parsed_function, repo_name, file_path)
-            if record is None:
-                continue
-            entity_id = record["entity_id"]
-            if entity_id in function_calls:
+        for function in parsed_file.functions:
+            if function.entity_id in function_calls:
                 logger.warning(
                     "Skipping duplicate function identity %s in %s",
-                    record["qualified_name"],
-                    file_path,
+                    function.qualified_name,
+                    parsed_file.file_path,
                 )
                 continue
-            functions.append(record)
-            function_calls[entity_id] = _call_names(parsed_function.get("calls"))
+            functions.append(_function_record(function, parsed_file))
+            function_calls[function.entity_id] = [
+                call.name for call in function.calls
+            ]
 
     return files, functions, function_calls
 
@@ -426,29 +353,8 @@ async def _embedded_function_batches(
         await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
 
 
-def _resolve_total_repo_tokens(
-    parsed_data_list: list[dict[str, Any]],
-    total_repo_tokens: int | None,
-) -> int | None:
-    """Resolve an explicit full-repository total or parsed-file totals."""
-
-    if total_repo_tokens is not None:
-        if total_repo_tokens < 0:
-            raise ValueError("total_repo_tokens must not be negative")
-        return total_repo_tokens
-
-    parsed_token_counts = [
-        value
-        for parsed_file in parsed_data_list
-        if isinstance((value := parsed_file.get("source_tokens")), int)
-        and not isinstance(value, bool)
-        and value >= 0
-    ]
-    return sum(parsed_token_counts) if parsed_token_counts else None
-
-
 async def save_parsed_ast_to_neo4j_with_progress(
-    parsed_data_list: list[dict[str, Any]],
+    parsed_files: list[IdentifiedFile],
     repo_name: str,
     replace_existing: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
@@ -461,7 +367,8 @@ async def save_parsed_ast_to_neo4j_with_progress(
     Otherwise the parsed files and ``deleted_file_paths`` are treated as an
     incremental change set: definitions that disappeared from those files are
     removed, surviving IDs keep their incoming edges, and outgoing calls from
-    the changed files are rebuilt.
+    the changed files are rebuilt. ``total_repo_tokens`` is stored as the
+    repository's token baseline when given; a changed-file subset is not one.
     """
 
     if batch_size <= 0:
@@ -469,24 +376,15 @@ async def save_parsed_ast_to_neo4j_with_progress(
 
     stage_started = perf_counter()
     files, functions, function_calls = _extract_etl_records(
-        parsed_data_list,
+        parsed_files,
         repo_name,
     )
     changed_paths = [file["path"] for file in files]
     deleted_paths = sorted(
-        {
-            _repository_relative_path(path)
-            for path in deleted_file_paths or []
-        }
+        {normalize_repository_path(path) for path in deleted_file_paths or []}
         - set(changed_paths)
     )
     affected_paths = sorted({*changed_paths, *deleted_paths})
-    # A changed-file subset is not a new repository-wide token baseline.
-    resolved_total_tokens = (
-        _resolve_total_repo_tokens(parsed_data_list, total_repo_tokens)
-        if replace_existing or total_repo_tokens is not None
-        else None
-    )
 
     async with get_neo4j_driver().session() as session:
         async def run_transaction(
@@ -534,11 +432,11 @@ async def save_parsed_ast_to_neo4j_with_progress(
             perf_counter() - stage_started,
         )
 
-        if resolved_total_tokens is not None:
+        if total_repo_tokens is not None:
             await run_transaction(
                 MERGE_REPOSITORY_TOKENS_QUERY,
                 extra_parameters={
-                    "total_tokens": resolved_total_tokens,
+                    "total_tokens": total_repo_tokens,
                     "tokenizer_model": DEFAULT_TOKEN_MODEL,
                 },
             )
@@ -645,16 +543,16 @@ async def save_parsed_ast_to_neo4j_with_progress(
 
 
 async def save_parsed_ast_to_neo4j(
-    parsed_data_list: list[dict[str, Any]],
+    parsed_files: list[IdentifiedFile],
     repo_name: str,
     replace_existing: bool = False,
     total_repo_tokens: int | None = None,
     deleted_file_paths: list[str] | None = None,
 ) -> None:
-    """Persist parsed AST data while discarding optional progress updates."""
+    """Persist identified files while discarding optional progress updates."""
 
     async for _ in save_parsed_ast_to_neo4j_with_progress(
-        parsed_data_list,
+        parsed_files,
         repo_name,
         replace_existing=replace_existing,
         total_repo_tokens=total_repo_tokens,

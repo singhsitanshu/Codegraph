@@ -23,7 +23,7 @@ from app.db.graph_ops import (
     MERGE_FUNCTIONS_QUERY,
     save_parsed_ast_to_neo4j,
 )
-from app.services.parser_service import CodeParser
+from app.services.parser_service import CodeParser, identify_parsed_source
 
 REPO = "integration/identity"
 PASSWORD = "integration-password"
@@ -119,7 +119,9 @@ def test_persisted_identity_calls_source_and_refresh(disposable_neo4j):
         async_driver = AsyncGraphDatabase.driver(uri, auth=("neo4j", PASSWORD))
         parser = CodeParser()
         async def parse(path, code):
-            return await parser.parse_file(path, code, repository=REPO)
+            return identify_parsed_source(
+                await parser.parse_file(path, code), repository=REPO, file_path=path
+            )
         auth = await parse("src/auth.py", b"def validate():\n return 'auth'\ndef caller():\n validate()\n remote()\noutside()\n")
         payments = await parse("src/payments.py", b"def validate():\n return 'payments'\n")
         try:

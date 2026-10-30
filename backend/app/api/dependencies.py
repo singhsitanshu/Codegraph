@@ -9,8 +9,8 @@ from app.config import settings
 async def verify_github_signature(
     request: Request,
     x_hub_signature_256: str | None = Header(default=None),
-) -> bool:
-    """Validate GitHub's HMAC SHA-256 signature for the raw request body."""
+) -> None:
+    """Reject a request unless GitHub's HMAC SHA-256 signature matches its body."""
 
     if x_hub_signature_256 is None:
         raise HTTPException(
@@ -31,5 +31,3 @@ async def verify_github_signature(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid GitHub webhook signature",
         )
-
-    return True
