@@ -19,7 +19,7 @@ from pydantic import (
     model_validator,
 )
 
-from app.services.parser_service import SUPPORTED_EXTENSIONS
+from app.services.languages import SUPPORTED_EXTENSIONS
 from app.utils.entity_identity import normalize_repository_path
 from app.utils.repository import GitHubRepository
 

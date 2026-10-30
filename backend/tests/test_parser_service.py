@@ -6,8 +6,10 @@ from unittest.mock import patch
 
 import pytest
 
+from tree_sitter import Language
+
+from app.services.languages import LANGUAGES, SUPPORTED_EXTENSIONS, LanguageSpec
 from app.services.parser_service import (
-    SUPPORTED_EXTENSIONS,
     CodeParser,
     ParsedSource,
     parse_changed_files,
@@ -44,6 +46,24 @@ def test_supported_extension_mapping_covers_all_requested_languages() -> None:
         ".tsx": "tsx",
         ".go": "go",
         ".java": "java",
+    }
+
+
+@pytest.mark.parametrize("spec", LANGUAGES, ids=lambda spec: spec.name)
+def test_language_spec_node_types_exist_in_its_grammar(spec: LanguageSpec) -> None:
+    language = Language(spec.grammar())
+    node_types = (
+        spec.scope_node_types
+        | spec.call_node_types
+        | spec.anonymous_function_node_types
+        | spec.assigned_function_node_types
+        | spec.receiver_method_node_types
+    )
+
+    assert node_types == {
+        node_type
+        for node_type in node_types
+        if language.id_for_node_kind(node_type, True)
     }
 
 

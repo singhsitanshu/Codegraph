@@ -6,13 +6,9 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
-import tree_sitter_go
-import tree_sitter_java
-import tree_sitter_javascript
-import tree_sitter_python
-import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
+from app.services.languages import LANGUAGE_BY_EXTENSION, LANGUAGES, LanguageSpec
 from app.utils.entity_identity import (
     generate_function_entity_id,
     normalize_repository_path,
@@ -22,145 +18,6 @@ from app.utils.tokens import count_tokens
 
 logger = logging.getLogger(__name__)
 MAX_CONCURRENT_FILE_READS = 32
-SUPPORTED_EXTENSIONS = {
-    ".py": "python",
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".ts": "typescript",
-    ".tsx": "tsx",
-    ".go": "go",
-    ".java": "java",
-}
-
-
-PYTHON_FUNCTION_DEFINITIONS_QUERY = """
-(function_definition
-  name: (identifier) @name) @definition
-"""
-
-PYTHON_FUNCTION_CALLS_QUERY = """
-(call
-  function: (identifier) @call)
-
-(call
-  function: (attribute
-    attribute: (identifier) @call))
-"""
-
-PYTHON_CLASS_DEFINITIONS_QUERY = """
-(class_definition
-  name: (identifier) @name)
-"""
-
-JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY = """
-(function_declaration
-  name: (identifier) @name) @definition
-
-(generator_function_declaration
-  name: (identifier) @name) @definition
-
-(method_definition
-  name: (property_identifier) @name) @definition
-
-(variable_declarator
-  name: (identifier) @name
-  value: [(arrow_function) (function_expression)]) @definition
-"""
-
-JAVASCRIPT_FUNCTION_CALLS_QUERY = """
-(call_expression
-  function: (identifier) @call)
-
-(call_expression
-  function: (member_expression
-    property: (property_identifier) @call))
-"""
-
-JAVASCRIPT_CLASS_DEFINITIONS_QUERY = """
-(class_declaration
-  name: (identifier) @name)
-"""
-
-TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY = """
-(function_signature
-  name: (identifier) @name) @definition
-
-(function_declaration
-  name: (identifier) @name) @definition
-
-(generator_function_declaration
-  name: (identifier) @name) @definition
-
-(method_definition
-  name: (property_identifier) @name) @definition
-
-(method_signature
-  name: (property_identifier) @name) @definition
-
-(variable_declarator
-  name: (identifier) @name
-  value: [(arrow_function) (function_expression)]) @definition
-"""
-
-TYPESCRIPT_FUNCTION_CALLS_QUERY = """
-(call_expression
-  function: (identifier) @call)
-
-(call_expression
-  function: (member_expression
-    property: (property_identifier) @call))
-"""
-
-TYPESCRIPT_CLASS_DEFINITIONS_QUERY = """
-(class_declaration
-  name: (type_identifier) @name)
-
-(abstract_class_declaration
-  name: (type_identifier) @name)
-"""
-
-GO_FUNCTION_DEFINITIONS_QUERY = """
-(function_declaration
-  name: (identifier) @name) @definition
-
-(method_declaration
-  name: (field_identifier) @name) @definition
-"""
-
-GO_FUNCTION_CALLS_QUERY = """
-(call_expression
-  function: (identifier) @call)
-
-(call_expression
-  function: (selector_expression
-    field: (field_identifier) @call))
-"""
-
-GO_CLASS_DEFINITIONS_QUERY = """
-(type_spec
-  name: (type_identifier) @name
-  type: [(struct_type) (interface_type)])
-"""
-
-JAVA_FUNCTION_DEFINITIONS_QUERY = """
-(method_declaration
-  name: (identifier) @name
-  body: (block)) @definition
-
-(constructor_declaration
-  name: (identifier) @name
-  body: (constructor_body)) @definition
-"""
-
-JAVA_FUNCTION_CALLS_QUERY = """
-(method_invocation
-  name: (identifier) @call)
-"""
-
-JAVA_CLASS_DEFINITIONS_QUERY = """
-(class_declaration
-  name: (identifier) @name)
-"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +27,32 @@ class _LanguageQueries:
     function_definitions: Query
     function_calls: Query
     class_definitions: Query
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedLanguage:
+    """A language's reusable parser, compiled queries and parse lock."""
+
+    spec: LanguageSpec
+    parser: Parser
+    queries: _LanguageQueries
+    lock: asyncio.Lock
+
+    @classmethod
+    def load(cls, spec: LanguageSpec) -> "_LoadedLanguage":
+        language = Language(spec.grammar())
+        return cls(
+            spec=spec,
+            parser=Parser(language),
+            queries=_LanguageQueries(
+                function_definitions=Query(
+                    language, spec.function_definitions_query
+                ),
+                function_calls=Query(language, spec.function_calls_query),
+                class_definitions=Query(language, spec.class_definitions_query),
+            ),
+            lock=asyncio.Lock(),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,7 +166,7 @@ class _CapturedDefinition:
 
 
 class CodeParser:
-    """Normalize Python, JavaScript, TypeScript, TSX, Go, and Java graphs.
+    """Normalize source files in every language registered in ``LANGUAGES``.
 
     Grammar packages are loaded from their precompiled Python wheels. No grammar
     compilation, C toolchain, or legacy ``Language.build_library`` call is used.
@@ -291,120 +174,14 @@ class CodeParser:
     single parser from being used concurrently by multiple background threads.
     """
 
-    _SUPPORTED_EXTENSIONS = frozenset(SUPPORTED_EXTENSIONS)
-
     def __init__(self) -> None:
         """Initialize parsers and compile extraction queries for all grammars."""
 
-        python_language = Language(tree_sitter_python.language())
-        javascript_language = Language(tree_sitter_javascript.language())
-        typescript_language = Language(
-            tree_sitter_typescript.language_typescript()
-        )
-        tsx_language = Language(tree_sitter_typescript.language_tsx())
-        go_language = Language(tree_sitter_go.language())
-        java_language = Language(tree_sitter_java.language())
-
-        self._languages: dict[str, Language] = {
-            ".py": python_language,
-            ".js": javascript_language,
-            ".jsx": javascript_language,
-            ".ts": typescript_language,
-            ".tsx": tsx_language,
-            ".go": go_language,
-            ".java": java_language,
+        self._languages: dict[str, _LoadedLanguage] = {
+            extension: language
+            for language in map(_LoadedLanguage.load, LANGUAGES)
+            for extension in language.spec.extensions
         }
-        javascript_parser = Parser(javascript_language)
-        self._parsers: dict[str, Parser] = {
-            ".py": Parser(python_language),
-            ".js": javascript_parser,
-            ".jsx": javascript_parser,
-            ".ts": Parser(typescript_language),
-            ".tsx": Parser(tsx_language),
-            ".go": Parser(go_language),
-            ".java": Parser(java_language),
-        }
-        language_locks = {
-            language_name: asyncio.Lock()
-            for language_name in set(SUPPORTED_EXTENSIONS.values())
-        }
-        self._parse_locks: dict[str, asyncio.Lock] = {
-            extension: language_locks[language_name]
-            for extension, language_name in SUPPORTED_EXTENSIONS.items()
-        }
-        self._queries: dict[str, _LanguageQueries] = {
-            ".py": self._compile_python_queries(python_language),
-            ".js": self._compile_javascript_queries(javascript_language),
-            ".jsx": self._compile_javascript_queries(javascript_language),
-            ".ts": self._compile_typescript_queries(typescript_language),
-            ".tsx": self._compile_typescript_queries(tsx_language),
-            ".go": self._compile_go_queries(go_language),
-            ".java": self._compile_java_queries(java_language),
-        }
-
-    @staticmethod
-    def _compile_python_queries(language: Language) -> _LanguageQueries:
-        """Compile Python definition, class, and call queries once."""
-
-        return _LanguageQueries(
-            function_definitions=Query(
-                language, PYTHON_FUNCTION_DEFINITIONS_QUERY
-            ),
-            function_calls=Query(language, PYTHON_FUNCTION_CALLS_QUERY),
-            class_definitions=Query(language, PYTHON_CLASS_DEFINITIONS_QUERY),
-        )
-
-    @staticmethod
-    def _compile_typescript_queries(language: Language) -> _LanguageQueries:
-        """Compile TypeScript queries for either the TypeScript or TSX grammar."""
-
-        return _LanguageQueries(
-            function_definitions=Query(
-                language, TYPESCRIPT_FUNCTION_DEFINITIONS_QUERY
-            ),
-            function_calls=Query(language, TYPESCRIPT_FUNCTION_CALLS_QUERY),
-            class_definitions=Query(
-                language, TYPESCRIPT_CLASS_DEFINITIONS_QUERY
-            ),
-        )
-
-    @staticmethod
-    def _compile_javascript_queries(language: Language) -> _LanguageQueries:
-        """Compile JavaScript queries shared by ``.js`` and ``.jsx``."""
-
-        return _LanguageQueries(
-            function_definitions=Query(
-                language, JAVASCRIPT_FUNCTION_DEFINITIONS_QUERY
-            ),
-            function_calls=Query(language, JAVASCRIPT_FUNCTION_CALLS_QUERY),
-            class_definitions=Query(
-                language, JAVASCRIPT_CLASS_DEFINITIONS_QUERY
-            ),
-        )
-
-    @staticmethod
-    def _compile_go_queries(language: Language) -> _LanguageQueries:
-        """Compile Go function, method, call, and type queries."""
-
-        return _LanguageQueries(
-            function_definitions=Query(
-                language, GO_FUNCTION_DEFINITIONS_QUERY
-            ),
-            function_calls=Query(language, GO_FUNCTION_CALLS_QUERY),
-            class_definitions=Query(language, GO_CLASS_DEFINITIONS_QUERY),
-        )
-
-    @staticmethod
-    def _compile_java_queries(language: Language) -> _LanguageQueries:
-        """Compile Java method, constructor, invocation, and class queries."""
-
-        return _LanguageQueries(
-            function_definitions=Query(
-                language, JAVA_FUNCTION_DEFINITIONS_QUERY
-            ),
-            function_calls=Query(language, JAVA_FUNCTION_CALLS_QUERY),
-            class_definitions=Query(language, JAVA_CLASS_DEFINITIONS_QUERY),
-        )
 
     @classmethod
     def _normalize_extension(cls, file_extension: str) -> str:
@@ -413,8 +190,8 @@ class CodeParser:
         normalized = file_extension.strip().lower()
         if normalized and not normalized.startswith("."):
             normalized = f".{normalized}"
-        if normalized not in cls._SUPPORTED_EXTENSIONS:
-            supported = ", ".join(sorted(cls._SUPPORTED_EXTENSIONS))
+        if normalized not in LANGUAGE_BY_EXTENSION:
+            supported = ", ".join(sorted(LANGUAGE_BY_EXTENSION))
             raise ValueError(
                 f"Unsupported file extension '{file_extension}'. "
                 f"Supported extensions: {supported}"
@@ -449,30 +226,15 @@ class CodeParser:
         )
 
     @classmethod
-    def _lexical_scope(cls, definition: Node, source_code: bytes) -> list[str]:
+    def _lexical_scope(
+        cls, spec: LanguageSpec, definition: Node, source_code: bytes
+    ) -> list[str]:
         """Collect named enclosing classes/functions, outermost first."""
 
         scope: list[str] = []
         parent = definition.parent
-        scope_types = {
-            "class_definition",
-            "class_declaration",
-            "abstract_class_declaration",
-            "interface_declaration",
-            "record_declaration",
-            "internal_module",
-            "function_definition",
-            "function_declaration",
-            "generator_function_declaration",
-            "method_definition",
-            "method_declaration",
-            "constructor_declaration",
-            "function_signature",
-            "method_signature",
-            "variable_declarator",
-        }
         while parent is not None:
-            if parent.type in scope_types:
+            if parent.type in spec.scope_node_types:
                 name = parent.child_by_field_name("name")
                 if name is not None:
                     scope.append(cls._text(name, source_code))
@@ -481,16 +243,18 @@ class CodeParser:
         return scope
 
     @classmethod
-    def _definition_body(cls, definition: Node) -> Node | None:
-        if definition.type == "variable_declarator":
+    def _definition_body(cls, spec: LanguageSpec, definition: Node) -> Node | None:
+        if definition.type in spec.assigned_function_node_types:
             value = definition.child_by_field_name("value")
             return value.child_by_field_name("body") if value is not None else None
         return definition.child_by_field_name("body")
 
     @classmethod
-    def _signature(cls, definition: Node, source_code: bytes) -> str | None:
+    def _signature(
+        cls, spec: LanguageSpec, definition: Node, source_code: bytes
+    ) -> str | None:
         owner = definition
-        if definition.type == "variable_declarator":
+        if definition.type in spec.assigned_function_node_types:
             owner = definition.child_by_field_name("value")
             if owner is None:
                 return None
@@ -500,9 +264,15 @@ class CodeParser:
         return re.sub(r"\s+", " ", cls._text(parameters, source_code)).strip()
 
     @classmethod
-    def _qualified_name(cls, definition: Node, name: str, source_code: bytes) -> str:
-        scope = cls._lexical_scope(definition, source_code)
-        if definition.type == "method_declaration":
+    def _qualified_name(
+        cls,
+        spec: LanguageSpec,
+        definition: Node,
+        name: str,
+        source_code: bytes,
+    ) -> str:
+        scope = cls._lexical_scope(spec, definition, source_code)
+        if definition.type in spec.receiver_method_node_types:
             receiver = definition.child_by_field_name("receiver")
             if receiver is not None:
                 receiver_types = [
@@ -528,6 +298,7 @@ class CodeParser:
     @classmethod
     def _capture_definitions(
         cls,
+        spec: LanguageSpec,
         query: Query,
         root_node: Node,
         source_code: bytes,
@@ -545,7 +316,7 @@ class CodeParser:
                 (
                     definition_node,
                     cls._text(name_nodes[0], source_code),
-                    cls._signature(definition_node, source_code),
+                    cls._signature(spec, definition_node, source_code),
                 )
             )
         matches.sort(key=lambda item: (item[0].start_byte, item[0].end_byte))
@@ -553,13 +324,15 @@ class CodeParser:
         definitions: list[_CapturedDefinition] = []
         occurrences: dict[tuple[str, str | None], int] = {}
         for definition_node, name, signature in matches:
-            qualified_name = cls._qualified_name(definition_node, name, source_code)
+            qualified_name = cls._qualified_name(
+                spec, definition_node, name, source_code
+            )
             key = (qualified_name, signature)
             occurrences[key] = occurrences.get(key, 0) + 1
             definitions.append(
                 _CapturedDefinition(
                     node=definition_node,
-                    body=cls._definition_body(definition_node),
+                    body=cls._definition_body(spec, definition_node),
                     declaration=FunctionDeclaration(
                         name=name,
                         qualified_name=qualified_name,
@@ -581,6 +354,7 @@ class CodeParser:
     @classmethod
     def _capture_call_sites(
         cls,
+        spec: LanguageSpec,
         query: Query,
         root_node: Node,
         source_code: bytes,
@@ -601,17 +375,12 @@ class CodeParser:
         captures = QueryCursor(query).captures(root_node).get("call", [])
         for name_node in sorted(captures, key=lambda node: node.start_byte):
             call_node = name_node
-            while call_node.parent is not None and call_node.type not in {
-                "call",
-                "call_expression",
-                "method_invocation",
-            }:
+            while (
+                call_node.parent is not None
+                and call_node.type not in spec.call_node_types
+            ):
                 call_node = call_node.parent
-            if call_node.type not in {
-                "call",
-                "call_expression",
-                "method_invocation",
-            }:
+            if call_node.type not in spec.call_node_types:
                 continue
             target = call_node.child_by_field_name("function")
             if target is None:
@@ -646,17 +415,9 @@ class CodeParser:
                 current = call_node.parent
                 anonymous_boundary = False
                 while current is not None and current != definition:
-                    if current.type in {
-                        "lambda",
-                        "lambda_expression",
-                        "arrow_function",
-                        "function_expression",
-                        "function",
-                        "generator_function",
-                        "func_literal",
-                    }:
+                    if current.type in spec.anonymous_function_node_types:
                         if not (
-                            definition.type == "variable_declarator"
+                            definition.type in spec.assigned_function_node_types
                             and current == definition.child_by_field_name("value")
                         ):
                             anonymous_boundary = True
@@ -671,30 +432,35 @@ class CodeParser:
     def _parse_source(
         self,
         file_path: str,
-        extension: str,
+        language: _LoadedLanguage,
         source_code: bytes,
     ) -> ParsedSource:
         """Synchronously parse and query source code in a worker thread."""
 
-        tree = self._parsers[extension].parse(source_code)
+        tree = language.parser.parse(source_code)
         root_node = tree.root_node
-        queries = self._queries[extension]
+        queries = language.queries
 
         if root_node.has_error:
             logger.warning("Tree-sitter found syntax errors while parsing %s", file_path)
 
         definitions = self._capture_definitions(
+            language.spec,
             queries.function_definitions,
             root_node,
             source_code,
         )
         owned_calls, unattributed_calls = self._capture_call_sites(
-            queries.function_calls, root_node, source_code, definitions
+            language.spec,
+            queries.function_calls,
+            root_node,
+            source_code,
+            definitions,
         )
 
         return ParsedSource(
             file_path=file_path,
-            language=SUPPORTED_EXTENSIONS[extension],
+            language=language.spec.name,
             defined_classes=tuple(
                 self._capture_text(
                     queries.class_definitions,
@@ -753,11 +519,12 @@ class CodeParser:
             raise TypeError("source_code must be bytes")
 
         extension = self._normalize_extension(Path(file_path).suffix)
-        async with self._parse_locks[extension]:
+        language = self._languages[extension]
+        async with language.lock:
             return await asyncio.to_thread(
                 self._parse_source,
                 file_path,
-                extension,
+                language,
                 source_code,
             )
 

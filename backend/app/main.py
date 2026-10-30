@@ -27,8 +27,8 @@ from app.db.graph_ops import (
 )
 from app.db.neo4j_client import initialize_database
 from app.services.github_service import download_and_extract_repo
+from app.services.languages import SUPPORTED_EXTENSIONS
 from app.services.parser_service import (
-    SUPPORTED_EXTENSIONS,
     IdentifiedFile,
     ParsedSource,
     identify_parsed_source,
